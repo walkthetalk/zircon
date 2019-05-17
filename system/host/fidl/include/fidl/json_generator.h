@@ -8,12 +8,27 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "flat_ast.h"
-#include "string_view.h"
 
 namespace fidl {
+
+struct NameLocation {
+    explicit NameLocation(const SourceLocation& location)
+        : filename(location.source_file().filename()) {
+      location.SourceLine(&position);
+    }
+
+    // TODO(FIDL-596): We are incorrectly assuming that the provided name is not
+    // anonymous, and relying on callers to avoid derefencing a nullptr
+    // location.
+    explicit NameLocation(const flat::Name& name) : NameLocation(*name.maybe_location()) {}
+
+    const std::string filename;
+    SourceFile::Position position;
+};
 
 // Methods or functions named "Emit..." are the actual interface to
 // the JSON output.
@@ -54,7 +69,7 @@ private:
     void GenerateObject(Callback callback);
 
     template <typename Type>
-    void GenerateObjectMember(StringView key, const Type& value,
+    void GenerateObjectMember(std::string_view key, const Type& value,
                               Position position = Position::kSubsequent);
 
     template <typename T>
@@ -66,8 +81,9 @@ private:
     void Generate(const std::vector<T>& value);
 
     void Generate(bool value);
-    void Generate(StringView value);
+    void Generate(std::string_view value);
     void Generate(SourceLocation value);
+    void Generate(NameLocation value);
     void Generate(uint32_t value);
 
     void Generate(types::HandleSubtype value);
@@ -75,21 +91,24 @@ private:
     void Generate(types::PrimitiveSubtype value);
 
     void Generate(const raw::Identifier& value);
-    void Generate(const raw::Literal& value);
-    void Generate(const raw::Type& value);
+    void Generate(const raw::TypeConstructor& value);
     void Generate(const raw::Attribute& value);
     void Generate(const raw::AttributeList& value);
     void Generate(const raw::Ordinal& value);
 
     void Generate(const flat::Name& value);
-    void Generate(const flat::Type& value);
+    void Generate(const flat::Type* value);
     void Generate(const flat::Constant& value);
+    void Generate(const flat::ConstantValue& value);
+    void Generate(const flat::Bits& value);
+    void Generate(const flat::Bits::Member& value);
     void Generate(const flat::Const& value);
     void Generate(const flat::Enum& value);
     void Generate(const flat::Enum::Member& value);
     void Generate(const flat::Interface& value);
     void Generate(const flat::Interface::Method* value);
     void GenerateRequest(const std::string& prefix, const flat::Struct& value);
+    void Generate(const flat::LiteralConstant& value);
     void Generate(const flat::Struct& value);
     void Generate(const flat::Struct::Member& value);
     void Generate(const flat::Table& value);
@@ -100,7 +119,7 @@ private:
     void Generate(const flat::XUnion::Member& value);
     void Generate(const flat::Library* library);
 
-    void GenerateDeclarationsEntry(int count, const flat::Name& name, StringView decl);
+    void GenerateDeclarationsEntry(int count, const flat::Name& name, std::string_view decl);
     void GenerateDeclarationsMember(const flat::Library* library,
                                     Position position = Position::kSubsequent);
 

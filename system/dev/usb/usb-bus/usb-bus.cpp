@@ -52,7 +52,7 @@ zx_status_t UsbBus::Init() {
         return status;
     }
 
-    hci_.SetBusInterface(this, &usb_bus_interface_ops_);
+    hci_.SetBusInterface(this, &usb_bus_interface_protocol_ops_);
 
     return ZX_OK;
 }
@@ -175,12 +175,12 @@ zx_status_t UsbBus::GetDeviceId(zx_device_t* device, uint32_t* out) {
 }
 
 zx_status_t UsbBus::UsbBusConfigureHub(zx_device_t* hub_device, usb_speed_t speed,
-                                       const usb_hub_descriptor_t* desc) {
+                                       const usb_hub_descriptor_t* desc, bool multi_tt) {
     uint32_t hub_id;
     if (GetDeviceId(hub_device, &hub_id) != ZX_OK) {
         return ZX_ERR_INTERNAL;
     }
-    return hci_.ConfigureHub(hub_id, speed, desc);
+    return hci_.ConfigureHub(hub_id, speed, desc, multi_tt);
 }
 
 zx_status_t UsbBus::UsbBusDeviceAdded(zx_device_t* hub_device, uint32_t port, usb_speed_t speed) {
@@ -199,7 +199,7 @@ zx_status_t UsbBus::UsbBusDeviceRemoved(zx_device_t* hub_device, uint32_t port) 
     return hci_.HubDeviceRemoved(hub_id, port);
 }
 
-zx_status_t UsbBus::UsbBusSetHubInterface(zx_device_t* usb_device, const usb_hub_interface_t* hub) {
+zx_status_t UsbBus::UsbBusSetHubInterface(zx_device_t* usb_device, const usb_hub_interface_protocol_t* hub) {
     uint32_t usb_device_id;
     auto status = GetDeviceId(usb_device, &usb_device_id);
     if (status != ZX_OK) {

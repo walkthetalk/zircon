@@ -6,7 +6,9 @@
 #include <fs/connection.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/fdio/namespace.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/channel.h>
 #include <unittest/unittest.h>
 #include <zircon/device/vfs.h>
@@ -47,8 +49,8 @@ bool FidlOpenValidator(const zx::channel& directory, const char* path,
     zx_handle_t handles[4];
     uint32_t actual_bytes;
     uint32_t actual_handles;
-    ASSERT_EQ(client.read(0, buf, sizeof(buf), &actual_bytes, handles, fbl::count_of(handles),
-                          &actual_handles), ZX_OK);
+    ASSERT_EQ(client.read(0, buf, handles, sizeof(buf), fbl::count_of(handles),
+                          &actual_bytes, &actual_handles), ZX_OK);
     ASSERT_EQ(actual_bytes, sizeof(fs::OnOpenMsg));
     ASSERT_EQ(actual_handles, expected_handles);
     auto response = reinterpret_cast<fs::OnOpenMsg*>(buf);
@@ -62,10 +64,9 @@ bool FidlOpenValidator(const zx::channel& directory, const char* path,
 
 // Validate some size information and expected fields without fully decoding the
 // FIDL message, for opening a path from a directory where we expect to fail.
-bool FidlOpenErrorValidator(const zx::channel& directory) {
+bool FidlOpenErrorValidator(const zx::channel& directory, const char* path) {
     BEGIN_HELPER;
 
-    const char* path = "this-path-better-not-actually-exist";
     zx::channel client;
     ASSERT_TRUE(OpenHelper(directory, path, &client));
 
@@ -73,8 +74,8 @@ bool FidlOpenErrorValidator(const zx::channel& directory) {
     zx_handle_t handles[4];
     uint32_t actual_bytes;
     uint32_t actual_handles;
-    ASSERT_EQ(client.read(0, buf, sizeof(buf), &actual_bytes, handles, fbl::count_of(handles),
-                          &actual_handles), ZX_OK);
+    ASSERT_EQ(client.read(0, buf, handles, sizeof(buf), fbl::count_of(handles),
+                          &actual_bytes, &actual_handles), ZX_OK);
     ASSERT_EQ(actual_bytes, sizeof(fuchsia_io_NodeOnOpenEvent));
     ASSERT_EQ(actual_handles, 0);
     auto response = reinterpret_cast<fuchsia_io_NodeOnOpenEvent*>(buf);
@@ -96,7 +97,9 @@ bool TestFidlOpen() {
         ASSERT_EQ(fdio_ns_get_installed(&ns), ZX_OK);
         ASSERT_EQ(fdio_ns_connect(ns, "/dev", ZX_FS_RIGHT_READABLE, dev_server.release()), ZX_OK);
         ASSERT_TRUE(FidlOpenValidator(dev_client, "zero", fuchsia_io_NodeInfoTag_device, 1));
-        ASSERT_TRUE(FidlOpenErrorValidator(dev_client));
+        ASSERT_TRUE(FidlOpenValidator(dev_client, "class/platform-bus/000", fuchsia_io_NodeInfoTag_device, 1));
+        ASSERT_TRUE(FidlOpenErrorValidator(dev_client, "this-path-better-not-actually-exist"));
+        ASSERT_TRUE(FidlOpenErrorValidator(dev_client, "zero/this-path-better-not-actually-exist"));
     }
 
     {
@@ -106,7 +109,7 @@ bool TestFidlOpen() {
         ASSERT_EQ(fdio_ns_get_installed(&ns), ZX_OK);
         ASSERT_EQ(fdio_ns_connect(ns, "/boot", ZX_FS_RIGHT_READABLE, dev_server.release()), ZX_OK);
         ASSERT_TRUE(FidlOpenValidator(dev_client, "lib", fuchsia_io_NodeInfoTag_directory, 0));
-        ASSERT_TRUE(FidlOpenErrorValidator(dev_client));
+        ASSERT_TRUE(FidlOpenErrorValidator(dev_client, "this-path-better-not-actually-exist"));
     }
 
     END_TEST;
@@ -177,7 +180,7 @@ bool ReadEvent(watch_buffer_t* wb, const zx::channel& c, const char** name,
                   ZX_OK);
         ASSERT_EQ(observed & ZX_CHANNEL_READABLE, ZX_CHANNEL_READABLE);
         uint32_t actual;
-        ASSERT_EQ(c.read(0, wb->buf, sizeof(wb->buf), &actual, nullptr, 0, nullptr), ZX_OK);
+        ASSERT_EQ(c.read(0, wb->buf, nullptr, sizeof(wb->buf), 0, &actual, nullptr), ZX_OK);
         wb->size = actual;
         wb->ptr = wb->buf;
     }

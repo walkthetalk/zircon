@@ -10,12 +10,14 @@
 #include <ddk/protocol/intelgpucore.h>
 #include <ddk/protocol/pci.h>
 #include <ddk/protocol/i2cimpl.h>
-#include <ddktl/mmio.h>
+#include <ddk/protocol/sysmem.h>
+#include <lib/mmio/mmio.h>
 #include <ddktl/protocol/display/controller.h>
 
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
 #include <hw/pci.h>
+#include <lib/zx/channel.h>
 #include <threads.h>
 
 #include <optional>
@@ -79,8 +81,10 @@ public:
 
     // display controller protocol ops
     void DisplayControllerImplSetDisplayControllerInterface(
-            const display_controller_interface* intf);
+            const display_controller_interface_protocol* intf);
     zx_status_t DisplayControllerImplImportVmoImage(image_t* image, zx::vmo vmo, size_t offset);
+    zx_status_t DisplayControllerImplImportImage(image_t* image, zx_unowned_handle_t handle,
+                                                 uint32_t index);
     void DisplayControllerImplReleaseImage(image_t* image);
     uint32_t DisplayControllerImplCheckConfiguration(const display_config_t** display_config,
                                                      size_t display_count,
@@ -90,6 +94,13 @@ public:
                                                  size_t display_count);
     uint32_t DisplayControllerImplComputeLinearStride(uint32_t width, zx_pixel_format_t format);
     zx_status_t DisplayControllerImplAllocateVmo(uint64_t size, zx::vmo* vmo_out);
+    zx_status_t DisplayControllerImplGetSysmemConnection(zx::channel connection);
+    zx_status_t DisplayControllerImplSetBufferCollectionConstraints(const image_t* config,
+                                                                    uint32_t collection);
+    zx_status_t DisplayControllerImplGetSingleBufferFramebuffer(zx::vmo* out_vmo,
+                                                                uint32_t* out_stride) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 
     // gpu core ops
     zx_status_t ReadPciConfig16(uint16_t addr, uint16_t* value_out);
@@ -192,7 +203,9 @@ private:
     bool gpu_released_ = false;
     bool display_released_ = false;
 
-    ddk::DisplayControllerInterfaceClient dc_intf_ __TA_GUARDED(display_lock_);
+    sysmem_protocol_t sysmem_;
+
+    ddk::DisplayControllerInterfaceProtocolClient dc_intf_ __TA_GUARDED(display_lock_);
     bool ready_for_callback_ __TA_GUARDED(display_lock_) = false;
 
     Gtt gtt_ __TA_GUARDED(gtt_lock_);

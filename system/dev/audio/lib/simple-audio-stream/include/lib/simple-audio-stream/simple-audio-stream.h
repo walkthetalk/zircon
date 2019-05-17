@@ -12,11 +12,13 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/vector.h>
+#include <fuchsia/hardware/audio/c/fidl.h>
 #include <lib/zx/vmo.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
 #include <atomic>
+#include <type_traits>
 #include <utility>
 
 namespace audio {
@@ -33,7 +35,8 @@ struct SimpleAudioStreamProtocol : public ddk::internal::base_protocol {
 
 class SimpleAudioStream;
 using SimpleAudioStreamBase = ddk::Device<SimpleAudioStream,
-                                          ddk::Ioctlable,
+                                          ddk::Messageable,
+                                          ddk::Suspendable,
                                           ddk::Unbindable>;
 
 class SimpleAudioStream : public SimpleAudioStreamBase,
@@ -53,7 +56,7 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     // sure to 'friend class SimpleAudioStream', and to 'friend class fbl::RefPtr<T>'
     template <typename T, typename... ConstructorSignature>
     static fbl::RefPtr<T> Create(ConstructorSignature&&... args) {
-        static_assert(fbl::is_base_of<SimpleAudioStream, T>::value,
+        static_assert(std::is_base_of<SimpleAudioStream, T>::value,
                       "Class must derive from SimpleAudioStream!");
 
         fbl::AllocChecker ac;
@@ -83,9 +86,12 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     // DDK device implementation
     void DdkUnbind();
     void DdkRelease();
-    zx_status_t DdkIoctl(uint32_t op,
-                         const void* in_buf, size_t in_len,
-                         void* out_buf, size_t out_len, size_t* out_actual);
+
+    zx_status_t DdkSuspend(uint32_t flags);
+
+    zx_status_t DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn) {
+        return fuchsia_hardware_audio_Device_dispatch(this, txn, msg, &AUDIO_FIDL_THUNKS);
+    }
 
   protected:
     friend class fbl::RefPtr<SimpleAudioStream>;
@@ -273,7 +279,7 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
 
     // Callable any time after SetFormat while the RingBuffer channel is active,
     // but only valid after GetBuffer is called. Can be called from any context.
-    uint32_t LoadNotificationsPerRing() const { return expected_notifications_per_ring_.load(); };
+    uint32_t LoadNotificationsPerRing() const { return expected_notifications_per_ring_.load(); }
 
     // The execution domain
     fbl::RefPtr<dispatcher::ExecutionDomain> domain_;
@@ -285,7 +291,7 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     audio_stream_unique_id_t unique_id_ __TA_GUARDED(domain_->token()) = {};
     char mfr_name_[64] __TA_GUARDED(domain_->token()) = {};
     char prod_name_[64] __TA_GUARDED(domain_->token()) = {};
-    char device_name_[64] = {};
+    char device_name_[32] = {};
 
     uint32_t frame_size_ __TA_GUARDED(domain_->token()) = 0;
     uint32_t fifo_depth_ __TA_GUARDED(domain_->token()) = 0;
@@ -309,6 +315,9 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     // Internal method; called after all initialization is complete to actually
     // publish the stream device node.
     zx_status_t PublishInternal();
+
+    // fuchsia hardware audio Device Interface
+    zx_status_t GetChannel(fidl_txn_t* txn);
 
     // Stream interface
     zx_status_t ProcessStreamChannel(dispatcher::Channel* channel, bool privileged)
@@ -366,6 +375,8 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     zx_status_t OnStop(dispatcher::Channel* channel, const audio_proto::RingBufStopReq& req)
         __TA_REQUIRES(domain_->token());
 
+    static fuchsia_hardware_audio_Device_ops_t AUDIO_FIDL_THUNKS;
+
     // Stream and ring buffer channel state.
     fbl::Mutex channel_lock_ __TA_ACQUIRED_AFTER(domain_->token());
     fbl::RefPtr<dispatcher::Channel> stream_channel_ __TA_GUARDED(channel_lock_);
@@ -382,6 +393,7 @@ class SimpleAudioStream : public SimpleAudioStreamBase,
     // State used for protocol enforcement.
     bool rb_started_ __TA_GUARDED(domain_->token()) = false;
     bool rb_fetched_ __TA_GUARDED(domain_->token()) = false;
+    bool is_shutdown_ = false;
     std::atomic<uint32_t> expected_notifications_per_ring_{0};
 };
 

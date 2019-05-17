@@ -43,8 +43,10 @@ struct arch_thread {
     // Debugger access to userspace general regs while suspended or stopped
     // in an exception.
     // The regs are saved on the stack and then a pointer is stored here.
-    // NULL if not suspended or stopped in an exception.
-    struct arm64_iframe_long* suspended_general_regs;
+    // Nullptr if not suspended or not stopped in an exception.
+    // TODO(ZX-563): Also nullptr for synthetic exceptions that don't provide
+    // them yet.
+    struct iframe_t* suspended_general_regs;
 
     // Point to the current cpu pointer when the thread is running, used to
     // restore x18 on exception entry. Swapped on context switch.

@@ -163,6 +163,7 @@ void x86_feature_debug(void);
 #define X86_FEATURE_PKU                 X86_CPUID_BIT(0x7, 2, 3)
 #define X86_FEATURE_IBRS_IBPB           X86_CPUID_BIT(0x7, 3, 26)
 #define X86_FEATURE_STIBP               X86_CPUID_BIT(0x7, 3, 27)
+#define X86_FEATURE_ARCH_CAPABILITIES   X86_CPUID_BIT(0x7, 3, 29)
 #define X86_FEATURE_SSBD                X86_CPUID_BIT(0x7, 3, 31)
 
 #define X86_FEATURE_KVM_PVCLOCK_STABLE  X86_CPUID_BIT(0x40000001, 0, 24)
@@ -258,6 +259,8 @@ struct x86_model_info {
 
     uint32_t display_family;
     uint32_t display_model;
+
+    uint32_t patch_level;
 };
 
 const struct x86_model_info * x86_get_model(void);
@@ -280,9 +283,11 @@ enum x86_microarch_list {
 extern enum x86_microarch_list x86_microarch;
 
 extern bool g_x86_feature_fsgsbase;
+extern bool g_x86_feature_pcid_good;
 
 enum x86_hypervisor_list {
     X86_HYPERVISOR_UNKNOWN,
+    X86_HYPERVISOR_NONE,
     X86_HYPERVISOR_KVM,
 };
 
@@ -307,5 +312,13 @@ static inline const x86_microarch_config_t* x86_get_microarch_config(void) {
     extern const x86_microarch_config_t* x86_microarch_config;
     return x86_microarch_config;
 }
+
+// Vendor-specific per-cpu init functions, in amd.cpp/intel.cpp
+void x86_amd_init_percpu(void);
+void x86_intel_init_percpu(void);
+bool x86_intel_cpu_has_meltdown(void);
+bool x86_intel_cpu_has_l1tf(void);
+uint32_t x86_amd_get_patch_level(void);
+uint32_t x86_intel_get_patch_level(void);
 
 __END_CDECLS

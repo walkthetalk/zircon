@@ -7,7 +7,7 @@
 #include <utility>
 
 #include <lib/fidl/internal.h>
-#include <lib/fidl/llcpp/array_wrapper.h>
+#include <lib/fidl/llcpp/array.h>
 #include <lib/fidl/llcpp/coding.h>
 #include <lib/zx/channel.h>
 
@@ -98,10 +98,10 @@ bool EncodedMessageTest() {
 
     {
         fidl::EncodedMessage<NonnullableChannelMessage> encoded_message;
-        encoded_message.Initialize([&buf, &channel_1](fidl::BytePart& msg_bytes,
-                                                      fidl::HandlePart& msg_handles) {
-            msg_bytes = fidl::BytePart(buf, sizeof(buf), sizeof(buf));
-            zx_handle_t* handle = msg_handles.data();
+        encoded_message.Initialize([&buf, &channel_1](fidl::BytePart* out_msg_bytes,
+                                                      fidl::HandlePart* msg_handles) {
+            *out_msg_bytes = fidl::BytePart(buf, sizeof(buf), sizeof(buf));
+            zx_handle_t* handle = msg_handles->data();
 
             // Unsafely open a channel, which should be closed automatically by encoded_message
             {
@@ -111,7 +111,7 @@ bool EncodedMessageTest() {
                 channel_1 = std::move(out1);
             }
 
-            msg_handles.set_actual(1);
+            msg_handles->set_actual(1);
         });
 
         EXPECT_TRUE(HelperExpectPeerValid(channel_1));
@@ -170,10 +170,10 @@ bool RoundTripTest() {
     zx_handle_t unsafe_handle_backup;
 
     encoded_message->Initialize([&buf, &channel_1, &unsafe_handle_backup](
-                                    fidl::BytePart& msg_bytes,
-                                    fidl::HandlePart& msg_handles) {
-        msg_bytes = fidl::BytePart(buf, sizeof(buf), sizeof(buf));
-        zx_handle_t* handle = msg_handles.data();
+                                    fidl::BytePart* out_msg_bytes,
+                                    fidl::HandlePart* msg_handles) {
+        *out_msg_bytes = fidl::BytePart(buf, sizeof(buf), sizeof(buf));
+        zx_handle_t* handle = msg_handles->data();
 
         // Unsafely open a channel, which should be closed automatically by encoded_message
         {
@@ -184,7 +184,7 @@ bool RoundTripTest() {
             channel_1 = std::move(out1);
         }
 
-        msg_handles.set_actual(1);
+        msg_handles->set_actual(1);
     });
 
     uint8_t golden_encoded[] = {
@@ -241,11 +241,10 @@ bool RoundTripTest() {
 bool ArrayLayoutTest() {
     BEGIN_TEST;
 
-    static_assert(sizeof(fidl::ArrayWrapper<uint8_t, 3>) == sizeof(uint8_t[3]));
-    static_assert(sizeof(fidl::ArrayWrapper<fidl::ArrayWrapper<uint8_t, 7>, 3>)
-                  == sizeof(uint8_t[3][7]));
+    static_assert(sizeof(fidl::Array<uint8_t, 3>) == sizeof(uint8_t[3]));
+    static_assert(sizeof(fidl::Array<fidl::Array<uint8_t, 7>, 3>) == sizeof(uint8_t[3][7]));
 
-    constexpr fidl::ArrayWrapper<uint8_t, 3> a = {1, 2, 3};
+    constexpr fidl::Array<uint8_t, 3> a = {1, 2, 3};
     constexpr uint8_t b[3] = {1, 2, 3};
     EXPECT_EQ((&a[2] - &a[0]), (&b[2] - &b[0]));
 
@@ -259,4 +258,4 @@ RUN_NAMED_TEST("EncodedMessage test", EncodedMessageTest)
 RUN_NAMED_TEST("DecodedMessage test", DecodedMessageTest)
 RUN_NAMED_TEST("Round trip test", RoundTripTest)
 RUN_NAMED_TEST("Array layout test", ArrayLayoutTest)
-END_TEST_CASE(llcpp_types_tests);
+END_TEST_CASE(llcpp_types_tests)

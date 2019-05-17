@@ -1,0 +1,103 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+executable("devcoordinator") {
+  sources = [
+    "main.cpp",
+  ]
+
+  deps = [
+    ":common",
+    "$zx/system/fidl/fuchsia-boot:c",
+    "$zx/system/ulib/devmgr-launcher",
+    "../shared",
+  ]
+
+  # Bring the auxiliaries into the build and the image.  devhost isn't
+  # listed here because it's implicitly in data_deps of every driver().
+  data_deps = [
+    ":internal-drivers",
+    "../fshost",
+    "$zx/system/core/miscsvc",
+    "$zx/system/core/netsvc",
+    "$zx/system/core/svchost",
+    "$zx/system/core/virtcon:virtual-console",
+    "$zx/system/core/pwrbtn-monitor",
+  ]
+}
+
+source_set("internal-drivers") {
+  deps = [
+    "$zx/system/core/devmgr/component",
+    "$zx/system/core/devmgr/dmctl",
+  ]
+}
+
+source_set("common") {
+  visibility = [ ":*" ]
+  sources = [
+    "binding-internal.h",
+    "binding.cpp",
+    "boot-args.cpp",
+    "boot-args.h",
+    "composite-device.cpp",
+    "coordinator.cpp",
+    "coordinator.h",
+    "devfs.cpp",
+    "devfs.h",
+    "devhost-loader-service.cpp",
+    "devhost-loader-service.h",
+    "device.cpp",
+    "device.h",
+    "driver.cpp",
+    "driver.h",
+    "fidl.cpp",
+    "suspend-task.cpp",
+    "task.cpp",
+    "vmo-writer.cpp",
+    "vmo-writer.h",
+  ]
+  public_deps = [
+    "$zx/system/fidl/fuchsia-boot:c",
+    "$zx/system/fidl/fuchsia-device-manager:c",
+    "$zx/system/fidl/fuchsia-io:c",
+    "$zx/system/fidl/fuchsia-mem:c",
+    "$zx/system/ulib/async-loop:async-loop-cpp",
+    "$zx/system/ulib/ddk",
+    "$zx/system/ulib/driver-info",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fdio",
+    "$zx/system/ulib/fidl",
+    "$zx/system/ulib/fit",
+    "$zx/system/ulib/fs",
+    "$zx/system/ulib/launchpad",
+    "$zx/system/ulib/libzbi",
+    "$zx/system/ulib/loader-service",
+    "$zx/system/ulib/memfs",
+    "$zx/system/ulib/svc",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zircon-internal",
+    "$zx/system/ulib/zx",
+  ]
+
+  deps = [
+    "$zx/system/ulib/fidl-async",
+  ]
+}
+
+test("devcoordinator-test") {
+  output_name = "devcoordinator-test"
+  test_group = "ddk"
+  sources = [
+    "binding-test.cpp",
+    "boot-args-test.cpp",
+    "coordinator-test.cpp",
+    "task-test.cpp",
+  ]
+  deps = [
+    ":common",
+    "$zx/system/ulib/zxtest",
+    "../shared:env",
+  ]
+}

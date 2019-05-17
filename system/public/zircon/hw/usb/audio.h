@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_HW_USB_AUDIO_H_
+#define SYSROOT_ZIRCON_HW_USB_AUDIO_H_
 
 // clang-format off
 
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 ////////////////////////////////////////////////////
 //
@@ -521,4 +522,6 @@ typedef struct {
     uint8_t baAssocJackID[];
 } __PACKED usb_midi_ms_endpoint_desc;
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_HW_USB_AUDIO_H_

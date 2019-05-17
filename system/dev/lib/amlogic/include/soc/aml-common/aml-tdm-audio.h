@@ -5,7 +5,7 @@
 #pragma once
 
 #include <assert.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/unique_ptr.h>
 #include <soc/aml-common/aml-audio-regs.h>
 
@@ -75,7 +75,7 @@ public:
     */
     void Shutdown();
 
-    uint32_t fifo_depth() const { return fifo_depth_;};
+    uint32_t fifo_depth() const { return fifo_depth_;}
 
 private:
     const uint32_t fifo_depth_;    // in bytes.
@@ -86,7 +86,7 @@ private:
     const zx_off_t frddr_base_;    // base offset of frddr ch used by this instance
     const zx_off_t tdm_base_;      // base offset of our tdmout block
     const ddk::MmioBuffer mmio_;
-    friend class fbl::unique_ptr<AmlTdmDevice>;
+    friend class std::default_delete<AmlTdmDevice>;
 
     AmlTdmDevice(ddk::MmioBuffer mmio, ee_audio_mclk_src_t clk_src,
         aml_tdm_out_t tdm, aml_frddr_t frddr, aml_tdm_mclk_t mclk,
@@ -98,7 +98,7 @@ private:
         clk_src_(clk_src),
         frddr_base_(GetFrddrBase(frddr)),
         tdm_base_(GetTdmBase(tdm)),
-        mmio_(std::move(mmio)) {};
+        mmio_(std::move(mmio)) {}
 
     ~AmlTdmDevice() = default;
 

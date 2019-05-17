@@ -30,8 +30,8 @@ static constexpr uint64_t kDisplayId = 1;
 static constexpr uint64_t kImageHandle = 0xdecafc0ffee;
 
 void SimpleDisplay::DisplayControllerImplSetDisplayControllerInterface(
-    const display_controller_interface_t* intf) {
-    intf_ = ddk::DisplayControllerInterfaceClient(intf);
+    const display_controller_interface_protocol_t* intf) {
+    intf_ = ddk::DisplayControllerInterfaceProtocolClient(intf);
 
     added_display_args_t args = {};
     args.display_id = kDisplayId;
@@ -110,7 +110,7 @@ void SimpleDisplay::DisplayControllerImplApplyConfiguration(const display_config
     bool has_image = display_count != 0 && display_config[0]->layer_count != 0;
     uint64_t handles[] = { kImageHandle };
     if (intf_.is_valid()) {
-        intf_.OnDisplayVsync(kDisplayId, zx_clock_get(ZX_CLOCK_MONOTONIC), handles, has_image);
+        intf_.OnDisplayVsync(kDisplayId, zx_clock_get_monotonic(), handles, has_image);
     }
 }
 
@@ -132,6 +132,22 @@ zx_status_t SimpleDisplay::DisplayControllerImplAllocateVmo(uint64_t size, zx::v
     }
     if (size > height_ * stride_ * ZX_PIXEL_FORMAT_BYTES(format_)) {
         return ZX_ERR_OUT_OF_RANGE;
+    }
+    return framebuffer_mmio_.get_vmo()->duplicate(ZX_RIGHT_SAME_RIGHTS, vmo_out);
+}
+
+zx_status_t SimpleDisplay::DisplayControllerImplGetSingleBufferFramebuffer(zx::vmo* vmo_out,
+                                                                           uint32_t* out_stride) {
+    *out_stride = stride_;
+    zx_info_handle_count handle_count;
+    size_t actual, avail;
+    zx_status_t status = framebuffer_mmio_.get_vmo()->get_info(
+        ZX_INFO_HANDLE_COUNT, &handle_count, sizeof(handle_count), &actual, &avail);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (handle_count.handle_count != 1) {
+        return ZX_ERR_NO_RESOURCES;
     }
     return framebuffer_mmio_.get_vmo()->duplicate(ZX_RIGHT_SAME_RIGHTS, vmo_out);
 }
@@ -181,6 +197,7 @@ SimpleDisplay::SimpleDisplay(zx_device_t* parent, ddk::MmioBuffer framebuffer_mm
 
 zx_status_t bind_simple_pci_display_bootloader(zx_device_t* dev, const char* name, uint32_t bar) {
     uint32_t format, width, height, stride;
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     zx_status_t status = zx_framebuffer_get_info(get_root_resource(), &format,
                                                  &width, &height, &stride);
     if (status != ZX_OK) {

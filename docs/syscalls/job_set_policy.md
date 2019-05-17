@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-job_set_policy - Set job security and resource policies.
+Set job security and resource policies.
 
 ## SYNOPSIS
 
@@ -79,6 +79,8 @@ Where *condition* is one of
   a new timer.
 + **ZX_POL_NEW_PROCESS** a process under this job is attempting to create
   a new process.
++ **ZX_POL_NEW_PROFILE** a process under this job is attempting to create
+  a new profile.
 + **ZX_POL_NEW_ANY** is a special *condition* that stands for all of
   the above **ZX_NEW** condtions such as **ZX_POL_NEW_VMO**,
   **ZX_POL_NEW_CHANNEL**, **ZX_POL_NEW_EVENT**, **ZX_POL_NEW_EVENTPAIR**,
@@ -86,16 +88,15 @@ Where *condition* is one of
   and any future **ZX_NEW** policy. This will include any new
   kernel objects which do not require a parent object for creation.
 
-Where *policy* is either
+Where *policy* is one of
 + **ZX_POL_ACTION_ALLOW**  allow *condition*.
 + **ZX_POL_ACTION_DENY**  prevent *condition*.
-
-Optionally it can be augmented via OR with
-+ **ZX_POL_ACTION_EXCEPTION** generate an exception via the debug port. An
-  exception generated this way acts as a breakpoint. The thread may be
++ **ZX_POL_ACTION_ALLOW_EXCEPTION**  generate an exception via the debug port.
+  An exception generated this way acts as a breakpoint. The thread may be
   resumed after the exception.
-+ **ZX_POL_ACTION_KILL** terminate the process. It also
-implies **ZX_POL_ACTION_DENY**.
++ **ZX_POL_ACTION_DENY_EXCEPTION**  just like **ZX_POL_ACTION_ALLOW_EXCEPTION**,
+  but after resuming *condition* is denied.
++ **ZX_POL_ACTION_KILL**  terminate the process.
 
 ### **ZX_JOB_POL_TIMER_SLACK**
 
@@ -111,12 +112,12 @@ typedef struct zx_policy_timer_slack {
 
 *min_slack* specifies the minimum amount of slack applied to timers and
 deadline-based events the job. Attempts to set a *min_slack* less than the
-parent job’s *min_slack* are ignored. In other words, a job’s *min_slack* is the
-maximum of the specified value and its parent job’s *min_slack*.
+parent job's *min_slack* are ignored. In other words, a job's *min_slack* is the
+maximum of the specified value and its parent job's *min_slack*.
 
 *default_mode* specifies how slack will be applied when not otherwise indicated
-by the syscall arguments. A job’s *default_mode* may be set regardless of its
-parent job’s *default_mode*. The possible values for *default_mode* are:
+by the syscall arguments. A job's *default_mode* may be set regardless of its
+parent job's *default_mode*. The possible values for *default_mode* are:
 + **ZX_TIMER_SLACK_CENTER**
 + **ZX_TIMER_SLACK_EARLY**
 + **ZX_TIMER_SLACK_LATE**

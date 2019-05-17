@@ -8,11 +8,16 @@
 
 #include <zircon/syscalls/smc.h>
 
-#define __DEFINE_SMC_RESULT_ARG_4(type0, name0, type1, name1, type2, name2, type3, name3) \
+#define __DEFINE_SMC_RESULT_ARG_5(type0, name0, type1, name1, type2, name2, type3, name3, \
+                                  type6, name6) \
     alignas(alignof(decltype(zx_smc_result_t::arg0))) type0 name0;                        \
     alignas(alignof(decltype(zx_smc_result_t::arg1))) type1 name1;                        \
     alignas(alignof(decltype(zx_smc_result_t::arg2))) type2 name2;                        \
-    alignas(alignof(decltype(zx_smc_result_t::arg3))) type3 name3;
+    alignas(alignof(decltype(zx_smc_result_t::arg3))) type3 name3;                        \
+    alignas(alignof(decltype(zx_smc_result_t::arg6))) type6 name6;
+
+#define __DEFINE_SMC_RESULT_ARG_4(...) \
+    __DEFINE_SMC_RESULT_ARG_5(__VA_ARGS__, uint64_t, unused4)
 
 #define __DEFINE_SMC_RESULT_ARG_3(...) \
     __DEFINE_SMC_RESULT_ARG_4(__VA_ARGS__, uint64_t, unused3)
@@ -133,7 +138,7 @@ constexpr uint32_t kTrustedOsCallCountFuncId = CreateFunctionId(kFastCall,
                                                                 kTrustedOsServiceEnd,
                                                                 0xFF00);
 
-DEFINE_SMC_RESULT_STRUCT(TrustedOsCallCountResult, 1, uint32_t, call_count);
+DEFINE_SMC_RESULT_STRUCT(TrustedOsCallCountResult, 1, uint32_t, call_count)
 
 //
 // Call UID Query (0xFF01)
@@ -157,7 +162,7 @@ DEFINE_SMC_RESULT_STRUCT(TrustedOsCallUidResult, 4,
                          uint32_t, uid_0_3,
                          uint32_t, uid_4_7,
                          uint32_t, uid_8_11,
-                         uint32_t, uid_12_15);
+                         uint32_t, uid_12_15)
 
 //
 // Call Revision Query (0xFF03)
@@ -184,6 +189,6 @@ constexpr uint32_t kTrustedOsCallRevisionFuncId = CreateFunctionId(kFastCall,
 
 DEFINE_SMC_RESULT_STRUCT(TrustedOsCallRevisionResult, 2,
                          uint32_t, major,
-                         uint32_t, minor);
+                         uint32_t, minor)
 
 } // namespace tee_smc

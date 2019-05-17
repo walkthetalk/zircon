@@ -37,6 +37,8 @@ public:
     explicit VirtualLayer(Display* display);
     explicit VirtualLayer(const fbl::Vector<Display>& displays);
 
+    virtual ~VirtualLayer() {}
+
     // Finish initializing the layer. All Set* methods should be called before this.
     virtual bool Init(zx_handle_t channel) = 0;
 
@@ -134,6 +136,9 @@ public:
         scaling_ = enable;
     }
     void SetImageFormat(uint32_t image_format) { image_format_ = image_format; }
+    void SetIntelYTiling(bool enable) {
+        intel_y_tiling_ = enable;
+    }
 
     bool Init(zx_handle_t channel) override;
     void StepLayout(int32_t frame_num) override;
@@ -169,6 +174,7 @@ private:
     bool alpha_enable_ = false;
     float alpha_val_ = 0.f;
     bool scaling_ = false;
+    bool intel_y_tiling_ = false;
 
     bool alt_image_ = false;
     Image* images_[2];
@@ -210,8 +216,8 @@ public:
 
     bool Init(zx_handle_t channel) override;
 
-    void SendLayout(zx_handle_t channel) override {};
-    void StepLayout(int32_t frame_num) override {};
+    void SendLayout(zx_handle_t channel) override {}
+    void StepLayout(int32_t frame_num) override {}
     bool WaitForReady() override { return true; }
     void Render(int32_t frame_num) override {}
     uint64_t image_id(uint64_t display_id) const override { return INVALID_ID; }

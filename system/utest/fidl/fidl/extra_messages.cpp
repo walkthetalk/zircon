@@ -5,6 +5,7 @@
 extern "C" {
 
 extern const fidl_type_t fidl_test_coding_StructWithManyHandlesTable;
+extern const fidl_type_t fidl_test_coding_SmallerTableOfStructWithHandleTable;
 extern const fidl_type_t fidl_test_coding_StructWithHandleTable;
 extern const fidl_type_t fidl_test_coding_TableOfStructWithHandleTable;
 extern const fidl_type_t fidl_test_coding_IntStructTable;
@@ -12,6 +13,7 @@ extern const fidl_type_t fidl_test_coding_OlderSimpleTableTable;
 extern const fidl_type_t fidl_test_coding_NewerSimpleTableTable;
 extern const fidl_type_t fidl_test_coding_SimpleTableTable;
 extern const fidl_type_t fidl_test_coding_SampleXUnionTable;
+extern const fidl_type_t fidl_test_coding_SampleNullableXUnionStructTable;
 extern const fidl_type_t fidl_test_coding_SampleXUnionStructTable;
 
 
@@ -37,12 +39,25 @@ static const fidl_type_t HandlehandlenonnullableTable = fidl_type_t(::fidl::Fidl
 
 static const fidl_type_t VectorHandlehandlenonnullable2nonnullableTable = fidl_type_t(::fidl::FidlCodedVector(&HandlehandlenonnullableTable, 2, 4, ::fidl::kNonnullable));
 
+static const ::fidl::FidlXUnionField fidl_test_coding_SampleXUnionNullableRefFields[] = {
+    ::fidl::FidlXUnionField(&::fidl::internal::kInt32Table,319709411),
+    ::fidl::FidlXUnionField(&fidl_test_coding_IntStructTable,376675050),
+    ::fidl::FidlXUnionField(&fidl_test_coding_SimpleTableTable,586453270)
+};
+const fidl_type_t fidl_test_coding_SampleXUnionNullableRefTable = fidl_type_t(::fidl::FidlCodedXUnion(3, fidl_test_coding_SampleXUnionNullableRefFields, ::fidl::kNullable, "fidl.test.coding/SampleXUnion"));
+
+
 static const ::fidl::FidlStructField fidl_test_coding_StructWithManyHandlesFields[] = {
     ::fidl::FidlStructField(&HandlehandlenonnullableTable, 0),
     ::fidl::FidlStructField(&HandlehandlenonnullableTable, 4),
     ::fidl::FidlStructField(&VectorHandlehandlenonnullable2nonnullableTable, 8)
 };
 const fidl_type_t fidl_test_coding_StructWithManyHandlesTable = fidl_type_t(::fidl::FidlCodedStruct(fidl_test_coding_StructWithManyHandlesFields, 3, 24, "fidl.test.coding/StructWithManyHandles"));
+
+static const ::fidl::FidlTableField fidl_test_coding_SmallerTableOfStructWithHandleFields[] = {
+    ::fidl::FidlTableField(&fidl_test_coding_StructWithManyHandlesTable,2)
+};
+const fidl_type_t fidl_test_coding_SmallerTableOfStructWithHandleTable = fidl_type_t(::fidl::FidlCodedTable(fidl_test_coding_SmallerTableOfStructWithHandleFields, 1, "fidl.test.coding/SmallerTableOfStructWithHandle"));
 
 static const ::fidl::FidlStructField fidl_test_coding_StructWithHandleFields[] = {
     ::fidl::FidlStructField(&HandlehandlenonnullableTable, 0)
@@ -77,10 +92,16 @@ static const ::fidl::FidlTableField fidl_test_coding_SimpleTableFields[] = {
 const fidl_type_t fidl_test_coding_SimpleTableTable = fidl_type_t(::fidl::FidlCodedTable(fidl_test_coding_SimpleTableFields, 2, "fidl.test.coding/SimpleTable"));
 
 static const ::fidl::FidlXUnionField fidl_test_coding_SampleXUnionFields[] = {
+    ::fidl::FidlXUnionField(&::fidl::internal::kInt32Table,319709411),
     ::fidl::FidlXUnionField(&fidl_test_coding_IntStructTable,376675050),
     ::fidl::FidlXUnionField(&fidl_test_coding_SimpleTableTable,586453270)
 };
-const fidl_type_t fidl_test_coding_SampleXUnionTable = fidl_type_t(::fidl::FidlCodedXUnion(2, fidl_test_coding_SampleXUnionFields, "fidl.test.coding/SampleXUnion"));
+const fidl_type_t fidl_test_coding_SampleXUnionTable = fidl_type_t(::fidl::FidlCodedXUnion(3, fidl_test_coding_SampleXUnionFields, ::fidl::kNonnullable, "fidl.test.coding/SampleXUnion"));
+
+static const ::fidl::FidlStructField fidl_test_coding_SampleNullableXUnionStructFields[] = {
+    ::fidl::FidlStructField(&fidl_test_coding_SampleXUnionNullableRefTable, 0)
+};
+const fidl_type_t fidl_test_coding_SampleNullableXUnionStructTable = fidl_type_t(::fidl::FidlCodedStruct(fidl_test_coding_SampleNullableXUnionStructFields, 1, 24, "fidl.test.coding/SampleNullableXUnionStruct"));
 
 static const ::fidl::FidlStructField fidl_test_coding_SampleXUnionStructFields[] = {
     ::fidl::FidlStructField(&fidl_test_coding_SampleXUnionTable, 0)

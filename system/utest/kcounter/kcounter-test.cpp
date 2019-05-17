@@ -12,12 +12,12 @@
 #include <fbl/unique_fd.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <lib/counter-vmo-abi.h>
 #include <lib/fdio/io.h>
 #include <lib/fzl/owned-vmo-mapper.h>
 #include <lib/zx/vmo.h>
 #include <unistd.h>
 #include <utility>
-#include <zircon/kernel-counters.h>
 #include <zircon/status.h>
 
 #include <unittest/unittest.h>
@@ -89,10 +89,10 @@ bool test_counters() {
     };
 
     constexpr counters::Descriptor kExpected[] = {
-        {"kernel.counters.magic", counters::Type::kSum},
-        {"kernel.handles.duped", counters::Type::kSum},
-        {"kernel.handles.live", counters::Type::kSum},
-        {"kernel.handles.made", counters::Type::kSum},
+        {"init.target.time.msec", counters::Type::kSum},
+        {"handles.duped", counters::Type::kSum},
+        {"handles.live", counters::Type::kSum},
+        {"handles.made", counters::Type::kSum},
     };
     for (const auto& ref : kExpected) {
         auto found = find(ref);
@@ -116,10 +116,6 @@ bool test_counters() {
                 }
             }
             EXPECT_GT(value, 0, ref.name);
-            if (!strcmp(ref.name, "kernel.counters.magic")) {
-                EXPECT_EQ(value, counters::DescriptorVmo::kMagic,
-                          "kernel.counters.magic");
-            }
         }
     }
 
@@ -131,8 +127,3 @@ bool test_counters() {
 BEGIN_TEST_CASE(counters_test)
 RUN_TEST(test_counters)
 END_TEST_CASE(counters_test)
-
-int main(int argc, char** argv) {
-    bool success = unittest_run_all_tests(argc, argv);
-    return success ? 0 : -1;
-}

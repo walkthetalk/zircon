@@ -4,6 +4,8 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <ddk/metadata.h>
+#include <ddk/metadata/i2c.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/platform/bus.h>
 #include <ddktl/protocol/gpioimpl.h>
@@ -45,6 +47,65 @@ static const pbus_irq_t i2c_irqs[] = {
     },
 };
 
+static const i2c_channel_t i2c_channels[] = {
+    // Backlight I2C
+    {
+        .bus_id = SHERLOCK_I2C_3,
+        .address = 0x2C,
+        .vid = PDEV_VID_TI,
+        .pid = PDEV_PID_TI_LP8556,
+        .did = PDEV_DID_TI_BACKLIGHT,
+    },
+    // Touch screen I2C
+    {
+        .bus_id = SHERLOCK_I2C_2,
+        .address = 0x38,
+        .vid = 0,
+        .pid = 0,
+        .did = 0,
+    },
+    // Tweeter left
+    {
+        .bus_id = SHERLOCK_I2C_A0_0,
+        .address = 0x6c,
+        .vid = 0,
+        .pid = 0,
+        .did = 0,
+    },
+    // Tweeter right
+    {
+        .bus_id = SHERLOCK_I2C_A0_0,
+        .address = 0x6d,
+        .vid = 0,
+        .pid = 0,
+        .did = 0,
+    },
+    // Woofer
+    {
+        .bus_id = SHERLOCK_I2C_A0_0,
+        .address = 0x6f,
+        .vid = 0,
+        .pid = 0,
+        .did = 0,
+    },
+    // IMX227 Camera Sensor
+    {
+        .bus_id = SHERLOCK_I2C_3,
+        .address = 0x36,
+        .vid = 0,
+        .pid = 0,
+        .did = 0,
+    },
+};
+
+static const pbus_metadata_t i2c_metadata[] = {
+    {
+        .type = DEVICE_METADATA_I2C_CHANNELS,
+        .data_buffer = &i2c_channels,
+        .data_size = sizeof(i2c_channels),
+    },
+};
+
 static pbus_dev_t i2c_dev = []() {
     pbus_dev_t dev;
     dev.name = "gpio";
@@ -55,6 +116,8 @@ static pbus_dev_t i2c_dev = []() {
     dev.mmio_count = countof(i2c_mmios);
     dev.irq_list = i2c_irqs;
     dev.irq_count = countof(i2c_irqs);
+    dev.metadata_list = i2c_metadata;
+    dev.metadata_count = countof(i2c_metadata);
     return dev;
 }();
 
@@ -71,9 +134,9 @@ zx_status_t Sherlock::I2cInit() {
     gpio_impl_.SetAltFunction(T931_GPIOA(14), 2);
     gpio_impl_.SetAltFunction(T931_GPIOA(15), 2);
 
-    zx_status_t status = pbus_.ProtocolDeviceAdd(ZX_PROTOCOL_I2C_IMPL, &i2c_dev);
+    zx_status_t status = pbus_.DeviceAdd(&i2c_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: ProtocolDeviceAdd failed %d\n", __func__, status);
+        zxlogf(ERROR, "%s: DeviceAdd failed %d\n", __func__, status);
         return status;
     }
 

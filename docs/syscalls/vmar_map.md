@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-vmar_map - add a memory mapping
+Add a memory mapping.
 
 ## SYNOPSIS
 
@@ -36,7 +36,9 @@ closing the VMO handle does not remove the mapping added by this function.
 - **ZX_VM_SPECIFIC_OVERWRITE**  Same as **ZX_VM_SPECIFIC**, but can
   overlap another mapping.  It is still an error to partially-overlap another VMAR.
   If the range meets these requirements, it will atomically (with respect to all
-  other map/unmap/protect operations) replace existing mappings in the area.
+  other map/unmap/protect operations) replace existing mappings in the range
+  specified by *vmar_offset* and *len*. If that range partially overlaps any
+  mappings, then the portions of those mappings outside the range will remain mapped.
 - **ZX_VM_PERM_READ**  Map *vmo* as readable.  It is an error if *handle*
   does not have **ZX_VM_CAN_MAP_READ** permissions, the *handle* does
   not have the **ZX_RIGHT_READ** right, or the *vmo* handle does not have the
@@ -61,6 +63,18 @@ the mapping will be assigned an offset at random by the kernel (with an
 allocator determined by policy set on the target VMAR).
 
 *len* must be page-aligned.
+
+In addition one of the following power-of-two alignment flags can added:
+- **ZX_VM_ALIGN_1KB** aligns *child_addr* to a power-of-2 at least 1K bytes.
+- **ZX_VM_ALIGN_2KB** aligns *child_addr* to a power-of-2 at least 2K bytes.
+- **ZX_VM_ALIGN_4KB** aligns *child_addr* to a power-of-2 at least 4K bytes.
+- **ZX_VM_ALIGN_8KB** aligns *child_addr* to a power-of-2 at least 8K bytes.
+and continues up to
+- **ZX_VM_ALIGN_4GB** aligns *child_addr* to a power-of-2 at least 4G bytes.
+
+Using **ZX_VM_ALIGN** flags with **ZX_VM_SPECIFIC** will fail if the vmar
+base address + *vmo_offset* are not aligned to the requested value.
+
 
 ## RIGHTS
 
@@ -107,6 +121,7 @@ The VMO that backs a memory mapping can be resized to a smaller size. This can c
 thread is reading or writing to the VMAR region to fault. To avoid this hazard, services
 that receive VMOs from clients should use **ZX_VM_REQUIRE_NON_RESIZABLE** when mapping
 the VMO.
+
 
 ## SEE ALSO
 

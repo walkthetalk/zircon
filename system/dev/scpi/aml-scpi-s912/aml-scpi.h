@@ -7,14 +7,13 @@
 #include <ddk/debug.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/platform-device-lib.h>
-#include <ddk/protocol/platform/bus.h>
-#include <ddk/protocol/platform/device.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
 #include <ddktl/pdev.h>
 #include <ddktl/protocol/mailbox.h>
 #include <ddktl/protocol/scpi.h>
+#include <fuchsia/hardware/thermal/c/fidl.h>
 #include <hw/reg.h>
+#include <lib/mmio/mmio.h>
 #include <lib/sync/completion.h>
 #include <threads.h>
 
@@ -46,7 +45,7 @@ public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(AmlSCPI);
 
     explicit AmlSCPI(zx_device_t* parent)
-        : DeviceType(parent), pdev_(parent), mailbox_(parent) {}
+        : DeviceType(parent), mailbox_(parent) {}
 
     static zx_status_t Create(zx_device_t* parent);
 
@@ -134,10 +133,9 @@ private:
         SCPI_CMD_SYS_PWR_STATE,
     };
 
-    ddk::PDev pdev_;
     ddk::MailboxProtocolClient mailbox_;
     mtx_t lock_;
-    scpi_opp_t* scpi_opp[MAX_DVFS_DOMAINS];
+    scpi_opp_t* scpi_opp[fuchsia_hardware_thermal_MAX_DVFS_DOMAINS];
 };
 
 } // namespace scpi

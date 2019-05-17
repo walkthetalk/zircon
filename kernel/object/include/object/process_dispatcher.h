@@ -6,9 +6,11 @@
 
 #pragma once
 
+#include <kernel/brwlock.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
 #include <object/dispatcher.h>
+#include <object/exceptionate.h>
 #include <object/futex_context.h>
 #include <object/handle.h>
 #include <object/job_policy.h>
@@ -33,8 +35,8 @@ class ProcessDispatcher final
 public:
     static zx_status_t Create(
         fbl::RefPtr<JobDispatcher> job, fbl::StringPiece name, uint32_t flags,
-        fbl::RefPtr<Dispatcher>* dispatcher, zx_rights_t* rights,
-        fbl::RefPtr<VmAddressRegionDispatcher>* root_vmar_disp,
+        KernelHandle<ProcessDispatcher>* handle, zx_rights_t* rights,
+        KernelHandle<VmAddressRegionDispatcher>* root_vmar_handle,
         zx_rights_t* root_vmar_rights);
 
     // Traits to belong in the parent job's raw list.
@@ -87,23 +89,22 @@ public:
     // it belongs to this process. Use |skip_policy = true| for testing that
     // a handle is valid without potentially triggering a job policy exception.
     Handle* GetHandleLocked(
-        zx_handle_t handle_value, bool skip_policy = false) TA_REQ(handle_table_lock_);
+        zx_handle_t handle_value, bool skip_policy = false) TA_REQ_SHARED(handle_table_lock_);
 
     // Adds |handle| to this process handle list. The handle->process_id() is
     // set to this process id().
     void AddHandle(HandleOwner handle);
     void AddHandleLocked(HandleOwner handle) TA_REQ(handle_table_lock_);
 
-    // Removes the Handle corresponding to |handle_value| from this process
-    // handle list.
-    HandleOwner RemoveHandle(zx_handle_t handle_value);
+    // Set of overloads that remove the |handle| or |handle_value| from this process
+    // handle list and returns ownership to the handle.
+    HandleOwner RemoveHandleLocked(Handle* handle) TA_REQ(handle_table_lock_);
     HandleOwner RemoveHandleLocked(zx_handle_t handle_value) TA_REQ(handle_table_lock_);
+    HandleOwner RemoveHandle(zx_handle_t handle_value);
 
-    // Remove all of an array of |user_handles| from the
-    // process. Returns ZX_OK if all of the handles were removed, and
-    // returns ZX_ERR_BAD_HANDLE if any were not.
-    zx_status_t RemoveHandles(user_in_ptr<const zx_handle_t> user_handles,
-                              size_t num_handles);
+    // Remove all of an array of |handles| from the process. Returns ZX_OK if all of the
+    // handles were removed, and returns ZX_ERR_BAD_HANDLE if any were not.
+    zx_status_t RemoveHandles(const zx_handle_t* handles, size_t num_handles);
 
     // Get the dispatcher corresponding to this handle value.
     template <typename T>
@@ -129,22 +130,45 @@ public:
 
     // Get the dispatcher corresponding to this handle value, after
     // checking that this handle has the desired rights.
-    // Returns the rights the handle currently has.
+    // WRONG_TYPE is returned before ACESSS_DENIED, because if the
+    // wrong handle was passed, evaluating its rights does not have
+    // much meaning and also this aids in debugging.
+    // If successful, returns the dispatcher and the rights the
+    // handle currently has.
     template <typename T>
     zx_status_t GetDispatcherWithRights(zx_handle_t handle_value,
                                         zx_rights_t desired_rights,
-                                        fbl::RefPtr<T>* dispatcher,
+                                        fbl::RefPtr<T>* out_dispatcher,
                                         zx_rights_t* out_rights) {
+        bool has_desired_rights;
+        zx_rights_t rights;
         fbl::RefPtr<Dispatcher> generic_dispatcher;
-        auto status = GetDispatcherWithRightsInternal(handle_value,
-                                                      desired_rights,
-                                                      &generic_dispatcher,
-                                                      out_rights);
-        if (status != ZX_OK)
-            return status;
-        *dispatcher = DownCastDispatcher<T>(&generic_dispatcher);
-        if (!*dispatcher)
+
+        {
+            // Scope utilized to reduce lock duration.
+            Guard<BrwLockPi, BrwLockPi::Reader> guard{&handle_table_lock_};
+            Handle* handle = GetHandleLocked(handle_value);
+            if (!handle)
+                return ZX_ERR_BAD_HANDLE;
+
+            has_desired_rights = handle->HasRights(desired_rights);
+            rights = handle->rights();
+            generic_dispatcher = handle->dispatcher();
+        }
+
+        fbl::RefPtr<T> dispatcher = DownCastDispatcher<T>(&generic_dispatcher);
+
+        // Wrong type takes precedence over access denied.
+        if (!dispatcher)
             return ZX_ERR_WRONG_TYPE;
+
+        if (!has_desired_rights)
+            return ZX_ERR_ACCESS_DENIED;
+
+        *out_dispatcher = ktl::move(dispatcher);
+        if (out_rights)
+            *out_rights = rights;
+
         return ZX_OK;
     }
 
@@ -168,7 +192,7 @@ public:
     // returning the error value.
     template <typename T>
     zx_status_t ForEachHandle(T func) const {
-        Guard<fbl::Mutex> guard{&handle_table_lock_};
+        Guard<BrwLockPi, BrwLockPi::Writer> guard{&handle_table_lock_};
         for (const auto& handle : handles_) {
             const Dispatcher* dispatcher = handle.dispatcher().get();
             zx_status_t s = func(MapHandleToValue(&handle), handle.rights(),
@@ -181,10 +205,10 @@ public:
     }
 
     // accessors
-    Lock<fbl::Mutex>* handle_table_lock() TA_RET_CAP(handle_table_lock_) {
+    Lock<BrwLockPi>* handle_table_lock() TA_RET_CAP(handle_table_lock_) {
         return &handle_table_lock_;
     }
-    FutexContext* futex_context() { return &futex_context_; }
+    FutexContext& futex_context() { return futex_context_; }
     State state() const;
     fbl::RefPtr<VmAspace> aspace() { return aspace_; }
     fbl::RefPtr<JobDispatcher> job();
@@ -193,7 +217,7 @@ public:
     zx_status_t set_name(const char* name, size_t len) final;
 
     void Exit(int64_t retcode) __NO_RETURN;
-    void Kill();
+    void Kill(int64_t retcode);
 
     // Suspends the process.
     //
@@ -226,6 +250,10 @@ public:
     // |eport| can either be the process's eport or that of any parent job.
     void OnExceptionPortRemoval(const fbl::RefPtr<ExceptionPort>& eport);
 
+    // TODO(ZX-3072): remove the port-based exception code once everyone is
+    // switched over to channels.
+    Exceptionate* exceptionate(Exceptionate::Type type);
+
     // The following two methods can be slow and inaccurate and should only be
     // called from diagnostics code.
     uint32_t ThreadCount() const;
@@ -242,7 +270,11 @@ public:
     uintptr_t get_debug_addr() const;
     zx_status_t set_debug_addr(uintptr_t addr);
 
-    // Checks the |condition| against the parent job's policy.
+    // Checks |condition| and enforces the parent job's policy.
+    //
+    // Depending on the parent job's policy, this method may signal an exception
+    // on the calling thread or signal that the current process should be
+    // killed.
     //
     // Must be called by syscalls before performing an action represented by an
     // ZX_POL_xxxxx condition. If the return value is ZX_OK the action can
@@ -252,14 +284,15 @@ public:
     // E.g., in sys_channel_create:
     //
     //     auto up = ProcessDispatcher::GetCurrent();
-    //     zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_CHANNEL);
+    //     zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_CHANNEL);
     //     if (res != ZX_OK) {
     //         // Channel creation denied by the calling process's
     //         // parent job's policy.
     //         return res;
     //     }
     //     // Ok to create a channel.
-    zx_status_t QueryBasicPolicy(uint32_t condition) const;
+    __WARN_UNUSED_RESULT
+    zx_status_t EnforceBasicPolicy(uint32_t condition);
 
     // Returns this job's timer slack policy.
     TimerSlack GetTimerSlackPolicy() const;
@@ -290,11 +323,9 @@ private:
     zx_status_t GetDispatcherInternal(zx_handle_t handle_value, fbl::RefPtr<Dispatcher>* dispatcher,
                                       zx_rights_t* rights);
 
-    zx_status_t GetDispatcherWithRightsInternal(zx_handle_t handle_value, zx_rights_t desired_rights,
-                                                fbl::RefPtr<Dispatcher>* dispatcher_out,
-                                                zx_rights_t* out_rights);
 
-    void OnProcessStartForJobDebugger(ThreadDispatcher *t);
+    void OnProcessStartForJobDebugger(ThreadDispatcher *t,
+                                      const arch_exception_context_t* context);
 
     // Thread lifecycle support.
     //
@@ -309,9 +340,6 @@ private:
 
     // Kill all threads
     void KillAllThreadsLocked() TA_REQ(get_lock());
-
-    // TODO(dbort): Add "canary_.Assert()" calls to methods.
-    fbl::Canary<fbl::magic("PROC")> canary_;
 
     // the enclosing job
     const fbl::RefPtr<JobDispatcher> job_;
@@ -335,7 +363,7 @@ private:
     fbl::RefPtr<VmAspace> aspace_;
 
     // our list of handles
-    mutable DECLARE_MUTEX(ProcessDispatcher) handle_table_lock_; // protects |handles_|.
+    mutable DECLARE_BRWLOCK_PI(ProcessDispatcher) handle_table_lock_; // protects |handles_|.
     fbl::DoublyLinkedList<Handle*> handles_ TA_GUARDED(handle_table_lock_);
 
     FutexContext futex_context_;
@@ -356,6 +384,8 @@ private:
     // Exception ports bound to the process.
     fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(get_lock());
     fbl::RefPtr<ExceptionPort> debugger_exception_port_ TA_GUARDED(get_lock());
+    Exceptionate exceptionate_;
+    Exceptionate debug_exceptionate_;
 
     // This is the value of _dl_debug_addr from ld.so.
     // See third_party/ulib/musl/ldso/dynlink.c.

@@ -2,18 +2,67 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <blobfs/allocator.h>
-#include <unittest/unittest.h>
-
 #include "utils.h"
+
+#include <zxtest/zxtest.h>
+
+using id_allocator::IdAllocator;
 
 namespace blobfs {
 
+zx_status_t MockTransactionManager::Transaction(block_fifo_request_t* requests, size_t count) {
+    fbl::AutoLock lock(&lock_);
+
+    if (transaction_callback_) {
+        for (size_t i = 0; i < count; i++) {
+            if (attached_vmos_.size() < requests[i].vmoid) {
+                return ZX_ERR_INVALID_ARGS;
+            }
+
+            std::optional<zx::vmo>* optional_vmo = &attached_vmos_[requests[i].vmoid - 1];
+
+            if (!optional_vmo->has_value()) {
+                return ZX_ERR_BAD_STATE;
+            }
+
+            zx_status_t status = transaction_callback_(requests[i], optional_vmo->value());
+            if (status != ZX_OK) {
+                return status;
+            }
+        }
+    }
+    return ZX_OK;
+}
+
+zx_status_t MockTransactionManager::AttachVmo(const zx::vmo& vmo, vmoid_t* out) {
+    fbl::AutoLock lock(&lock_);
+    zx::vmo duplicate_vmo;
+    zx_status_t status = vmo.duplicate(ZX_RIGHT_SAME_RIGHTS, &duplicate_vmo);
+    if (status != ZX_OK) {
+        return status;
+    }
+    attached_vmos_.push_back(std::move(duplicate_vmo));
+    *out = static_cast<uint16_t>(attached_vmos_.size());
+    if (*out == 0) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+    return ZX_OK;
+}
+
+zx_status_t MockTransactionManager::DetachVmo(vmoid_t vmoid) {
+    fbl::AutoLock lock(&lock_);
+    if (attached_vmos_.size() < vmoid) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    attached_vmos_[vmoid - 1].reset();
+    return ZX_OK;
+}
+
 // Create a block and node map of the requested size, update the superblock of
 // the |space_manager|, and create an allocator from this provided info.
-bool InitializeAllocator(size_t blocks, size_t nodes, MockSpaceManager* space_manager,
+void InitializeAllocator(size_t blocks, size_t nodes, MockSpaceManager* space_manager,
                          fbl::unique_ptr<Allocator>* out) {
-    BEGIN_HELPER;
     RawBitmap block_map;
     ASSERT_EQ(ZX_OK, block_map.Reset(blocks));
     fzl::ResizeableVmoMapper node_map;
@@ -21,16 +70,16 @@ bool InitializeAllocator(size_t blocks, size_t nodes, MockSpaceManager* space_ma
 
     space_manager->MutableInfo().inode_count = nodes;
     space_manager->MutableInfo().data_block_count = blocks;
-    *out = fbl::make_unique<Allocator>(space_manager, std::move(block_map), std::move(node_map));
+    std::unique_ptr<IdAllocator> nodes_bitmap = {};
+    ASSERT_EQ(ZX_OK, IdAllocator::Create(nodes, &nodes_bitmap), "nodes bitmap");
+    *out = std::make_unique<Allocator>(space_manager, std::move(block_map), std::move(node_map),
+                                       std::move(nodes_bitmap));
     (*out)->SetLogging(false);
-    END_HELPER;
 }
 
 // Force the allocator to become maximally fragmented by allocating
 // every-other block within up to |blocks|.
-bool ForceFragmentation(Allocator* allocator, size_t blocks) {
-    BEGIN_HELPER;
-
+void ForceFragmentation(Allocator* allocator, size_t blocks) {
     fbl::Vector<ReservedExtent> extents[blocks];
     for (size_t i = 0; i < blocks; i++) {
         ASSERT_EQ(ZX_OK, allocator->ReserveBlocks(1, &extents[i]));
@@ -40,8 +89,6 @@ bool ForceFragmentation(Allocator* allocator, size_t blocks) {
     for (size_t i = 0; i < blocks; i += 2) {
         allocator->MarkBlocksAllocated(extents[i][0]);
     }
-
-    END_HELPER;
 }
 
 // Save the extents within |in| in a non-reserved vector |out|.

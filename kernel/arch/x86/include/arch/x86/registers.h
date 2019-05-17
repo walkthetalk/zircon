@@ -27,6 +27,7 @@
 #define X86_CR4_OSXSAVE                 0x00040000 /* os supports xsave */
 #define X86_CR4_SMEP                    0x00100000 /* SMEP protection enabling */
 #define X86_CR4_SMAP                    0x00200000 /* SMAP protection enabling */
+#define X86_CR4_PKE                     0x00400000 /* Enable protection keys */
 #define X86_EFER_SCE                    0x00000001 /* enable SYSCALL */
 #define X86_EFER_LME                    0x00000100 /* long mode enable */
 #define X86_EFER_LMA                    0x00000400 /* long mode active */
@@ -36,6 +37,9 @@
 #define X86_MSR_IA32_TSC_ADJUST         0x0000003b /* TSC adjust */
 #define X86_MSR_IA32_BIOS_SIGN_ID       0x0000008b /* BIOS update signature */
 #define X86_MSR_IA32_MTRRCAP            0x000000fe /* MTRR capability */
+#define X86_MSR_IA32_ARCH_CAPABILITIES  0x0000010a
+#define X86_ARCH_CAPABILITIES_RDCL_NO   (1ull < 0)
+#define X86_MSR_IA32_FLUSH_CMD          0x0000010b /* L1D$ Flush control */
 #define X86_MSR_IA32_SYSENTER_CS        0x00000174 /* SYSENTER CS */
 #define X86_MSR_IA32_SYSENTER_ESP       0x00000175 /* SYSENTER ESP */
 #define X86_MSR_IA32_SYSENTER_EIP       0x00000176 /* SYSENTER EIP */
@@ -69,6 +73,7 @@
 #define X86_CR4_PSE                     0xffffffef /* Disabling PSE bit in the CR4 */
 
 // Non-architectural MSRs
+#define X86_MSR_POWER_CTL               0x000001fc /* Power Control Register */
 #define X86_MSR_RAPL_POWER_UNIT         0x00000606 /* RAPL unit multipliers */
 #define X86_MSR_PKG_POWER_LIMIT         0x00000610 /* Package power limits */
 #define X86_MSR_PKG_POWER_LIMIT_PL1_CLAMP   (1 << 16)
@@ -243,11 +248,26 @@ void x86_extended_register_init(void);
  * will ensure it is enabled on all CPUs */
 bool x86_extended_register_enable_feature(enum x86_extended_register_feature);
 
+/* Return the size required for all requested features. */
 size_t x86_extended_register_size(void);
+
+/* Return the size required for all supported features, whether requested or not. */
+size_t x86_extended_register_max_size(void);
+
+/* Return all potentially supported (although possibly not currently enabled) state bits for xcr0 */
+uint64_t x86_extended_xcr0_component_bitmap(void);
+
+/* Returns whether or not xsave is supported by the CPU */
+bool x86_xsave_supported(void);
 
 /* Initialize a state vector. The passed in buffer must be X86_EXTENDED_REGISTER_SIZE big and it
  * must be 64-byte aligned. This function will initialize it for use in save and restore. */
 void x86_extended_register_init_state(void* buffer);
+
+/* Initialize a state vector to a specific set of state bits. The passed in buffer must be
+ * X86_EXTENDED_REGISTER_SIZE big and it must be 64-byte aligned. This function will initialize it
+ * for use in save and restore. */
+void x86_extended_register_init_state_from_bv(void* register_state, uint64_t xstate_bv);
 
 /* Save current state to state vector */
 void x86_extended_register_save_state(void *register_state);

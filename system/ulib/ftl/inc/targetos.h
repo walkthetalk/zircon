@@ -36,8 +36,12 @@ extern "C" {
 #define vui16 volatile uint16_t
 #define vui32 volatile uint32_t
 
+// __USE_MISC determines whether these types are defined for linux-arm64.
+// Only define these if they're not already defined.
+#ifndef __USE_MISC
 #define uint unsigned int
 #define ulong unsigned long
+#endif
 
 #undef TRUE
 #define TRUE 1
@@ -168,6 +172,7 @@ typedef volatile struct vol_circ_list {
 // Circular Linked List Management Macros
 
 #define CIRC_LIST_INIT(lst) ((lst)->next_fwd = (lst)->next_bck = (lst))
+#define CIRC_NODE_INIT(node) CIRC_LIST_INIT(node)
 
 #define CIRC_NODE_APPEND(free_node, list_node)         \
     do {                                               \

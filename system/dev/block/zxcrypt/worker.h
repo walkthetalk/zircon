@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <stdint.h>
 #include <threads.h>
 
@@ -11,7 +12,7 @@
 #include <lib/zx/port.h>
 #include <zircon/syscalls/port.h>
 #include <zircon/types.h>
-#include <zxcrypt/volume.h>
+#include <zxcrypt/ddk-volume.h>
 
 #include "extra.h"
 
@@ -37,7 +38,7 @@ public:
 
     // Starts the worker, which will service requests sent from the given |device| on the given
     // |port|.  Cryptographic operations will use the key material from the given |volume|.
-    zx_status_t Start(Device* device, const Volume& volume, zx::port&& port);
+    zx_status_t Start(Device* device, const DdkVolume& volume, zx::port&& port);
 
     // Asks the worker to stop.  This call blocks until the worker has finished processing the
     // currently queued operations and exits.
@@ -71,6 +72,9 @@ private:
 
     // The executing thread for this worker
     thrd_t thrd_;
+
+    // Indicates if a thread was created for this worker
+    std::atomic_bool started_;
 };
 
 } // namespace zxcrypt

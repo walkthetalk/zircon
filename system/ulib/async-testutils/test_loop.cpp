@@ -55,71 +55,13 @@ public:
 
     zx::time Now() const override { return current_time_; }
 
-    void RegisterTimer(zx::time deadline, TimerDispatcher* dispatcher) override {
-        if (deadline <= current_time_) {
-            dispatcher->FireTimer();
-            return;
-        }
-
-        for (auto& entry : table_) {
-            if (entry.dispatcher == dispatcher) {
-                entry.deadlines.push_back(deadline);
-                return;
-            }
-        }
-
-        DeadlinesByDispatcher entry{};
-        entry.dispatcher = dispatcher;
-        entry.deadlines.push_back(deadline);
-        table_.push_back(std::move(entry));
-    }
-
-    void CancelTimers(TimerDispatcher* dispatcher) override {
-        size_t ind = 0;
-        for (; ind < table_.size(); ++ind){
-            if (table_[ind].dispatcher == dispatcher){
-                table_.erase(ind);
-                return;
-            }
-        }
-    }
-
     void AdvanceTimeTo(zx::time time) {
         if (time < current_time_) { return; }
         current_time_ = time;
-
-        for (auto& entry : table_) {
-            if (entry.deadlines.size() == 0) {
-                continue;
-            }
-            zx::time min_deadline =
-              *fbl::min_element(entry.deadlines.begin(), entry.deadlines.end());
-            if (min_deadline > time){
-                continue;
-            }
-            entry.dispatcher->FireTimer();
-
-            size_t end = entry.deadlines.size() - 1;
-            for (size_t i = 0; i <= entry.deadlines.size(); ++i){
-                zx::time back = entry.deadlines[end];
-                entry.deadlines.pop_back();
-                if (back > time) {
-                    entry.deadlines.insert(0, back);
-                    continue;
-                }
-                --end;
-            }
-        }
     }
 
 private:
-    struct DeadlinesByDispatcher {
-      TimerDispatcher* dispatcher;
-      fbl::Vector<zx::time> deadlines;
-    };
-
     zx::time current_time_;
-    fbl::Vector<DeadlinesByDispatcher> table_;
 };
 
 
@@ -151,7 +93,7 @@ TestLoop::TestLoop() : TestLoop(0) {}
 TestLoop::TestLoop(uint32_t state)
     : time_keeper_(new TestLoopTimeKeeper()),
       initial_state_((state != 0)? state : GetRandomSeed()), state_(initial_state_) {
-    dispatchers_.push_back(fbl::make_unique<TestLoopDispatcher>(time_keeper_.get()));
+    dispatchers_.push_back(std::make_unique<TestLoopDispatcher>(time_keeper_.get()));
     async_set_default_dispatcher(dispatchers_[0].get());
 
     printf("\nTEST_LOOP_RANDOM_SEED=\"%u\"\n", initial_state_);
@@ -166,9 +108,9 @@ async_dispatcher_t* TestLoop::dispatcher() {
 }
 
 fbl::unique_ptr<LoopInterface> TestLoop::StartNewLoop() {
-    dispatchers_.push_back(fbl::make_unique<TestLoopDispatcher>(time_keeper_.get()));
+    dispatchers_.push_back(std::make_unique<TestLoopDispatcher>(time_keeper_.get()));
     auto* new_dispatcher = dispatchers_[dispatchers_.size() - 1].get();
-    return fbl::make_unique<TestLoopInterface>(this, new_dispatcher);
+    return std::make_unique<TestLoopInterface>(this, new_dispatcher);
 }
 
 zx::time TestLoop::Now() const {

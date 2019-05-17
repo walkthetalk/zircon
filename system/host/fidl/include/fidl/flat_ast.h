@@ -13,7 +13,10 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string_view>
+#include <optional>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 #include <lib/fit/function.h>
@@ -24,6 +27,12 @@
 #include "type_shape.h"
 #include "virtual_source_file.h"
 
+// TODO(FIDL-487, ZX-3415): Decide if all cases of NumericConstantValue::Convert() are safe.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-compare"
+#endif
+
 namespace fidl {
 namespace flat {
 
@@ -32,13 +41,14 @@ struct PtrCompare {
     bool operator()(const T* left, const T* right) const { return *left < *right; }
 };
 
+class Typespace;
 struct Decl;
 class Library;
 
 bool HasSimpleLayout(const Decl* decl);
 
 // This is needed (for now) to work around declaration order issues.
-std::string LibraryName(const Library* library, StringView separator);
+std::string LibraryName(const Library* library, std::string_view separator);
 
 // Name represents a scope name, i.e. a name within the context of a library
 // or in the 'global' context. Names either reference (or name) things which
@@ -48,47 +58,53 @@ struct Name {
     Name() {}
 
     Name(const Library* library, const SourceLocation name)
-        : library_(library),
-          name_from_source_(std::make_unique<SourceLocation>(name)) {}
+        : library_(library), name_(name) {}
 
     Name(const Library* library, const std::string& name)
-        : library_(library),
-          anonymous_name_(std::make_unique<std::string>(name)) {}
+        : library_(library), name_(name) {}
 
     Name(Name&&) = default;
     Name& operator=(Name&&) = default;
 
-    bool is_anonymous() const { return name_from_source_ == nullptr; }
     const Library* library() const { return library_; }
-    const SourceLocation& source_location() const {
-        assert(!is_anonymous());
-        return *name_from_source_.get();
+    const SourceLocation* maybe_location() const {
+        if (std::holds_alternative<AnonymousName>(name_)) {
+            return nullptr;
+        }
+        return &std::get<SourceLocation>(name_);
     }
-    const StringView name_part() const {
-        if (is_anonymous())
-            return *anonymous_name_.get();
-        return name_from_source_->data();
+    const std::string_view name_part() const {
+        if (std::holds_alternative<AnonymousName>(name_)) {
+            return std::get<AnonymousName>(name_);
+        } else {
+            return std::get<SourceLocation>(name_).data();
+        }
     }
 
     bool operator==(const Name& other) const {
-        // TODO(pascallouis): Why are we lenient, and allow a name comparison,
-        // rather than require the more stricter pointer equality here?
-        if (LibraryName(library_, ".") != LibraryName(other.library_, "."))
+        // can't use the library name yet, not necesserily compiled!
+        auto library_ptr = reinterpret_cast<uintptr_t>(library_);
+        auto other_library_ptr = reinterpret_cast<uintptr_t>(other.library_);
+        if (library_ptr != other_library_ptr)
             return false;
         return name_part() == other.name_part();
     }
     bool operator!=(const Name& other) const { return !operator==(other); }
 
     bool operator<(const Name& other) const {
-        if (LibraryName(library_, ".") != LibraryName(other.library_, "."))
-            return LibraryName(library_, ".") < LibraryName(other.library_, ".");
+        // can't use the library name yet, not necesserily compiled!
+        auto library_ptr = reinterpret_cast<uintptr_t>(library_);
+        auto other_library_ptr = reinterpret_cast<uintptr_t>(other.library_);
+        if (library_ptr != other_library_ptr)
+            return library_ptr < other_library_ptr;
         return name_part() < other.name_part();
     }
 
 private:
+    using AnonymousName = std::string;
+
     const Library* library_ = nullptr;
-    std::unique_ptr<SourceLocation> name_from_source_;
-    std::unique_ptr<std::string> anonymous_name_;
+    std::variant<SourceLocation, AnonymousName> name_;
 };
 
 struct ConstantValue {
@@ -342,7 +358,7 @@ struct BoolConstantValue : ConstantValue {
 };
 
 struct StringConstantValue : ConstantValue {
-    explicit StringConstantValue(StringView value)
+    explicit StringConstantValue(std::string_view value)
         : ConstantValue(ConstantValue::Kind::kString), value(value) {}
 
     friend std::ostream& operator<<(std::ostream& os, const StringConstantValue& v) {
@@ -354,14 +370,14 @@ struct StringConstantValue : ConstantValue {
         assert(out_value != nullptr);
         switch (kind) {
         case Kind::kString:
-            *out_value = std::make_unique<StringConstantValue>(StringView(value));
+            *out_value = std::make_unique<StringConstantValue>(std::string_view(value));
             return true;
         default:
             return false;
         }
     }
 
-    StringView value;
+    std::string_view value;
 };
 
 struct Constant {
@@ -420,6 +436,7 @@ struct Decl {
     virtual ~Decl() {}
 
     enum struct Kind {
+        kBits,
         kConst,
         kEnum,
         kInterface,
@@ -437,12 +454,19 @@ struct Decl {
     std::unique_ptr<raw::AttributeList> attributes;
     const Name name;
 
-    bool HasAttribute(fidl::StringView name) const;
-    fidl::StringView GetAttribute(fidl::StringView name) const;
+    bool HasAttribute(std::string_view name) const;
+    std::string_view GetAttribute(std::string_view name) const;
     std::string GetName() const;
 
     bool compiling = false;
     bool compiled = false;
+};
+
+struct TypeDecl : public Decl {
+    TypeDecl(Kind kind, std::unique_ptr<raw::AttributeList> attributes, Name name)
+        : Decl(kind, std::move(attributes), std::move(name)) {}
+    TypeShape typeshape;
+    bool recursive = false;
 };
 
 struct Type {
@@ -458,14 +482,12 @@ struct Type {
         kIdentifier,
     };
 
-    explicit Type(Kind kind, uint32_t size, types::Nullability nullability)
-        : kind(kind), size(size), nullability(nullability) {}
+    explicit Type(Kind kind, types::Nullability nullability, TypeShape shape)
+        : kind(kind), nullability(nullability), shape(shape) {}
 
     const Kind kind;
-    // Set at construction time for most types. Identifier types get
-    // this set later, during compilation.
-    uint32_t size;
     const types::Nullability nullability;
+    TypeShape shape;
 
     // Comparison helper object.
     class Comparison {
@@ -510,63 +532,63 @@ struct Type {
 };
 
 struct ArrayType : public Type {
-    ArrayType(SourceLocation name, std::unique_ptr<Type> element_type,
-              std::unique_ptr<Constant> element_count)
-        : Type(Kind::kArray, 0u, types::Nullability::kNonnullable), name(name),
-          element_type(std::move(element_type)),
-          element_count(std::move(element_count)) {}
+    ArrayType(const Type* element_type, const Size* element_count)
+        : Type(
+              Kind::kArray,
+              types::Nullability::kNonnullable,
+              Shape(element_type->shape, element_count->value)),
+          element_type(element_type), element_count(element_count) {}
 
-    SourceLocation name;
-    std::unique_ptr<Type> element_type;
-    std::unique_ptr<Constant> element_count;
+    const Type* element_type;
+    const Size* element_count;
 
     Comparison Compare(const Type& other) const override {
         const auto& o = static_cast<const ArrayType&>(other);
         return Type::Compare(o)
-            .Compare(static_cast<const Size&>(element_count->Value()).value,
-                     static_cast<const Size&>(o.element_count->Value()).value)
+            .Compare(element_count->value, o.element_count->value)
             .Compare(*element_type, *o.element_type);
     }
+
+    static TypeShape Shape(TypeShape element, uint32_t count);
 };
 
 struct VectorType : public Type {
-    VectorType(SourceLocation name, std::unique_ptr<Type> element_type,
-               std::unique_ptr<Constant> element_count, types::Nullability nullability)
-        : Type(Kind::kVector, 16u, nullability), name(name), element_type(std::move(element_type)),
-          element_count(std::move(element_count)) {}
+    VectorType(const Type* element_type, const Size* element_count, types::Nullability nullability)
+        : Type(Kind::kVector, nullability, Shape(element_type->shape, element_count->value)),
+          element_type(element_type), element_count(element_count) {}
 
-    SourceLocation name;
-    std::unique_ptr<Type> element_type;
-    std::unique_ptr<Constant> element_count;
+    const Type* element_type;
+    const Size* element_count;
 
     Comparison Compare(const Type& other) const override {
         const auto& o = static_cast<const VectorType&>(other);
         return Type::Compare(o)
-            .Compare(static_cast<const Size&>(element_count->Value()).value,
-                     static_cast<const Size&>(o.element_count->Value()).value)
+            .Compare(element_count->value, o.element_count->value)
             .Compare(*element_type, *o.element_type);
     }
+
+    static TypeShape Shape(TypeShape element, uint32_t max_element_count);
 };
 
 struct StringType : public Type {
-    StringType(SourceLocation name, std::unique_ptr<Constant> max_size,
-               types::Nullability nullability)
-        : Type(Kind::kString, 16u, nullability), name(name), max_size(std::move(max_size)) {}
+    StringType(const Size* max_size, types::Nullability nullability)
+        : Type(Kind::kString, nullability, Shape(max_size->value)), max_size(max_size) {}
 
-    SourceLocation name;
-    std::unique_ptr<Constant> max_size;
+    const Size* max_size;
 
     Comparison Compare(const Type& other) const override {
         const auto& o = static_cast<const StringType&>(other);
         return Type::Compare(o)
-            .Compare(static_cast<const Size&>(max_size->Value()).value,
-                     static_cast<const Size&>(o.max_size->Value()).value);
+            .Compare(max_size->value, o.max_size->value);
     }
+
+    static TypeShape Shape(uint32_t max_length);
 };
 
 struct HandleType : public Type {
     HandleType(types::HandleSubtype subtype, types::Nullability nullability)
-        : Type(Kind::kHandle, 4u, nullability), subtype(subtype) {}
+        : Type(Kind::kHandle, nullability, Shape()),
+          subtype(subtype) {}
 
     const types::HandleSubtype subtype;
 
@@ -575,47 +597,17 @@ struct HandleType : public Type {
         return Type::Compare(o)
             .Compare(subtype, o.subtype);
     }
-};
 
-struct RequestHandleType : public Type {
-    RequestHandleType(Name name, types::Nullability nullability)
-        : Type(Kind::kRequestHandle, 4u, nullability), name(std::move(name)) {}
-
-    Name name;
-
-    Comparison Compare(const Type& other) const override {
-        const auto& o = static_cast<const RequestHandleType&>(other);
-        return Type::Compare(o)
-            .Compare(name, o.name);
-    }
+    static TypeShape Shape();
 };
 
 struct PrimitiveType : public Type {
-    static uint32_t SubtypeSize(types::PrimitiveSubtype subtype) {
-        switch (subtype) {
-        case types::PrimitiveSubtype::kBool:
-        case types::PrimitiveSubtype::kInt8:
-        case types::PrimitiveSubtype::kUint8:
-            return 1u;
-
-        case types::PrimitiveSubtype::kInt16:
-        case types::PrimitiveSubtype::kUint16:
-            return 2u;
-
-        case types::PrimitiveSubtype::kFloat32:
-        case types::PrimitiveSubtype::kInt32:
-        case types::PrimitiveSubtype::kUint32:
-            return 4u;
-
-        case types::PrimitiveSubtype::kFloat64:
-        case types::PrimitiveSubtype::kInt64:
-        case types::PrimitiveSubtype::kUint64:
-            return 8u;
-        }
-    }
 
     explicit PrimitiveType(types::PrimitiveSubtype subtype)
-        : Type(Kind::kPrimitive, SubtypeSize(subtype), types::Nullability::kNonnullable),
+        : Type(
+            Kind::kPrimitive,
+            types::Nullability::kNonnullable,
+            Shape(subtype)),
           subtype(subtype) {}
 
     types::PrimitiveSubtype subtype;
@@ -625,19 +617,59 @@ struct PrimitiveType : public Type {
         return Type::Compare(o)
             .Compare(subtype, o.subtype);
     }
+
+    static TypeShape Shape(types::PrimitiveSubtype subtype);
+    static uint32_t SubtypeSize(types::PrimitiveSubtype subtype);
 };
 
 struct IdentifierType : public Type {
-    IdentifierType(Name name, types::Nullability nullability)
-        : Type(Kind::kIdentifier, 0u, nullability), name(std::move(name)) {}
+    IdentifierType(Name name, types::Nullability nullability, const TypeDecl* type_decl, TypeShape shape)
+        : Type(Kind::kIdentifier, nullability, shape),
+          name(std::move(name)), type_decl(type_decl) {}
 
     Name name;
+    const TypeDecl* type_decl;
+
+    Comparison Compare(const Type& other) const override {
+        const auto& o = static_cast<const IdentifierType&>(other);
+        return Type::Compare(o)
+            .Compare(name, o.name);
+    }
+};
+
+struct RequestHandleType : public Type {
+    RequestHandleType(const IdentifierType* interface_type, types::Nullability nullability)
+        : Type(Kind::kRequestHandle, nullability, HandleType::Shape()),
+          interface_type(interface_type) {}
+
+    const IdentifierType* interface_type;
 
     Comparison Compare(const Type& other) const override {
         const auto& o = static_cast<const RequestHandleType&>(other);
         return Type::Compare(o)
-            .Compare(name, o.name);
+            .Compare(*interface_type, *o.interface_type);
     }
+};
+
+struct TypeConstructor {
+    TypeConstructor(Name name, std::unique_ptr<TypeConstructor> maybe_arg_type_ctor,
+               std::optional<types::HandleSubtype> handle_subtype,
+               std::unique_ptr<Constant> maybe_size, types::Nullability nullability)
+        : name(std::move(name)), maybe_arg_type_ctor(std::move(maybe_arg_type_ctor)),
+          handle_subtype(handle_subtype),
+          maybe_size(std::move(maybe_size)), nullability(nullability) {}
+
+    // Set during construction.
+    const Name name;
+    const std::unique_ptr<TypeConstructor> maybe_arg_type_ctor;
+    const std::optional<types::HandleSubtype> handle_subtype;
+    const std::unique_ptr<Constant> maybe_size;
+    const types::Nullability nullability;
+
+    // Set during compilation.
+    bool compiling = false;
+    bool compiled = false;
+    const Type* type = nullptr;
 };
 
 struct Using {
@@ -649,15 +681,16 @@ struct Using {
 };
 
 struct Const : public Decl {
-    Const(std::unique_ptr<raw::AttributeList> attributes, Name name, std::unique_ptr<Type> type,
+    Const(std::unique_ptr<raw::AttributeList> attributes, Name name,
+          std::unique_ptr<TypeConstructor> type_ctor,
           std::unique_ptr<Constant> value)
-        : Decl(Kind::kConst, std::move(attributes), std::move(name)), type(std::move(type)),
+        : Decl(Kind::kConst, std::move(attributes), std::move(name)), type_ctor(std::move(type_ctor)),
           value(std::move(value)) {}
-    std::unique_ptr<Type> type;
+    std::unique_ptr<TypeConstructor> type_ctor;
     std::unique_ptr<Constant> value;
 };
 
-struct Enum : public Decl {
+struct Enum : public TypeDecl {
     struct Member {
         Member(SourceLocation name, std::unique_ptr<Constant> value, std::unique_ptr<raw::AttributeList> attributes)
             : name(name), value(std::move(value)), attributes(std::move(attributes)) {}
@@ -667,30 +700,53 @@ struct Enum : public Decl {
     };
 
     Enum(std::unique_ptr<raw::AttributeList> attributes, Name name,
-         std::unique_ptr<raw::IdentifierType> maybe_subtype,
+         std::unique_ptr<TypeConstructor> subtype_ctor,
          std::vector<Member> members)
-        : Decl(Kind::kEnum, std::move(attributes), std::move(name)),
-          maybe_subtype(std::move(maybe_subtype)),
+        : TypeDecl(Kind::kEnum, std::move(attributes), std::move(name)),
+          subtype_ctor(std::move(subtype_ctor)),
           members(std::move(members)) {}
 
     // Set during construction.
-    std::unique_ptr<raw::IdentifierType> maybe_subtype;
+    std::unique_ptr<TypeConstructor> subtype_ctor;
     std::vector<Member> members;
 
     // Set during compilation.
     const PrimitiveType* type = nullptr;
-    TypeShape typeshape;
 };
 
-struct Struct : public Decl {
+struct Bits : public TypeDecl {
     struct Member {
-        Member(std::unique_ptr<Type> type, SourceLocation name,
+        Member(SourceLocation name, std::unique_ptr<Constant> value, std::unique_ptr<raw::AttributeList> attributes)
+            : name(name), value(std::move(value)), attributes(std::move(attributes)) {}
+        SourceLocation name;
+        std::unique_ptr<Constant> value;
+        std::unique_ptr<raw::AttributeList> attributes;
+    };
+
+    Bits(std::unique_ptr<raw::AttributeList> attributes, Name name,
+         std::unique_ptr<TypeConstructor> subtype_ctor,
+         std::vector<Member> members)
+        : TypeDecl(Kind::kBits, std::move(attributes), std::move(name)),
+          subtype_ctor(std::move(subtype_ctor)),
+          members(std::move(members)) {}
+
+    // Set during construction.
+    std::unique_ptr<TypeConstructor> subtype_ctor;
+    std::vector<Member> members;
+
+    // Set during compilation.
+    uint64_t mask = 0;
+};
+
+struct Struct : public TypeDecl {
+    struct Member {
+        Member(std::unique_ptr<TypeConstructor> type_ctor, SourceLocation name,
                std::unique_ptr<Constant> maybe_default_value,
                std::unique_ptr<raw::AttributeList> attributes)
-            : type(std::move(type)), name(std::move(name)),
+            : type_ctor(std::move(type_ctor)), name(std::move(name)),
               maybe_default_value(std::move(maybe_default_value)),
               attributes(std::move(attributes)) {}
-        std::unique_ptr<Type> type;
+        std::unique_ptr<TypeConstructor> type_ctor;
         SourceLocation name;
         std::unique_ptr<Constant> maybe_default_value;
         std::unique_ptr<raw::AttributeList> attributes;
@@ -699,36 +755,40 @@ struct Struct : public Decl {
 
     Struct(std::unique_ptr<raw::AttributeList> attributes, Name name,
            std::vector<Member> members, bool anonymous = false)
-        : Decl(Kind::kStruct, std::move(attributes), std::move(name)),
+        : TypeDecl(Kind::kStruct, std::move(attributes), std::move(name)),
           members(std::move(members)), anonymous(anonymous) {
     }
 
     std::vector<Member> members;
     const bool anonymous;
-    TypeShape typeshape;
-    bool recursive = false;
+
+    static TypeShape Shape(std::vector<FieldShape*>* fields, uint32_t extra_handles = 0u);
 };
 
-struct Table : public Decl {
+struct Table : public TypeDecl {
     struct Member {
-        Member(std::unique_ptr<raw::Ordinal> ordinal, std::unique_ptr<Type> type, SourceLocation name,
+        Member(std::unique_ptr<raw::Ordinal> ordinal, std::unique_ptr<TypeConstructor> type,
+               SourceLocation name,
                std::unique_ptr<Constant> maybe_default_value,
                std::unique_ptr<raw::AttributeList> attributes)
             : ordinal(std::move(ordinal)),
               maybe_used(std::make_unique<Used>(std::move(type), std::move(name),
                                                 std::move(maybe_default_value),
                                                 std::move(attributes))) {}
-        Member(std::unique_ptr<raw::Ordinal> ordinal)
-            : ordinal(std::move(ordinal)) {}
+        Member(std::unique_ptr<raw::Ordinal> ordinal, SourceLocation location)
+            : ordinal(std::move(ordinal)),
+              maybe_location(std::make_unique<SourceLocation>(location)) {}
         std::unique_ptr<raw::Ordinal> ordinal;
+        // The location for reserved table members.
+        std::unique_ptr<SourceLocation> maybe_location;
         struct Used {
-            Used(std::unique_ptr<Type> type, SourceLocation name,
+            Used(std::unique_ptr<TypeConstructor> type_ctor, SourceLocation name,
                  std::unique_ptr<Constant> maybe_default_value,
                  std::unique_ptr<raw::AttributeList> attributes)
-                : type(std::move(type)), name(std::move(name)),
+                : type_ctor(std::move(type_ctor)), name(std::move(name)),
                   maybe_default_value(std::move(maybe_default_value)),
                   attributes(std::move(attributes)) {}
-            std::unique_ptr<Type> type;
+            std::unique_ptr<TypeConstructor> type_ctor;
             SourceLocation name;
             std::unique_ptr<Constant> maybe_default_value;
             std::unique_ptr<raw::AttributeList> attributes;
@@ -738,55 +798,60 @@ struct Table : public Decl {
     };
 
     Table(std::unique_ptr<raw::AttributeList> attributes, Name name, std::vector<Member> members)
-        : Decl(Kind::kTable, std::move(attributes), std::move(name)), members(std::move(members)) {
-    }
+        : TypeDecl(Kind::kTable, std::move(attributes), std::move(name)),
+                   members(std::move(members)) {}
 
     std::vector<Member> members;
-    TypeShape typeshape;
-    bool recursive = false;
+
+    static TypeShape Shape(std::vector<TypeShape*>* fields, uint32_t extra_handles = 0u);
 };
 
-struct Union : public Decl {
+struct Union : public TypeDecl {
     struct Member {
-        Member(std::unique_ptr<Type> type, SourceLocation name, std::unique_ptr<raw::AttributeList> attributes)
-            : type(std::move(type)), name(std::move(name)), attributes(std::move(attributes)) {}
-        std::unique_ptr<Type> type;
+        Member(std::unique_ptr<TypeConstructor> type_ctor, SourceLocation name,
+               std::unique_ptr<raw::AttributeList> attributes)
+            : type_ctor(std::move(type_ctor)), name(std::move(name)),
+              attributes(std::move(attributes)) {}
+        std::unique_ptr<TypeConstructor> type_ctor;
         SourceLocation name;
         std::unique_ptr<raw::AttributeList> attributes;
         FieldShape fieldshape;
     };
 
     Union(std::unique_ptr<raw::AttributeList> attributes, Name name, std::vector<Member> members)
-        : Decl(Kind::kUnion, std::move(attributes), std::move(name)), members(std::move(members)) {}
+        : TypeDecl(Kind::kUnion, std::move(attributes), std::move(name)),
+                   members(std::move(members)) {}
 
     std::vector<Member> members;
-    TypeShape typeshape;
     // The offset of each of the union members is the same, so store
     // it here as well.
     FieldShape membershape;
-    bool recursive = false;
+
+    static TypeShape Shape(const std::vector<flat::Union::Member>& members);
 };
 
-struct XUnion : public Decl {
+struct XUnion : public TypeDecl {
     struct Member {
-        Member(std::unique_ptr<raw::Ordinal> ordinal, std::unique_ptr<Type> type, SourceLocation name, std::unique_ptr<raw::AttributeList> attributes)
-            : ordinal(std::move(ordinal)), type(std::move(type)), name(std::move(name)), attributes(std::move(attributes)) {}
+        Member(std::unique_ptr<raw::Ordinal> ordinal, std::unique_ptr<TypeConstructor> type_ctor,
+               SourceLocation name, std::unique_ptr<raw::AttributeList> attributes)
+            : ordinal(std::move(ordinal)), type_ctor(std::move(type_ctor)), name(std::move(name)),
+              attributes(std::move(attributes)) {}
         std::unique_ptr<raw::Ordinal> ordinal;
-        std::unique_ptr<Type> type;
+        std::unique_ptr<TypeConstructor> type_ctor;
         SourceLocation name;
         std::unique_ptr<raw::AttributeList> attributes;
         FieldShape fieldshape;
     };
 
     XUnion(std::unique_ptr<raw::AttributeList> attributes, Name name, std::vector<Member> members)
-        : Decl(Kind::kXUnion, std::move(attributes), std::move(name)), members(std::move(members)) {}
+        : TypeDecl(Kind::kXUnion, std::move(attributes), std::move(name)), members(std::move(members)) {}
 
     std::vector<Member> members;
-    TypeShape typeshape;
-    bool recursive = false;
+
+    static TypeShape Shape(const std::vector<flat::XUnion::Member>& members, uint32_t extra_handles = 0u);
 };
 
-struct Interface : public Decl {
+struct Interface : public TypeDecl {
     struct Method {
         Method(Method&&) = default;
         Method& operator=(Method&&) = default;
@@ -812,18 +877,68 @@ struct Interface : public Decl {
         SourceLocation name;
         Struct* maybe_request;
         Struct* maybe_response;
+        // This is set to the |Interface| instance that owns this |Method|,
+        // when the |Interface| is constructed.
+        Interface* owning_interface = nullptr;
     };
 
     Interface(std::unique_ptr<raw::AttributeList> attributes, Name name,
-              std::vector<Name> superinterfaces, std::vector<Method> methods)
-        : Decl(Kind::kInterface, std::move(attributes), std::move(name)),
-          superinterfaces(std::move(superinterfaces)), methods(std::move(methods)) {}
+              std::set<Name> superinterfaces, std::vector<Method> methods)
+        : TypeDecl(Kind::kInterface, std::move(attributes), std::move(name)),
+          superinterfaces(std::move(superinterfaces)), methods(std::move(methods)) {
+        for (auto& method : this->methods) {
+            method.owning_interface = this;
+        }
+    }
 
-    std::vector<Name> superinterfaces;
+    std::set<Name> superinterfaces;
     std::vector<Method> methods;
     // Pointers here are set after superinterfaces are compiled, and
-    // are owned by the correspending superinterface.
+    // are owned by the corresponding superinterface.
     std::vector<const Method*> all_methods;
+};
+
+class TypeTemplate {
+public:
+    TypeTemplate(Name name, Typespace* typespace, ErrorReporter* error_reporter)
+        : typespace_(typespace), name_(std::move(name)), error_reporter_(error_reporter) {}
+
+    TypeTemplate(TypeTemplate&& type_template) = default;
+
+    virtual ~TypeTemplate() = default;
+
+    const Name* name() const { return &name_; }
+
+    virtual bool Create(const SourceLocation* maybe_location,
+                        const Type* arg_type,
+                        const std::optional<types::HandleSubtype>& handle_subtype,
+                        const Size* size,
+                        types::Nullability nullability,
+                        std::unique_ptr<Type>* out_type) const = 0;
+
+protected:
+    bool MustBeParameterized(const SourceLocation* maybe_location) const {
+        return Fail(maybe_location, "must be parametrized");
+    }
+    bool MustHaveSize(const SourceLocation* maybe_location) const {
+        return Fail(maybe_location, "must have size");
+    }
+    bool CannotBeParameterized(const SourceLocation* maybe_location) const {
+        return Fail(maybe_location, "cannot be parametrized");
+    }
+    bool CannotHaveSize(const SourceLocation* maybe_location) const {
+        return Fail(maybe_location, "cannot have size");
+    }
+    bool CannotBeNullable(const SourceLocation* maybe_location) const {
+        return Fail(maybe_location, "cannot be nullable");
+    }
+    bool Fail(const SourceLocation* maybe_location, const std::string& content) const;
+
+    Typespace* typespace_;
+
+private:
+    Name name_;
+    ErrorReporter* error_reporter_;
 };
 
 // Typespace provides builders for all types (e.g. array, vector, string), and
@@ -833,102 +948,33 @@ struct Interface : public Decl {
 // the same type.
 class Typespace {
 public:
-    enum LookupMode {
-        kNoForwardReferences,
-        kAllowForwardReferences,
-    };
+    explicit Typespace(ErrorReporter* error_reporter)
+        : error_reporter_(error_reporter) {}
 
-    // Lookup looks up a type by its name, or alias, and returns the type
-    // which corresponds, whilst respecting the nullability qualifier.
-    // If the type exists, returns the type, otherwise returns nullptr.
-    //
-    // If forward references are allowed, a placeholder type is returned
-    // if the type does not exist yet. This allows forward references to be
-    // made, and later resolved.
-    //
-    // See also RegisterDecl, RegisterAlias, and
-    // EnsureAllTypesHaveBeenResolved.
-    Type* Lookup(const flat::Name& name, types::Nullability nullability,
-                 LookupMode lookup_mode);
+    bool Create(const flat::Name& name,
+                const Type* arg_type,
+                const std::optional<types::HandleSubtype>& handle_subtype,
+                const Size* size,
+                types::Nullability nullability,
+                const Type** out_type);
 
-    // ArrayType creates or returns an array type for the |element_type|,
-    // and |element_count|.
-    ArrayType* ArrayType(Type* element_type, Size element_count);
-
-    // VectorType creates or returns a vector type for the |element_type|,
-    // |max_size|, and |nullability|.
-    VectorType* VectorType(Type* element_type, Size max_size,
-                           types::Nullability nullability);
-
-    // StringType creates or returns a string type for |max_size|,
-    // and |nullability|.
-    StringType* StringType(Size max_size, types::Nullability nullability);
-
-    // HandleType creates or returns a handle type for the |subtype|,
-    // and |nullability|.
-    HandleType* HandleType(types::HandleSubtype subtype, types::Nullability nullability);
-
-    // RequestType creates or returns an interface request type for the |name|,
-    // and |nullability|.
-    RequestHandleType* RequestType(Name name, types::Nullability nullability);
-
-    // RegisterDecl registers a declaration under a specific name. Registering
-    // a declaration resolves all prior references to this named type, i.e.
-    // earlier lookups from forward references.
-    // This method returns true if there was no name conflict, false otherwise.
-    bool RegisterDecl(Name name, Decl* decl);
-
-    // RegisterAlias registers a type alias, such as `using int = int32;`. An
-    // aliased type can be referenced by either name, with no behavioral
-    // difference.
-    // This method returns true if there was no name conflict, false otherwise.
-    bool RegisterAlias(Name name, Name alias);
-
-    // EnsureAllTypesHaveBeenResolved checks that all forward references have
-    // been propertly resolved.
-    bool EnsureAllTypesHaveBeenResolved();
+    void AddTemplate(std::unique_ptr<TypeTemplate> type_template);
 
     // BoostrapRootTypes creates a instance with all primitive types. It is
     // meant to be used as the top-level types lookup mechanism, providing
     // definitional meaning to names such as `int64`, or `bool`.
-    static Typespace RootTypes() {
-        Typespace root_typespace;
-        ByName primitive_types;
-        auto add = [&](const std::string name, types::PrimitiveSubtype subtype) {
-            root_typespace.owned_names_.push_back(
-                std::make_unique<Name>(nullptr, name));
-            primitive_types.emplace(
-                root_typespace.owned_names_.back().get(),
-                std::make_unique<PrimitiveType>(subtype));
-        };
-
-        add("bool", types::PrimitiveSubtype::kBool);
-
-        add("int8", types::PrimitiveSubtype::kInt8);
-        add("int16", types::PrimitiveSubtype::kInt16);
-        add("int32", types::PrimitiveSubtype::kInt32);
-        add("int64", types::PrimitiveSubtype::kInt64);
-        add("uint8", types::PrimitiveSubtype::kUint8);
-        add("uint16", types::PrimitiveSubtype::kUint16);
-        add("uint32", types::PrimitiveSubtype::kUint32);
-        add("uint64", types::PrimitiveSubtype::kUint64);
-
-        add("float32", types::PrimitiveSubtype::kFloat32);
-        add("float64", types::PrimitiveSubtype::kFloat64);
-
-        root_typespace.named_types_.emplace(
-            types::Nullability::kNonnullable, std::move(primitive_types));
-        return root_typespace;
-    }
+    static Typespace RootTypes(ErrorReporter* error_reporter);
 
 private:
-    // CreateForwardDeclaredType creates a placeholder for the named type. As
-    // the name suggest, this type must be resolved by registering a named type
-    // for it.
-    //
-    // See also RegisterDecl, RegisterAlias, and
-    // EnsureAllTypesHaveBeenResolved.
-    Type* CreateForwardDeclaredType(const flat::Name& name, types::Nullability nullability);
+    friend class TypeAliasTypeTemplate;
+
+    bool CreateNotOwned(const flat::Name& name,
+                        const Type* arg_type,
+                        const std::optional<types::HandleSubtype>& handle_subtype,
+                        const Size* size,
+                        types::Nullability nullability,
+                        std::unique_ptr<Type>* out_type);
+    const TypeTemplate* LookupTemplate(const flat::Name& name) const;
 
     struct cmpName {
         bool operator()(const flat::Name* a, const flat::Name* b) const {
@@ -936,24 +982,10 @@ private:
         }
     };
 
-    using BySize = std::map<const Size, std::unique_ptr<Type>>;
-    using ByNullability = std::map<types::Nullability, std::unique_ptr<Type>>;
-    using ByName = std::map<const flat::Name*, std::unique_ptr<Type>, cmpName>;
-    using ByHandleSubtype = std::map<types::HandleSubtype, std::unique_ptr<Type>>;
+    std::map<const flat::Name*, std::unique_ptr<TypeTemplate>, cmpName> templates_;
+    std::vector<std::unique_ptr<Type>> types_;
 
-    using ByNullabilityThenBySize = std::map<types::Nullability, BySize>;
-    using ByNullabilityThenByName = std::map<types::Nullability, ByName>;
-    using ByNullabilityThenByHandleSubtype = std::map<types::Nullability, ByHandleSubtype>;
-
-    std::map<const Type*, BySize> array_types_;
-    std::map<const Type*, ByNullabilityThenBySize> vector_types_;
-    ByNullabilityThenBySize string_types_;
-    ByNullabilityThenByHandleSubtype handle_types_;
-    ByNullabilityThenByName request_types_;
-    ByNullabilityThenByName named_types_;
-    ByName aliases_;
-
-    std::vector<std::unique_ptr<Name>> owned_names_;
+    ErrorReporter* error_reporter_;
 };
 
 // AttributeSchema defines a schema for attributes. This includes:
@@ -966,13 +998,15 @@ private:
 class AttributeSchema {
 public:
     using Constraint = fit::function<bool(ErrorReporter* error_reporter,
-                                          const raw::Attribute* attribute,
+                                          const raw::Attribute& attribute,
                                           const Decl* decl)>;
 
     // Placement indicates the placement of an attribute, e.g. whether an
     // attribute is placed on an enum declaration, method, or union
     // member.
     enum class Placement {
+        kBitsDecl,
+        kBitsMember,
         kConstDecl,
         kEnumDecl,
         kEnumMember,
@@ -996,19 +1030,19 @@ public:
     AttributeSchema(AttributeSchema&& schema) = default;
 
     void ValidatePlacement(ErrorReporter* error_reporter,
-                           const raw::Attribute* attribute,
+                           const raw::Attribute& attribute,
                            Placement placement) const;
 
     void ValidateValue(ErrorReporter* error_reporter,
-                       const raw::Attribute* attribute) const;
+                       const raw::Attribute& attribute) const;
 
     void ValidateConstraint(ErrorReporter* error_reporter,
-                            const raw::Attribute* attribute,
+                            const raw::Attribute& attribute,
                             const Decl* decl) const;
 
 private:
     static bool NoOpConstraint(ErrorReporter* error_reporter,
-                               const raw::Attribute* attribute,
+                               const raw::Attribute& attribute,
                                const Decl* decl) {
         return true;
     }
@@ -1026,19 +1060,22 @@ public:
     bool Insert(std::unique_ptr<Library> library);
 
     // Lookup a library by its |library_name|.
-    bool Lookup(const std::vector<StringView>& library_name,
+    bool Lookup(const std::vector<std::string_view>& library_name,
                 Library** out_library) const;
 
     void AddAttributeSchema(const std::string& name, AttributeSchema schema) {
-        auto iter = attribute_schemas_.emplace(name, std::move(schema));
+        [[maybe_unused]] auto iter =
+            attribute_schemas_.emplace(name, std::move(schema));
         assert(iter.second && "do not add schemas twice");
     }
 
     const AttributeSchema* RetrieveAttributeSchema(ErrorReporter* error_reporter,
-                                                   const raw::Attribute* attribute) const;
+                                                   const raw::Attribute& attribute) const;
+
+    std::set<std::vector<std::string_view>> Unused(const Library* target_library) const;
 
 private:
-    std::map<std::vector<StringView>, std::unique_ptr<Library>> all_libraries_;
+    std::map<std::vector<std::string_view>, std::unique_ptr<Library>> all_libraries_;
     std::map<std::string, AttributeSchema> attribute_schemas_;
 };
 
@@ -1047,22 +1084,39 @@ public:
     // Register a dependency to a library. The newly recorded dependent library
     // will be referenced by its name, and may also be optionally be referenced
     // by an alias.
-    bool Register(StringView filename, Library* dep_library,
+    bool Register(const SourceLocation& location, std::string_view filename, Library* dep_library,
                   const std::unique_ptr<raw::Identifier>& maybe_alias);
 
-    // Lookup a dependent library by |filename| and |name|.
-    bool Lookup(StringView filename, const std::vector<StringView>& name,
-                Library** out_library);
+    // Looks up a dependent library by |filename| and |name|, and marks it as
+    // used.
+    bool LookupAndUse(std::string_view filename, const std::vector<std::string_view>& name,
+                      Library** out_library);
 
-    const std::set<Library*>& dependencies() const { return dependencies_aggregate_; };
+    // VerifyAllDependenciesWereUsed verifies that all regisered dependencies
+    // were used, i.e. at least one lookup was made to retrieve them.
+    // Reports errors directly, and returns true if one error or more was
+    // reported.
+    bool VerifyAllDependenciesWereUsed(const Library& for_library, ErrorReporter* error_reporter);
+
+    const std::set<Library*>& dependencies() const { return dependencies_aggregate_; }
 
 private:
-    bool InsertByName(StringView filename, const std::vector<StringView>& name,
-                      Library* library);
+    struct LibraryRef {
+        LibraryRef(const SourceLocation location, Library* library) :
+            location_(location), library_(library) {}
 
-    using ByName = std::map<std::vector<StringView>, Library*>;
+        const SourceLocation location_;
+        Library* library_;
+        bool used_ = false;
+    };
+
+    bool InsertByName(std::string_view filename,
+                      const std::vector<std::string_view>& name, LibraryRef* ref);
+
+    using ByName = std::map<std::vector<std::string_view>, LibraryRef*>;
     using ByFilename = std::map<std::string, std::unique_ptr<ByName>>;
 
+    std::vector<std::unique_ptr<LibraryRef>> refs_;
     ByFilename dependencies_;
     std::set<Library*> dependencies_aggregate_;
 };
@@ -1075,41 +1129,49 @@ public:
     bool ConsumeFile(std::unique_ptr<raw::File> file);
     bool Compile();
 
-    const std::vector<StringView>& name() const { return library_name_; }
+    const std::vector<std::string_view>& name() const { return library_name_; }
     const std::vector<std::string>& errors() const { return error_reporter_->errors(); }
 
 private:
-    bool Fail(StringView message);
-    bool Fail(const SourceLocation& location, StringView message);
-    bool Fail(const Name& name, StringView message) {
-        if (name.is_anonymous()) {
-            return Fail(message);
-        }
-        return Fail(name.source_location(), message);
+    friend class TypeAliasTypeTemplate;
+
+    bool Fail(std::string_view message);
+    bool Fail(const SourceLocation& location, std::string_view message) {
+        return Fail(&location, message);
     }
-    bool Fail(const Decl& decl, StringView message) { return Fail(decl.name, message); }
+    bool Fail(const SourceLocation* maybe_location, std::string_view message);
+    bool Fail(const Name& name, std::string_view message) {
+        return Fail(name.maybe_location(), message);
+    }
+    bool Fail(const Decl& decl, std::string_view message) { return Fail(decl.name, message); }
 
     void ValidateAttributesPlacement(AttributeSchema::Placement placement,
                                      const raw::AttributeList* attributes);
     void ValidateAttributesConstraints(const Decl* decl,
                                        const raw::AttributeList* attributes);
 
+    // TODO(FIDL-596): Rationalize the use of names. Here, a simple name is
+    // one that is not scoped, it is just text. An anonymous name is one that
+    // is guaranteed to be unique within the library, and a derived name is one
+    // that is library scoped but derived from the concatenated components using
+    // underscores as delimiters.
+    SourceLocation GeneratedSimpleName(const std::string& name);
     Name NextAnonymousName();
-    Name GeneratedName(const std::string& name);
-    Name DerivedName(const std::vector<StringView>& components);
+    Name DerivedName(const std::vector<std::string_view>& components);
 
     bool CompileCompoundIdentifier(const raw::CompoundIdentifier* compound_identifier,
                                    SourceLocation location, Name* out_name);
-    void RegisterConst(Const* decl);
-    bool RegisterDecl(Decl* decl);
+    bool RegisterDecl(std::unique_ptr<Decl> decl);
 
     bool ConsumeConstant(std::unique_ptr<raw::Constant> raw_constant, SourceLocation location,
                          std::unique_ptr<Constant>* out_constant);
-    bool ConsumeType(std::unique_ptr<raw::Type> raw_type, SourceLocation location,
-                     std::unique_ptr<Type>* out_type);
+    bool ConsumeTypeConstructor(std::unique_ptr<raw::TypeConstructor> raw_type_ctor,
+                                SourceLocation location,
+                                std::unique_ptr<TypeConstructor>* out_type);
 
     bool ConsumeUsing(std::unique_ptr<raw::Using> using_directive);
     bool ConsumeTypeAlias(std::unique_ptr<raw::Using> using_directive);
+    bool ConsumeBitsDeclaration(std::unique_ptr<raw::BitsDeclaration> bits_declaration);
     bool ConsumeConstDeclaration(std::unique_ptr<raw::ConstDeclaration> const_declaration);
     bool ConsumeEnumDeclaration(std::unique_ptr<raw::EnumDeclaration> enum_declaration);
     bool
@@ -1125,30 +1187,12 @@ private:
     bool TypeCanBeConst(const Type* type);
     const Type* TypeResolve(const Type* type);
     bool TypeIsConvertibleTo(const Type* from_type, const Type* to_type);
-    std::unique_ptr<IdentifierType> IdentifierTypeForDecl(const Decl* decl, types::Nullability nullability);
+    std::unique_ptr<TypeConstructor> IdentifierTypeForDecl(const Decl* decl, types::Nullability nullability);
 
     // Given a const declaration of the form
     //     const type foo = name;
     // return the declaration corresponding to name.
-    Decl* LookupConstant(const Type* type, const Name& name);
-
-    // Given a name, checks whether that name corresponds to a primitive type. If
-    // so, returns the type. Otherwise, returns nullptr.
-    const PrimitiveType* LookupPrimitiveType(const Name& name) const;
-
-    // Given a name, checks whether that name corresponds to a type alias. If
-    // so, returns the type. Otherwise, returns nullptr.
-    const PrimitiveType* LookupTypeAlias(const Name& name) const;
-
-    // Returns nullptr when |type| does not correspond directly to a
-    // declaration. For example, if |type| refers to int32 or if it is
-    // a struct pointer, this will return null. If it is a struct, it
-    // will return a pointer to the declaration of the type.
-    enum class LookupOption {
-        kIgnoreNullable,
-        kIncludeNullable,
-    };
-    Decl* LookupDeclByType(const flat::Type* type, LookupOption option) const;
+    Decl* LookupConstant(const TypeConstructor* type_ctor, const Name& name);
 
     bool DeclDependencies(Decl* decl, std::set<Decl*>* out_edges);
 
@@ -1156,6 +1200,7 @@ private:
 
     bool CompileLibraryName();
 
+    bool CompileBits(Bits* bits_declaration);
     bool CompileConst(Const* const_declaration);
     bool CompileEnum(Enum* enum_declaration);
     bool CompileInterface(Interface* interface_declaration);
@@ -1168,23 +1213,28 @@ private:
     // information for the type. In particular, we validate that
     // optional identifier types refer to things that can in fact be
     // nullable (ie not enums).
-    bool CompileArrayType(ArrayType* array_type, TypeShape* out_type_metadata);
-    bool CompileVectorType(VectorType* vector_type, TypeShape* out_type_metadata);
-    bool CompileStringType(StringType* string_type, TypeShape* out_type_metadata);
-    bool CompileHandleType(HandleType* handle_type, TypeShape* out_type_metadata);
-    bool CompileRequestHandleType(RequestHandleType* request_type, TypeShape* out_type_metadata);
-    bool CompilePrimitiveType(PrimitiveType* primitive_type, TypeShape* out_type_metadata);
-    bool CompileIdentifierType(IdentifierType* identifier_type, TypeShape* out_type_metadata);
-    bool CompileType(Type* type, TypeShape* out_type_metadata);
+    bool CompileTypeConstructor(TypeConstructor* type, TypeShape* out_type_metadata);
 
     bool ResolveConstant(Constant* constant, const Type* type);
     bool ResolveIdentifierConstant(IdentifierConstant* identifier_constant, const Type* type);
     bool ResolveLiteralConstant(LiteralConstant* literal_constant, const Type* type);
 
+    // Validates a single member of a bits or enum. On failure,
+    // returns false and places an error message in the out parameter.
+    template <typename MemberType>
+    using MemberValidator = fit::function<bool(const MemberType& member, std::string* out_error)>;
+    template <typename DeclType, typename MemberType>
+    bool ValidateMembers(DeclType* decl, MemberValidator<MemberType> validator);
+    template <typename MemberType>
+    bool ValidateBitsMembersAndCalcMask(Bits* bits_decl, MemberType* out_mask);
     template <typename MemberType>
     bool ValidateEnumMembers(Enum* enum_decl);
 
+    bool VerifyDeclAttributes(Decl* decl);
+
 public:
+    bool CompileDecl(Decl* decl);
+
     // Returns nullptr when the |name| cannot be resolved to a
     // Name. Otherwise it returns the declaration.
     Decl* LookupDeclByName(const Name& name) const;
@@ -1192,13 +1242,13 @@ public:
     template <typename NumericType>
     bool ParseNumericLiteral(const raw::NumericLiteral* literal, NumericType* out_value) const;
 
-    bool HasAttribute(fidl::StringView name) const;
+    bool HasAttribute(std::string_view name) const;
 
     const std::set<Library*>& dependencies() const;
 
-    std::vector<StringView> library_name_;
+    std::vector<std::string_view> library_name_;
 
-    std::vector<std::unique_ptr<Using>> using_;
+    std::vector<std::unique_ptr<Bits>> bits_declarations_;
     std::vector<std::unique_ptr<Const>> const_declarations_;
     std::vector<std::unique_ptr<Enum>> enum_declarations_;
     std::vector<std::unique_ptr<Interface>> interface_declarations_;
@@ -1221,7 +1271,6 @@ private:
 
     // All Name, Constant, Using, and Decl pointers here are non-null and are
     // owned by the various foo_declarations_.
-    std::map<const Name*, Using*, PtrCompare<Name>> type_aliases_;
     std::map<const Name*, Decl*, PtrCompare<Name>> declarations_;
     std::map<const Name*, Const*, PtrCompare<Name>> constants_;
 
@@ -1235,5 +1284,10 @@ private:
 
 } // namespace flat
 } // namespace fidl
+
+// TODO(FIDL-487, ZX-3415): Decide if all cases of NumericConstantValue::Convert() are safe.
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #endif // ZIRCON_SYSTEM_HOST_FIDL_INCLUDE_FIDL_FLAT_AST_H_

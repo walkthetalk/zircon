@@ -19,34 +19,16 @@
 #include <fbl/algorithm.h>
 #include <fbl/auto_lock.h>
 #include <fbl/unique_ptr.h>
+#include <fuchsia/boot/c/fidl.h>
 #include <fuchsia/sysinfo/c/fidl.h>
 #include <zircon/boot/driver-config.h>
-#include <zircon/boot/image.h>
 #include <zircon/process.h>
 #include <zircon/syscalls/iommu.h>
 
-#include <utility>
+#include "cpu-trace.h"
+#include "platform-composite-device.h"
 
 namespace platform_bus {
-
-zx_status_t PlatformBus::Proxy(
-    const void* req_buffer, size_t req_size, const zx_handle_t* req_handle_list,
-    size_t req_handle_count, void* out_resp_buffer, size_t resp_size, size_t* out_resp_actual,
-    zx_handle_t* out_resp_handle_list, size_t resp_handle_count,
-    size_t* out_resp_handle_actual) {
-
-    auto* req = static_cast<const platform_proxy_req*>(req_buffer);
-    fbl::AutoLock lock(&proto_proxys_mutex_);
-    auto proto_proxy = proto_proxys_.find(req->proto_id);
-    if (!proto_proxy.IsValid()) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    proto_proxy->Proxy(req_buffer, req_size, req_handle_list, req_handle_count,
-                       out_resp_buffer, resp_size, out_resp_actual, out_resp_handle_list,
-                       resp_handle_count, out_resp_handle_actual);
-    return ZX_OK;
-}
 
 zx_status_t PlatformBus::IommuGetBti(uint32_t iommu_index, uint32_t bti_id,
                                      zx::bti* out_bti) {
@@ -57,70 +39,39 @@ zx_status_t PlatformBus::IommuGetBti(uint32_t iommu_index, uint32_t bti_id,
 }
 
 zx_status_t PlatformBus::PBusRegisterProtocol(uint32_t proto_id, const void* protocol,
-                                              size_t protocol_size,
-                                              const platform_proxy_cb_t* proxy_cb) {
+                                              size_t protocol_size) {
     if (!protocol || protocol_size < sizeof(ddk::AnyProtocol)) {
         return ZX_ERR_INVALID_ARGS;
     }
 
     switch (proto_id) {
     case ZX_PROTOCOL_GPIO_IMPL: {
-        if (proxy_cb->callback != nullptr) {
-            return ZX_ERR_INVALID_ARGS;
-        }
         gpio_ = ddk::GpioImplProtocolClient(static_cast<const gpio_impl_protocol_t*>(protocol));
         break;
     }
-    case ZX_PROTOCOL_I2C_IMPL: {
-        if (proxy_cb->callback != nullptr) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        auto proto = static_cast<const i2c_impl_protocol_t*>(protocol);
-        auto status = I2cInit(proto);
-        if (status != ZX_OK) {
-            return status;
-        }
-
-        i2c_ = ddk::I2cImplProtocolClient(proto);
+    case ZX_PROTOCOL_CLOCK_IMPL: {
+        clk_ = ddk::ClockImplProtocolClient(static_cast<const clock_impl_protocol_t*>(protocol));
         break;
     }
-    case ZX_PROTOCOL_CLK: {
-        if (proxy_cb->callback != nullptr) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        clk_ = ddk::ClkProtocolClient(static_cast<const clk_protocol_t*>(protocol));
+    case ZX_PROTOCOL_POWER_IMPL: {
+        power_ = ddk::PowerImplProtocolClient(static_cast<const power_impl_protocol_t*>(protocol));
         break;
     }
     case ZX_PROTOCOL_IOMMU: {
-        if (proxy_cb->callback != nullptr) {
-            return ZX_ERR_INVALID_ARGS;
-        }
         iommu_ = ddk::IommuProtocolClient(static_cast<const iommu_protocol_t*>(protocol));
         break;
     }
-    default: {
-        if (proxy_cb->callback == nullptr) {
-            return ZX_ERR_NOT_SUPPORTED;
-        }
-
-        fbl::AutoLock lock(&proto_proxys_mutex_);
-        if (proto_proxys_.find(proto_id).IsValid()) {
-            zxlogf(ERROR, "%s: protocol %08x has already been registered\n", __func__, proto_id);
-            return ZX_ERR_BAD_STATE;
-        }
-
-        fbl::AllocChecker ac;
-        auto proxy = fbl::make_unique_checked<ProtoProxy>(&ac, proto_id,
-                                                          static_cast<const ddk::AnyProtocol*>(protocol),
-                                                          *proxy_cb);
-        if (!ac.check()) {
-            return ZX_ERR_NO_MEMORY;
-        }
-
-        proto_proxys_.insert(std::move(proxy));
-        sync_completion_signal(&proto_completion_);
-        return ZX_OK;
+    case ZX_PROTOCOL_SYSMEM: {
+        sysmem_ = ddk::SysmemProtocolClient(static_cast<const sysmem_protocol_t*>(protocol));
+        break;
     }
+    case ZX_PROTOCOL_AMLOGIC_CANVAS: {
+        canvas_ = ddk::AmlogicCanvasProtocolClient(
+                                        static_cast<const amlogic_canvas_protocol_t*>(protocol));
+        break;
+    }
+    default:
+        return ZX_ERR_NOT_SUPPORTED;
     }
 
     fbl::AutoLock lock(&proto_completion_mutex_);
@@ -187,7 +138,8 @@ zx_status_t PlatformBus::PBusProtocolDeviceAdd(uint32_t proto_id, const pbus_dev
         proto_completion_mutex_.Release();
         zx_status_t status = sync_completion_wait(&proto_completion_, ZX_SEC(10));
         if (status != ZX_OK) {
-            zxlogf(ERROR, "%s failed for protocol %08x\n", __FUNCTION__, proto_id);
+            zxlogf(ERROR, "%s sync_completion_wait(protocol %08x) failed: %d\n", __FUNCTION__,
+                   proto_id, status);
             return status;
         }
         proto_completion_mutex_.Acquire();
@@ -206,6 +158,67 @@ zx_status_t PlatformBus::PBusSetBoardInfo(const pbus_board_info_t* info) {
     return ZX_OK;
 }
 
+zx_status_t PlatformBus::PBusRegisterSysSuspendCallback(const pbus_sys_suspend_t* suspend_cbin) {
+    suspend_cb_ = *suspend_cbin;
+    return ZX_OK;
+}
+
+zx_status_t PlatformBus::PBusCompositeDeviceAdd(const pbus_dev_t* pdev,
+                                                const device_component_t* components_list,
+                                                size_t components_count,
+                                                uint32_t coresident_device_index) {
+    if (!pdev || !pdev->name) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if (coresident_device_index == 0) {
+        zxlogf(ERROR, "%s: coresident_device_index cannot be zero\n", __func__);
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    fbl::unique_ptr<platform_bus::CompositeDevice> dev;
+    auto status = CompositeDevice::Create(pdev, zxdev(), this, &dev);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    status = dev->Start();
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    // devmgr is now in charge of the device.
+    __UNUSED auto* dummy = dev.release();
+
+    device_component_t components[components_count + 1];
+    memcpy(&components[1], components_list, components_count * sizeof(components[1]));
+
+    constexpr zx_bind_inst_t root_match[] = {
+        BI_MATCH(),
+    };
+    const zx_bind_inst_t pdev_match[]  = {
+        BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PDEV),
+        BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, pdev->vid),
+        BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, pdev->pid),
+        BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, pdev->did),
+    };
+    const device_component_part_t pdev_component[] = {
+        { countof(root_match), root_match },
+        { countof(pdev_match), pdev_match },
+    };
+
+    components[0].parts_count = fbl::count_of(pdev_component);
+    components[0].parts = pdev_component;
+
+    const zx_device_prop_t props[] = {
+        { BIND_PLATFORM_DEV_VID, 0, pdev->vid },
+        { BIND_PLATFORM_DEV_PID, 0, pdev->pid },
+        { BIND_PLATFORM_DEV_DID, 0, pdev->did },
+    };
+
+    return DdkAddComposite(pdev->name, props, fbl::count_of(props), components,
+                           components_count + 1, coresident_device_index);
+}
+
 zx_status_t PlatformBus::DdkGetProtocol(uint32_t proto_id, void* out) {
     switch (proto_id) {
     case ZX_PROTOCOL_PBUS: {
@@ -220,15 +233,27 @@ zx_status_t PlatformBus::DdkGetProtocol(uint32_t proto_id, void* out) {
             return ZX_OK;
         }
         break;
-    case ZX_PROTOCOL_I2C_IMPL:
-        if (i2c_) {
-            i2c_->GetProto(static_cast<i2c_impl_protocol_t*>(out));
+    case ZX_PROTOCOL_POWER_IMPL:
+        if (power_) {
+            power_->GetProto(static_cast<power_impl_protocol_t*>(out));
             return ZX_OK;
         }
         break;
-    case ZX_PROTOCOL_CLK:
+    case ZX_PROTOCOL_CLOCK_IMPL:
         if (clk_) {
-            clk_->GetProto(static_cast<clk_protocol_t*>(out));
+            clk_->GetProto(static_cast<clock_impl_protocol_t*>(out));
+            return ZX_OK;
+        }
+        break;
+    case ZX_PROTOCOL_SYSMEM:
+        if (sysmem_) {
+            sysmem_->GetProto(static_cast<sysmem_protocol_t*>(out));
+            return ZX_OK;
+        }
+        break;
+    case ZX_PROTOCOL_AMLOGIC_CANVAS:
+        if (canvas_) {
+            canvas_->GetProto(static_cast<amlogic_canvas_protocol_t*>(out));
             return ZX_OK;
         }
         break;
@@ -243,247 +268,142 @@ zx_status_t PlatformBus::DdkGetProtocol(uint32_t proto_id, void* out) {
             return ZX_OK;
         }
         break;
-    default: {
-        fbl::AutoLock lock(&proto_proxys_mutex_);
-        auto proto_proxy = proto_proxys_.find(proto_id);
-        if (!proto_proxy.IsValid()) {
-            return ZX_ERR_NOT_SUPPORTED;
-        }
-        proto_proxy->GetProtocol(out);
-        return ZX_OK;
-    }
     }
 
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t PlatformBus::ReadZbi(zx::vmo zbi) {
-    zbi_header_t header;
+zx_status_t PlatformBus::GetBootItem(uint32_t type, uint32_t extra, zx::vmo* vmo,
+                                     uint32_t* length) {
+    return fuchsia_boot_ItemsGet(items_svc_.get(), type, extra, vmo->reset_and_get_address(),
+                                 length);
+}
 
-    zx_status_t status = zbi.read(&header, 0, sizeof(header));
+zx_status_t PlatformBus::GetBootItem(uint32_t type, uint32_t extra, fbl::Array<uint8_t>* out) {
+    zx::vmo vmo;
+    uint32_t length;
+    zx_status_t status = GetBootItem(type, extra, &vmo, &length);
     if (status != ZX_OK) {
         return status;
     }
-    if ((header.type != ZBI_TYPE_CONTAINER) || (header.extra != ZBI_CONTAINER_MAGIC)) {
-        zxlogf(ERROR, "platform_bus: ZBI VMO not contain ZBI container\n");
-        return ZX_ERR_INTERNAL;
-    }
-
-    size_t zbi_length = header.length;
-
-    // compute size of ZBI records we need to save for metadata
-    uint8_t* metadata = nullptr;
-    size_t metadata_size = 0;
-    size_t len = zbi_length;
-    size_t off = sizeof(header);
-
-    while (len > sizeof(header)) {
-        auto status = zbi.read(&header, off, sizeof(header));
-        if (status < 0) {
-            zxlogf(ERROR, "zbi.read() failed: %d\n", status);
-            return status;
-        }
-        size_t itemlen = ZBI_ALIGN(
-            static_cast<uint32_t>(sizeof(zbi_header_t)) + header.length);
-        if (itemlen > len) {
-            zxlogf(ERROR, "platform_bus: ZBI item too large (%zd > %zd)\n", itemlen, len);
-            break;
-        }
-        if (ZBI_TYPE_DRV_METADATA(header.type)) {
-            metadata_size += itemlen;
-        }
-        off += itemlen;
-        len -= itemlen;
-    }
-
-    if (metadata_size) {
-        fbl::AllocChecker ac;
-        metadata_.reset(new (&ac) uint8_t[metadata_size], metadata_size);
-        if (!ac.check()) {
-            return ZX_ERR_NO_MEMORY;
-        }
-        metadata = metadata_.get();
-    }
-
-    bool got_platform_id = false;
-    uint8_t interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_UNKNOWN;
-    zx_off_t metadata_offset = 0;
-    len = zbi_length;
-    off = sizeof(header);
-
-    // find platform ID record and copy metadata records
-    while (len > sizeof(header)) {
-        auto status = zbi.read(&header, off, sizeof(header));
-        if (status < 0) {
-            break;
-        }
-        const size_t itemlen = ZBI_ALIGN(
-            static_cast<uint32_t>(sizeof(zbi_header_t)) + header.length);
-        if (itemlen > len) {
-            zxlogf(ERROR, "platform_bus: ZBI item too large (%zd > %zd)\n", itemlen, len);
-            break;
-        }
-        if (header.type == ZBI_TYPE_PLATFORM_ID) {
-            zbi_platform_id_t platform_id;
-            status = zbi.read(&platform_id, off + sizeof(zbi_header_t), sizeof(platform_id));
-            if (status != ZX_OK) {
-                zxlogf(ERROR, "zbi.read() failed: %d\n", status);
-                return status;
-            }
-            board_info_.vid = platform_id.vid;
-            board_info_.pid = platform_id.pid;
-            memcpy(board_info_.board_name, platform_id.board_name, sizeof(board_info_.board_name));
-            // This is optionally set later by the board driver.
-            board_info_.board_revision = 0;
-            got_platform_id = true;
-
-            zxlogf(INFO, "platform bus: VID: %u PID: %u board: \"%s\"\n", platform_id.vid,
-                   platform_id.pid, platform_id.board_name);
-
-            // Publish board name to sysinfo driver
-            status = device_publish_metadata(parent(), "/dev/misc/sysinfo",
-                                             DEVICE_METADATA_BOARD_NAME, platform_id.board_name,
-                                             sizeof(platform_id.board_name));
-            if (status != ZX_OK) {
-                zxlogf(ERROR, "device_publish_metadata(board_name) failed: %d\n", status);
-                return status;
-            }
-        } else if (header.type == ZBI_TYPE_KERNEL_DRIVER) {
-            if (header.extra == KDRV_ARM_GIC_V2) {
-                interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_GIC_V2;
-            } else if (header.extra == KDRV_ARM_GIC_V3) {
-                interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_GIC_V3;
-            }
-        } else if (ZBI_TYPE_DRV_METADATA(header.type)) {
-            status = zbi.read(metadata + metadata_offset, off, itemlen);
-            if (status != ZX_OK) {
-                zxlogf(ERROR, "zbi.read() failed: %d\n", status);
-                return status;
-            }
-            metadata_offset += itemlen;
-        }
-        off += itemlen;
-        len -= itemlen;
-    }
-
-    // Publish interrupt controller type to sysinfo driver
-    status = device_publish_metadata(parent(), "/dev/misc/sysinfo",
-                                     DEVICE_METADATA_INTERRUPT_CONTROLLER_TYPE,
-                                     &interrupt_controller_type, sizeof(interrupt_controller_type));
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "device_publish_metadata(interrupt_controller_type) failed: %d\n", status);
-        return status;
-    }
-
-    if (!got_platform_id) {
-        zxlogf(ERROR, "platform_bus: ZBI_TYPE_PLATFORM_ID not found\n");
-        return ZX_ERR_INTERNAL;
-    }
-
-    return ZX_OK;
-}
-
-zx_status_t PlatformBus::GetZbiMetadata(uint32_t type, uint32_t extra, const void** out_metadata,
-                                        uint32_t* out_size) {
-    const uint8_t* metadata = metadata_.get();
-    const size_t metadata_size = metadata_.size();
-    size_t offset = 0;
-
-    while (offset + sizeof(zbi_header_t) < metadata_size) {
-        const auto header = reinterpret_cast<const zbi_header_t*>(metadata);
-        const size_t length = ZBI_ALIGN(
-            static_cast<uint32_t>(sizeof(zbi_header_t)) + header->length);
-        if (offset + length > metadata_size) {
-            break;
-        }
-
-        if (header->type == type && header->extra == extra) {
-            *out_metadata = header + 1;
-            *out_size = static_cast<uint32_t>(length - sizeof(zbi_header_t));
-            return ZX_OK;
-        }
-        metadata += length;
-        offset += length;
-    }
-    zxlogf(ERROR, "%s metadata not found for type %08x, extra %u\n", __FUNCTION__, type, extra);
-    return ZX_ERR_NOT_FOUND;
-}
-
-zx_status_t PlatformBus::I2cInit(const i2c_impl_protocol_t* i2c) {
-    if (!i2c_buses_.is_empty()) {
-        // already initialized
-        return ZX_ERR_BAD_STATE;
-    }
-
-    uint32_t bus_count = i2c_impl_get_bus_count(i2c);
-    if (!bus_count) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    fbl::AllocChecker ac;
-    i2c_buses_.reserve(bus_count, &ac);
-    if (!ac.check()) {
-        return ZX_ERR_NO_MEMORY;
-    }
-
-    for (uint32_t i = 0; i < bus_count; i++) {
-        fbl::unique_ptr<PlatformI2cBus> i2c_bus(new (&ac) PlatformI2cBus(i2c, i));
-        if (!ac.check()) {
-            return ZX_ERR_NO_MEMORY;
-        }
-
-        auto status = i2c_bus->Start();
+    if (vmo.is_valid()) {
+        fbl::Array<uint8_t> data(new uint8_t[length], length);
+        status = vmo.read(data.get(), 0, data.size());
         if (status != ZX_OK) {
             return status;
         }
-
-        i2c_buses_.push_back(std::move(i2c_bus));
+        *out = std::move(data);
     }
-
     return ZX_OK;
-}
-
-zx_status_t PlatformBus::I2cTransact(uint32_t txid, rpc_i2c_req_t* req,
-                                     const pbus_i2c_channel_t* channel,
-                                     zx_handle_t channel_handle) {
-    if (channel->bus_id >= i2c_buses_.size()) {
-        return ZX_ERR_OUT_OF_RANGE;
-    }
-    auto i2c_bus = i2c_buses_[channel->bus_id].get();
-    return i2c_bus->Transact(txid, req, channel->address, channel_handle);
 }
 
 void PlatformBus::DdkRelease() {
     delete this;
 }
 
-static zx_protocol_device_t sys_device_proto = {};
+typedef struct {
+    void* pbus_instance;
+} sysdev_suspend_t;
 
-zx_status_t PlatformBus::Create(zx_device_t* parent, const char* name, zx::vmo zbi) {
+static zx_status_t sys_device_suspend(void* ctx, uint32_t flags) {
+    auto* p = reinterpret_cast<sysdev_suspend_t*>(ctx);
+    auto* pbus = reinterpret_cast<class PlatformBus*>(p->pbus_instance);
+
+    if (pbus != nullptr) {
+        pbus_sys_suspend_t suspend_cb = pbus->suspend_cb();
+        if (suspend_cb.callback != nullptr) {
+            return suspend_cb.callback(suspend_cb.ctx, flags);
+        }
+    }
+    return ZX_ERR_NOT_SUPPORTED;
+}
+
+static void sys_device_release(void* ctx) {
+    auto* p = reinterpret_cast<sysdev_suspend_t*>(ctx);
+    delete p;
+}
+
+// cpu-trace provides access to the cpu's tracing and performance counters.
+// As such the "device" is the cpu itself.
+static zx_status_t InitCpuTrace(zx_device_t* parent, zx_handle_t dummy_iommu_handle) {
+    zx_handle_t cpu_trace_bti;
+    zx_status_t status = zx_bti_create(dummy_iommu_handle, 0, CPU_TRACE_BTI_ID, &cpu_trace_bti);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "platform-bus: error %d in bti_create(cpu_trace_bti)\n", status);
+        return status;
+    }
+
+    status = publish_cpu_trace(cpu_trace_bti, parent);
+    if (status != ZX_OK) {
+        // This is not fatal.
+        zxlogf(INFO, "publish_cpu_trace returned %d\n", status);
+    }
+    return status;
+}
+
+static zx_protocol_device_t sys_device_proto = []() {
+    zx_protocol_device_t result;
+
+    result.version = DEVICE_OPS_VERSION;
+    result.suspend = sys_device_suspend;
+    result.release = sys_device_release;
+    return result;
+}();
+
+zx_status_t PlatformBus::Create(zx_device_t* parent, const char* name, zx::channel items_svc) {
     // This creates the "sys" device.
     sys_device_proto.version = DEVICE_OPS_VERSION;
+
+    // The suspend op needs to get access to the PBus instance, to be able to
+    // callback the ACPI suspend hook. Introducing a level of indirection here
+    // to allow us to update the PBus instance in the device context after creating
+    // the device.
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<uint8_t[]> ptr(new (&ac) uint8_t[sizeof(sysdev_suspend_t)]);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+    auto* suspend_buf = reinterpret_cast<sysdev_suspend_t*>(ptr.get());
+    suspend_buf->pbus_instance = nullptr;
 
     device_add_args_t args = {};
     args.version = DEVICE_ADD_ARGS_VERSION;
     args.name = "sys";
     args.ops = &sys_device_proto;
     args.flags = DEVICE_ADD_NON_BINDABLE;
+    args.ctx = suspend_buf;
 
-    // Add child of sys for the board driver to bind to.
-    auto status = device_add(parent, &args, &parent);
+    // Create /dev/sys.
+    zx_device_t* sys_root;
+    auto status = device_add(parent, &args, &sys_root);
     if (status != ZX_OK) {
         return status;
+    } else {
+        __UNUSED auto* dummy = ptr.release();
     }
 
-    fbl::AllocChecker ac;
-    fbl::unique_ptr<platform_bus::PlatformBus> bus(new (&ac) platform_bus::PlatformBus(parent));
+    // Add child of sys for the board driver to bind to.
+    fbl::unique_ptr<platform_bus::PlatformBus> bus(
+        new (&ac) platform_bus::PlatformBus(sys_root, std::move(items_svc)));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
+    suspend_buf->pbus_instance = bus.get();
 
-    status = bus->Init(std::move(zbi));
+    status = bus->Init();
     if (status != ZX_OK) {
         return status;
+    }
+
+    // Create /dev/sys/cpu-trace.
+    // But only do so if we have an iommu handle. Normally we do, but tests
+    // may create us without a root resource, and thus without the iommu
+    // handle.
+    if (bus->iommu_handle_.is_valid()) {
+        status = InitCpuTrace(sys_root, bus->iommu_handle_.get());
+        if (status != ZX_OK) {
+            // This is not fatal. Error message already printed.
+        }
     }
 
     // devmgr is now in charge of the device.
@@ -491,45 +411,133 @@ zx_status_t PlatformBus::Create(zx_device_t* parent, const char* name, zx::vmo z
     return ZX_OK;
 }
 
-PlatformBus::PlatformBus(zx_device_t* parent)
-    : PlatformBusType(parent) {
+PlatformBus::PlatformBus(zx_device_t* parent, zx::channel items_svc)
+    : PlatformBusType(parent), items_svc_(std::move(items_svc)) {
     sync_completion_reset(&proto_completion_);
 }
 
-zx_status_t PlatformBus::Init(zx::vmo zbi) {
-    auto status = ReadZbi(std::move(zbi));
+zx_status_t PlatformBus::Init() {
+    zx_status_t status;
+    // Set up a dummy IOMMU protocol to use in the case where our board driver
+    // does not set a real one.
+    zx_iommu_desc_dummy_t desc;
+    // Please do not use get_root_resource() in new code. See ZX-1467.
+    zx::unowned_resource root_resource(get_root_resource());
+    if (root_resource->is_valid()) {
+        status = zx::iommu::create(*root_resource, ZX_IOMMU_TYPE_DUMMY, &desc, sizeof(desc),
+                                   &iommu_handle_);
+        if (status != ZX_OK) {
+            return status;
+        }
+    }
+
+    // Read kernel driver.
+    zx::vmo vmo;
+    uint32_t length;
+    uint8_t interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_UNKNOWN;
+#if __x86_64__
+    interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_APIC;
+#else
+    status = GetBootItem(ZBI_TYPE_KERNEL_DRIVER, KDRV_ARM_GIC_V2, &vmo, &length);
     if (status != ZX_OK) {
         return status;
     }
-
-    // Set up a dummy IOMMU protocol to use in the case where our board driver does not
-    // set a real one.
-    zx_iommu_desc_dummy_t desc;
-    zx::unowned_resource root_resource(get_root_resource());
-    if (root_resource->is_valid()) {
-      status = zx::iommu::create(*root_resource, ZX_IOMMU_TYPE_DUMMY, &desc, sizeof(desc),
-                                 &iommu_handle_);
-      if (status != ZX_OK) {
-          return status;
-      }
+    if (vmo.is_valid()) {
+        interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_GIC_V2;
     }
+    status = GetBootItem(ZBI_TYPE_KERNEL_DRIVER, KDRV_ARM_GIC_V3, &vmo, &length);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (vmo.is_valid()) {
+        interrupt_controller_type = fuchsia_sysinfo_InterruptControllerType_GIC_V3;
+    }
+#endif
+    // Publish interrupt controller type to sysinfo driver
+    status = device_publish_metadata(
+        parent(), "/dev/misc/sysinfo", DEVICE_METADATA_INTERRUPT_CONTROLLER_TYPE,
+        &interrupt_controller_type, sizeof(interrupt_controller_type));
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "device_publish_metadata(interrupt_controller_type) failed: %d\n", status);
+        return status;
+    }
+
+    // Read platform ID.
+    status = GetBootItem(ZBI_TYPE_PLATFORM_ID, 0, &vmo, &length);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (vmo.is_valid()) {
+        zbi_platform_id_t platform_id;
+        status = vmo.read(&platform_id, 0, sizeof(platform_id));
+        if (status != ZX_OK) {
+            return status;
+        }
+        zxlogf(INFO, "platform bus: VID: %u PID: %u board: \"%s\"\n", platform_id.vid,
+               platform_id.pid, platform_id.board_name);
+        board_info_.vid = platform_id.vid;
+        board_info_.pid = platform_id.pid;
+        memcpy(board_info_.board_name, platform_id.board_name, sizeof(board_info_.board_name));
+        // Publish board name to sysinfo driver
+        status = device_publish_metadata(parent(), "/dev/misc/sysinfo", DEVICE_METADATA_BOARD_NAME,
+                                         platform_id.board_name, sizeof(platform_id.board_name));
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "device_publish_metadata(board_name) failed: %d\n", status);
+            return status;
+        }
+    } else {
+#if __x86_64__
+        // For x86_64, we might not find the ZBI_TYPE_PLATFORM_ID, old bootloaders
+        // won't support this, for example. If this is the case, cons up the VID/PID here
+        // to allow the acpi board driver to load and bind.
+        board_info_.vid = PDEV_VID_INTEL;
+        board_info_.pid = PDEV_PID_X86;
+        strncpy(board_info_.board_name, "x86_64", sizeof(board_info_.board_name));
+        // Publish board name to sysinfo driver
+        status = device_publish_metadata(parent(), "/dev/misc/sysinfo", DEVICE_METADATA_BOARD_NAME,
+                                         "x86_64", sizeof("x86_64"));
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "device_publish_metadata(board_name) failed: %d\n", status);
+            return status;
+        }
+#else
+        zxlogf(ERROR, "platform_bus: ZBI_TYPE_PLATFORM_ID not found\n");
+        return ZX_ERR_INTERNAL;
+#endif
+    }
+    // This is optionally set later by the board driver.
+    board_info_.board_revision = 0;
 
     // Then we attach the platform-bus device below it.
     zx_device_prop_t props[] = {
         {BIND_PLATFORM_DEV_VID, 0, board_info_.vid},
         {BIND_PLATFORM_DEV_PID, 0, board_info_.pid},
     };
-
-    return DdkAdd("platform", 0, props, fbl::count_of(props));
+    status = DdkAdd("platform", DEVICE_ADD_INVISIBLE, props, fbl::count_of(props));
+    if (status != ZX_OK) {
+        return status;
+    }
+    fbl::Array<uint8_t> board_data;
+    status = GetBootItem(ZBI_TYPE_DRV_BOARD_PRIVATE, 0, &board_data);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (board_data) {
+        status = DdkAddMetadata(DEVICE_METADATA_BOARD_PRIVATE, board_data.get(), board_data.size());
+        if (status != ZX_OK) {
+            return status;
+        }
+    }
+    DdkMakeVisible();
+    return ZX_OK;
 }
 
 zx_status_t platform_bus_create(void* ctx, zx_device_t* parent, const char* name,
-                                const char* args, zx_handle_t zbi_vmo_handle) {
-    zx::vmo zbi(zbi_vmo_handle);
-    return platform_bus::PlatformBus::Create(parent, name, std::move(zbi));
+                                const char* args, zx_handle_t handle) {
+    return platform_bus::PlatformBus::Create(parent, name, zx::channel(handle));
 }
 
-static zx_driver_ops_t driver_ops = [](){
+static zx_driver_ops_t driver_ops = []() {
     zx_driver_ops_t ops;
     ops.version = DRIVER_OPS_VERSION;
     ops.create = platform_bus_create;

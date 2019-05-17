@@ -18,13 +18,8 @@ Vnode::~Vnode() = default;
 
 #ifdef __Fuchsia__
 zx_status_t Vnode::Serve(fs::Vfs* vfs, zx::channel channel, uint32_t flags) {
-    return vfs->ServeConnection(fbl::make_unique<Connection>(
+    return vfs->ServeConnection(std::make_unique<Connection>(
         vfs, fbl::WrapRefPtr(this), std::move(channel), flags));
-}
-
-zx_status_t Vnode::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
-    info->tag = fuchsia_io_NodeInfoTag_service;
-    return ZX_OK;
 }
 
 zx_status_t Vnode::WatchDir(Vfs* vfs, uint32_t mask, uint32_t options, zx::channel watcher) {

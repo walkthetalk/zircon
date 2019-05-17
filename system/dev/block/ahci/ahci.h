@@ -18,23 +18,23 @@
 #define AHCI_PRD_MAX_SIZE 0x400000 // 4mb
 static_assert(PAGE_SIZE <= AHCI_PRD_MAX_SIZE, "page size must be less than PRD max size\n");
 
-#define AHCI_PORT_INT_CPD (1 << 31)
-#define AHCI_PORT_INT_TFE (1 << 30)
-#define AHCI_PORT_INT_HBF (1 << 29)
-#define AHCI_PORT_INT_HBD (1 << 28)
-#define AHCI_PORT_INT_IF  (1 << 27)
-#define AHCI_PORT_INT_INF (1 << 26)
-#define AHCI_PORT_INT_OF  (1 << 24)
-#define AHCI_PORT_INT_IPM (1 << 23)
-#define AHCI_PORT_INT_PRC (1 << 22)
-#define AHCI_PORT_INT_DI  (1 << 7)
-#define AHCI_PORT_INT_PC  (1 << 6)
-#define AHCI_PORT_INT_DP  (1 << 5)
-#define AHCI_PORT_INT_UF  (1 << 4)
-#define AHCI_PORT_INT_SDB (1 << 3)
-#define AHCI_PORT_INT_DS  (1 << 2)
-#define AHCI_PORT_INT_PS  (1 << 1)
-#define AHCI_PORT_INT_DHR (1 << 0)
+#define AHCI_PORT_INT_CPD (1u << 31)
+#define AHCI_PORT_INT_TFE (1u << 30)
+#define AHCI_PORT_INT_HBF (1u << 29)
+#define AHCI_PORT_INT_HBD (1u << 28)
+#define AHCI_PORT_INT_IF  (1u << 27)
+#define AHCI_PORT_INT_INF (1u << 26)
+#define AHCI_PORT_INT_OF  (1u << 24)
+#define AHCI_PORT_INT_IPM (1u << 23)
+#define AHCI_PORT_INT_PRC (1u << 22)
+#define AHCI_PORT_INT_DI  (1u << 7)
+#define AHCI_PORT_INT_PC  (1u << 6)
+#define AHCI_PORT_INT_DP  (1u << 5)
+#define AHCI_PORT_INT_UF  (1u << 4)
+#define AHCI_PORT_INT_SDB (1u << 3)
+#define AHCI_PORT_INT_DS  (1u << 2)
+#define AHCI_PORT_INT_PS  (1u << 1)
+#define AHCI_PORT_INT_DHR (1u << 0)
 
 #define AHCI_PORT_INT_ERROR (AHCI_PORT_INT_TFE | AHCI_PORT_INT_HBF | AHCI_PORT_INT_HBD | \
                              AHCI_PORT_INT_IF | AHCI_PORT_INT_INF | AHCI_PORT_INT_OF | \
@@ -43,29 +43,31 @@ static_assert(PAGE_SIZE <= AHCI_PRD_MAX_SIZE, "page size must be less than PRD m
 #define AHCI_PORT_INT_MASK (AHCI_PORT_INT_ERROR | AHCI_PORT_INT_DP | AHCI_PORT_INT_SDB | \
                             AHCI_PORT_INT_DS | AHCI_PORT_INT_PS | AHCI_PORT_INT_DHR)
 
-#define AHCI_PORT_CMD_ST         (1 << 0)
-#define AHCI_PORT_CMD_SUD        (1 << 1)
-#define AHCI_PORT_CMD_POD        (1 << 2)
-#define AHCI_PORT_CMD_FRE        (1 << 4)
-#define AHCI_PORT_CMD_FR         (1 << 14)
-#define AHCI_PORT_CMD_CR         (1 << 15)
-#define AHCI_PORT_CMD_ATAPI      (1 << 24)
-#define AHCI_PORT_CMD_ICC_ACTIVE (1 << 28)
+#define AHCI_PORT_CMD_ST         (1u << 0)
+#define AHCI_PORT_CMD_SUD        (1u << 1)
+#define AHCI_PORT_CMD_POD        (1u << 2)
+#define AHCI_PORT_CMD_FRE        (1u << 4)
+#define AHCI_PORT_CMD_FR         (1u << 14)
+#define AHCI_PORT_CMD_CR         (1u << 15)
+#define AHCI_PORT_CMD_ATAPI      (1u << 24)
+#define AHCI_PORT_CMD_ICC_ACTIVE (1u << 28)
 #define AHCI_PORT_CMD_ICC_MASK   (0xf << 28)
 
-#define AHCI_PORT_TFD_DATA_REQUEST (1 << 3)
-#define AHCI_PORT_TFD_BUSY         (1 << 7)
+#define AHCI_PORT_TFD_DATA_REQUEST (1u << 3)
+#define AHCI_PORT_TFD_BUSY         (1u << 7)
 
 #define AHCI_PORT_SIG_SATA 0x101
 
 #define AHCI_PORT_SSTS_DET_PRESENT 3
 
-#define AHCI_PORT_SCTL_IPM_ACTIVE  (1 << 8)
-#define AHCI_PORT_SCTL_IPM_PARTIAL (2 << 8)
+#define AHCI_PORT_SCTL_IPM_ACTIVE  (1u << 8)
+#define AHCI_PORT_SCTL_IPM_PARTIAL (2u << 8)
 #define AHCI_PORT_SCTL_DET_MASK    0xf
 #define AHCI_PORT_SCTL_DET_INIT    1
 
-typedef struct {
+class AhciController;
+
+struct ahci_port_reg_t {
     uint32_t clb;           // command list base address 1024-byte aligned
     uint32_t clbu;          // command list base address upper 32 bits
     uint32_t fb;            // FIS base address 256-byte aligned
@@ -86,14 +88,14 @@ typedef struct {
     uint32_t devslp;        // device sleep
     uint32_t reserved1[10]; // reserved
     uint32_t vendor[4];     // vendor specific
-} __attribute__((packed)) ahci_port_reg_t;
+} __attribute__((packed));
 
-#define AHCI_CAP_NCQ (1 << 30)
-#define AHCI_GHC_HR  (1 << 0)
-#define AHCI_GHC_IE  (1 << 1)
-#define AHCI_GHC_AE  (1 << 31)
+#define AHCI_CAP_NCQ (1u << 30)
+#define AHCI_GHC_HR  (1u << 0)
+#define AHCI_GHC_IE  (1u << 1)
+#define AHCI_GHC_AE  (1u << 31)
 
-typedef struct {
+struct ahci_hba_t {
     uint32_t cap;              // host capabilities
     uint32_t ghc;              // global host control
     uint32_t is;               // interrupt status
@@ -108,9 +110,10 @@ typedef struct {
     uint32_t reserved[29];     // reserved
     uint32_t vendor[24];       // vendor specific registers
     ahci_port_reg_t ports[32]; // port control registers
-} __attribute__((packed)) ahci_hba_t;
+} __attribute__((packed));
 
-typedef struct {
+// Command List.
+struct ahci_cl_t {
     union {
         struct {
             uint16_t cfl : 5; // command FIS length
@@ -130,9 +133,10 @@ typedef struct {
     uint32_t ctba;            // command table base address 128-byte aligned
     uint32_t ctbau;           // command table base address upper 32 bits
     uint32_t reserved[4];     // reserved
-} __attribute__((packed)) ahci_cl_t;
+} __attribute__((packed));
 
-typedef struct {
+// Frame Information Structure.
+struct ahci_fis_t {
     uint8_t dsfis[0x1c];     // DMA setup FIS
     uint8_t reserved1[0x4];
     uint8_t psfis[0x14];     // PIO setup FIS
@@ -142,20 +146,22 @@ typedef struct {
     uint8_t sdbfis[0x8];     // set device bits FIS
     uint8_t ufis[0x40];      // unknown FIS
     uint8_t reserved4[0x60];
-} __attribute__((packed)) ahci_fis_t;
+} __attribute__((packed));
 
-typedef struct {
+// Command Table Header.
+struct ahci_ct_t {
     uint8_t cfis[0x40];            // command FIS
     uint8_t acmd[0x20];            // ATAPI command
     uint8_t reserved[0x20];        // reserved
-} __attribute__((packed)) ahci_ct_t;
+} __attribute__((packed));
 
-typedef struct {
+// Physical Region Descriptor Entry.
+struct ahci_prd_t {
     uint32_t dba;      // data base address 2-byte aligned
     uint32_t dbau;     // data base address upper 32 bits
     uint32_t reserved; // reserved
     uint32_t dbc;      // byte count max 4mb
-} __attribute__((packed)) ahci_prd_t;
+} __attribute__((packed));
 
 static_assert(sizeof(ahci_cl_t) == 0x20, "unexpected command list size");
 static_assert(sizeof(ahci_fis_t) == 0x100, "unexpected fis size");

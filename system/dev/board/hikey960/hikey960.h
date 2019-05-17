@@ -5,8 +5,11 @@
 #pragma once
 
 #include <ddk/io-buffer.h>
+#include <ddk/mmio-buffer.h>
+#include <ddk/protocol/gpio.h>
+#include <ddk/protocol/gpioimpl.h>
 #include <ddk/protocol/platform/bus.h>
-#include <soc/hi3660/hi3660.h>
+#include <zircon/listnode.h>
 
 // BTI IDs for our devices
 enum {
@@ -20,10 +23,17 @@ enum {
 
 typedef struct {
     pbus_protocol_t pbus;
-    gpio_protocol_t gpio;
     zx_device_t* parent;
     zx_handle_t bti_handle;
-    hi3660_t* hi3660;
+
+    mmio_buffer_t usb3otg_bc;
+    mmio_buffer_t peri_crg;
+    mmio_buffer_t iomcu;
+    mmio_buffer_t pctrl;
+    mmio_buffer_t iomg_pmx4;
+    mmio_buffer_t iocfg_pmx9;
+    mmio_buffer_t pmu_ssio;
+    mmio_buffer_t ufs_sctrl;
 } hikey960_t;
 
 // hikey960-devices.c
@@ -32,8 +42,20 @@ zx_status_t hikey960_add_devices(hikey960_t* bus);
 // hikey960-sysmem.c
 zx_status_t hikey960_sysmem_init(hikey960_t* hikey);
 
+// hikey960-gpio.c
+zx_status_t hikey960_gpio_init(hikey960_t* bus);
+
 // hikey960-i2c.c
+zx_status_t hikey960_i2c1_init(hikey960_t* hikey);
+zx_status_t hikey960_i2c_pinmux(hikey960_t* hikey);
+zx_status_t hikey960_enable_ldo(hikey960_t* hikey);
 zx_status_t hikey960_i2c_init(hikey960_t* bus);
 
 // hikey960-usb.c
 zx_status_t hikey960_usb_init(hikey960_t* hikey);
+
+// hikey960-dsi.c
+zx_status_t hikey960_dsi_init(hikey960_t* hikey);
+
+// hikey960-ufs.c
+zx_status_t hikey960_ufs_init(hikey960_t* hikey);

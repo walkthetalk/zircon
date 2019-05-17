@@ -2,23 +2,27 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FDIO_NAMESPACE_H_
+#define LIB_FDIO_NAMESPACE_H_
 
 #include <stdint.h>
 
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 typedef struct fdio_namespace fdio_ns_t;
-
 
 // Create a new, empty namespace
 zx_status_t fdio_ns_create(fdio_ns_t** out);
 
-// Destroy and deallocate a namespace
-// Will fail (ZX_ERR_BAD_STATE) if the namespace is in use.
+// Destroy and deallocate a namespace.
+//
+// If the namespace is in-use, it will be destroyed once it is
+// no longer referenced.
+//
+// This function always returns |ZX_OK|.
 zx_status_t fdio_ns_destroy(fdio_ns_t* ns);
 
 // Create a new directory within a namespace, bound to the
@@ -27,10 +31,16 @@ zx_status_t fdio_ns_destroy(fdio_ns_t* ns);
 // no "." nor ".." entries.  It is relative to the root of the
 // namespace.
 //
-// The handle is not closed on failure.
-//
-// Will fail with ZX_ERR_BAD_STATE if the namespace is in use.
+// Ownership of |h| is transferred to |ns|: it is closed on error.
 zx_status_t fdio_ns_bind(fdio_ns_t* ns, const char* path, zx_handle_t h);
+
+// Unbinds |path| from a namespace, closing the handle within |ns| that
+// corresponds to that path when all references to the node go out of scope.
+//
+// Returns ZX_ERR_NOT_FOUND if |path| is not a remote.
+// Returns ZX_ERR_NOT_SUPPORTED if |path| is the root of the namespace.
+// Returns ZX_ERR_INVALID_ARGS if |path| is otherwise invalid.
+zx_status_t fdio_ns_unbind(fdio_ns_t* ns, const char* path);
 
 // Create a new directory within a namespace, bound to the
 // directory referenced by the file descriptor fd.
@@ -38,7 +48,7 @@ zx_status_t fdio_ns_bind(fdio_ns_t* ns, const char* path, zx_handle_t h);
 // no "." nor ".." entries.  It is relative to the root of the
 // namespace.
 //
-// The fd is not closed on success or failure.
+// |fd| is borrowed by this function, but is not closed on success or error.
 // Closing the fd after success does not affect namespace.
 //
 // Failures:
@@ -71,8 +81,7 @@ typedef struct fdio_flat_namespace {
 // one provided in 'ns' or the active root namespace, respectively.)
 // The handles are CLONEs of the handles in the namespace and also
 // belong to the caller.
-// The whole data structure can be released with free(), keeping in
-// mind that the handles should be used or closed first.
+// The whole data structure can be released with fdio_ns_free_flat_ns().
 zx_status_t fdio_ns_export(fdio_ns_t* ns, fdio_flat_namespace_t** out);
 zx_status_t fdio_ns_export_root(fdio_flat_namespace_t** out);
 
@@ -92,4 +101,10 @@ zx_status_t fdio_ns_connect(fdio_ns_t* ns, const char* path,
 zx_status_t fdio_ns_open(fdio_ns_t* ns, const char* path,
                          uint32_t zxflags, zx_handle_t* out);
 
-__END_CDECLS;
+// Frees a flat namespace.
+// Closes all handles contained within |ns|.
+void fdio_ns_free_flat_ns(fdio_flat_namespace_t* ns);
+
+__END_CDECLS
+
+#endif  // LIB_FDIO_NAMESPACE_H_

@@ -60,15 +60,19 @@ void zxtest_runner_notify_assertion(const char* desc, const char* expected,
                           {.filename = file, .line_number = line}, is_fatal));
 }
 
-bool zxtest_runner_should_abort_current_test(void) {
-    return zxtest::Runner::GetInstance()->ShouldAbortCurrentTest();
+bool zxtest_runner_current_test_has_fatal_failures(void) {
+    return zxtest::Runner::GetInstance()->CurrentTestHasFatalFailures();
+}
+
+bool zxtest_runner_current_test_has_failures(void) {
+    return zxtest::Runner::GetInstance()->CurrentTestHasFailures();
 }
 
 size_t _zxtest_print_int32(int32_t val, char* buffer, size_t buffer_size) {
     return snprintf(buffer, buffer_size, "%" PRIi32, val);
 }
 
-size_t _zxtest_print_uint32(int32_t val, char* buffer, size_t buffer_size) {
+size_t _zxtest_print_uint32(uint32_t val, char* buffer, size_t buffer_size) {
     return snprintf(buffer, buffer_size, "%" PRIu32, val);
 }
 
@@ -85,10 +89,13 @@ size_t _zxtest_print_bool(bool val, char* buffer, size_t buffer_size) {
 }
 
 size_t _zxtest_print_str(const char* val, char* buffer, size_t buffer_size) {
-    return snprintf(buffer, buffer_size, "%s", (val == NULL) ? "nullptr" : val);
+    return snprintf(buffer, buffer_size, "%s", (val == nullptr) ? "<nullptr>" : val);
 }
 
 size_t _zxtest_print_ptr(const void* val, char* buffer, size_t buffer_size) {
+    if (val == nullptr) {
+        return snprintf(buffer, buffer_size, "<nullptr>");
+    }
     return snprintf(buffer, buffer_size, "%p", val);
 }
 
@@ -97,8 +104,8 @@ size_t _zxtest_print_hex(const void* val, size_t size, char* buffer, size_t buff
         return 3 * size + 1;
     }
 
-    if (val == NULL) {
-        snprintf(buffer, 4, "nullptr");
+    if (val == nullptr) {
+        snprintf(buffer, 9, "<nullptr>");
     }
 
     for (size_t curr = 0; curr < size; ++curr) {
@@ -110,4 +117,10 @@ size_t _zxtest_print_hex(const void* val, size_t size, char* buffer, size_t buff
 
 void zxtest_c_clean_buffer(char** buffer) {
     free(*buffer);
+}
+
+void zxtest_runner_fail_current_test(bool is_fatal, const char* file, int line,
+                                     const char* message) {
+    zxtest::Runner::GetInstance()->NotifyAssertion(
+        zxtest::Assertion(message, {.filename = file, .line_number = line}, is_fatal));
 }

@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_HW_USB_H_
+#define SYSROOT_ZIRCON_HW_USB_H_
 
 // clang-format off
 
@@ -10,7 +11,7 @@
 #include <stdint.h>
 #include <zircon/compiler.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // maximum number of endpoints per device
 #define USB_MAX_EPS                     32
@@ -200,6 +201,9 @@ typedef struct {
     uint16_t wMaxPacketSize;
     uint8_t bInterval;
 } __attribute__ ((packed)) usb_endpoint_descriptor_t;
+#define usb_ep_num(ep)          ((ep)->bEndpointAddress & USB_ENDPOINT_NUM_MASK)
+// usb_ep_num2() useful with you have bEndpointAddress outside of a descriptor.
+#define usb_ep_num2(addr)       ((addr) & USB_ENDPOINT_NUM_MASK)
 #define usb_ep_direction(ep)    ((ep)->bEndpointAddress & USB_ENDPOINT_DIR_MASK)
 #define usb_ep_type(ep)         ((ep)->bmAttributes & USB_ENDPOINT_TYPE_MASK)
 #define usb_ep_sync_type(ep)    ((ep)->bmAttributes & USB_ENDPOINT_SYNCHRONIZATION_MASK)
@@ -208,6 +212,18 @@ typedef struct {
 // for high speed interrupt and isochronous endpoints, additional transactions per microframe
 // are in bits 12..11
 #define usb_ep_add_mf_transactions(ep) ((le16toh((ep)->wMaxPacketSize) >> 11) & 3)
+
+typedef struct {
+    uint8_t bLength;
+    uint8_t bDescriptorType;    // USB_DT_DEVICE_QUALIFIER
+    uint16_t bcdUSB;
+    uint8_t bDeviceClass;
+    uint8_t bDeviceSubClass;
+    uint8_t bDeviceProtocol;
+    uint8_t bMaxPacketSize0;
+    uint8_t bNumConfigurations;
+    uint8_t bReserved;
+} __attribute__ ((packed)) usb_device_qualifier_descriptor_t;
 
 typedef struct {
     uint8_t bLength;
@@ -255,4 +271,6 @@ typedef struct {
     uint16_t code_points[127];
 } __attribute__ ((packed)) usb_string_desc_t;
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_HW_USB_H_

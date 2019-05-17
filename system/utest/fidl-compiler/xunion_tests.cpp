@@ -67,11 +67,27 @@ xunion Foo {
 };
 )FIDL"));
 
+    // Keywords as field names.
+    EXPECT_TRUE(Compiles(R"FIDL(
+library fidl.test.xunions;
+
+struct struct {
+    bool field;
+};
+
+xunion Foo {
+    int64 xunion;
+    bool library;
+    uint32 uint32;
+    struct member;
+};
+)FIDL"));
+
     END_TEST;
 }
 
 } // namespace
 
-BEGIN_TEST_CASE(xunion_tests);
-RUN_TEST(compiling);
-END_TEST_CASE(xunion_tests);
+BEGIN_TEST_CASE(xunion_tests)
+RUN_TEST(compiling)
+END_TEST_CASE(xunion_tests)

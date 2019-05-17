@@ -2,10 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_AUTO_CALL_H_
+#define FBL_AUTO_CALL_H_
 
 #include <fbl/macros.h>
-#include <fbl/type_support.h>
 
 #include <utility>
 
@@ -82,3 +82,5 @@ inline AutoCall<T> MakeAutoCall(T c) {
 }
 
 } // namespace fbl
+
+#endif  // FBL_AUTO_CALL_H_

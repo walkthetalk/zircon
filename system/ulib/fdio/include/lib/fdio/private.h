@@ -2,13 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FDIO_PRIVATE_H_
+#define LIB_FDIO_PRIVATE_H_
 
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <stdint.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // WARNING: These APIs are subject to change
 
@@ -19,4 +20,6 @@ __BEGIN_CDECLS;
 // is set to true if the returned path must be a directory.
 zx_status_t __fdio_cleanpath(const char* in, char* out, size_t* outlen, bool* is_dir);
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // LIB_FDIO_PRIVATE_H_

@@ -21,15 +21,21 @@
 #include <fbl/unique_fd.h>
 #include <fs-management/fvm.h>
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
+#include <ramdevice-client/ramdisk.h>
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/hardware/ramdisk/c/fidl.h>
-#include <fvm/fvm.h>
-#include <lib/fdio/debug.h>
+#include <fvm/format.h>
+#include <lib/zircon-internal/debug.h>
+#include <lib/fdio/unsafe.h>
 #include <lib/fdio/watcher.h>
+#include <lib/fzl/fdio.h>
+#include <lib/zx/fifo.h>
 #include <lib/zx/time.h>
+#include <lib/zx/vmo.h>
 #include <unittest/unittest.h>
 #include <zircon/assert.h>
 #include <zircon/types.h>
+#include <zxcrypt/fdio-volume.h>
 #include <zxcrypt/volume.h>
 
 #include "test-device.h"
@@ -134,7 +140,7 @@ bool TestDevice::Create(size_t device_size, size_t block_size, bool fvm) {
 bool TestDevice::Bind(Volume::Version version, bool fvm) {
     BEGIN_HELPER;
     ASSERT_TRUE(Create(kDeviceSize, kBlockSize, fvm));
-    ASSERT_OK(Volume::Create(parent(), key_));
+    ASSERT_OK(FdioVolume::Create(parent(), key_));
     ASSERT_TRUE(Connect());
     END_HELPER;
 }
@@ -153,6 +159,9 @@ bool TestDevice::Rebind() {
     ASSERT_EQ(ramdisk_rebind(ramdisk_), ZX_OK);
     if (strlen(fvm_part_path_) != 0) {
         ASSERT_TRUE(WaitAndOpen(fvm_part_path_, &fvm_part_));
+        parent_caller_.reset(fvm_part_.get());
+    } else {
+        parent_caller_.reset(ramdisk_get_block_fd(ramdisk_));
     }
     ASSERT_TRUE(Connect());
 
@@ -257,8 +266,8 @@ bool TestDevice::Corrupt(uint64_t blkno, key_slot_t slot) {
     ASSERT_OK(ToStatus(::lseek(fd.get(), blkno * block_size_, SEEK_SET)));
     ASSERT_OK(ToStatus(::read(fd.get(), block, block_size_)));
 
-    fbl::unique_ptr<Volume> volume;
-    ASSERT_OK(Volume::Unlock(parent(), key_, 0, &volume));
+    fbl::unique_ptr<FdioVolume> volume;
+    ASSERT_OK(FdioVolume::Unlock(parent(), key_, 0, &volume));
 
     zx_off_t off;
     ASSERT_OK(volume->GetSlotOffset(slot, &off));
@@ -287,7 +296,8 @@ bool TestDevice::CreateRamdisk(size_t device_size, size_t block_size) {
     ASSERT_TRUE(ac.check());
     memset(as_read_.get(), 0, block_size);
 
-    ASSERT_EQ(create_ramdisk(block_size, count, &ramdisk_), ZX_OK);
+    ASSERT_EQ(ramdisk_create(block_size, count, &ramdisk_), ZX_OK);
+    parent_caller_.reset(ramdisk_get_block_fd(ramdisk_));
 
     block_size_ = block_size;
     block_count_ = count;
@@ -307,19 +317,27 @@ bool TestDevice::CreateFvmPart(size_t device_size, size_t block_size) {
     BEGIN_HELPER;
 
     // Calculate total size of data + metadata.
-    device_size = fbl::round_up(device_size, FVM_BLOCK_SIZE);
-    size_t old_meta = fvm::MetadataSize(device_size, FVM_BLOCK_SIZE);
-    size_t new_meta = fvm::MetadataSize(old_meta + device_size, FVM_BLOCK_SIZE);
+    device_size = fbl::round_up(device_size, fvm::kBlockSize);
+    size_t old_meta = fvm::MetadataSize(device_size, fvm::kBlockSize);
+    size_t new_meta = fvm::MetadataSize(old_meta + device_size, fvm::kBlockSize);
     while (old_meta != new_meta) {
         old_meta = new_meta;
-        new_meta = fvm::MetadataSize(old_meta + device_size, FVM_BLOCK_SIZE);
+        new_meta = fvm::MetadataSize(old_meta + device_size, fvm::kBlockSize);
     }
     ASSERT_TRUE(CreateRamdisk(device_size + (new_meta * 2), block_size));
 
     // Format the ramdisk as FVM and bind to it
-    ASSERT_OK(fvm_init(ramdisk_get_block_fd(ramdisk_), FVM_BLOCK_SIZE));
-    ASSERT_OK(ToStatus(ioctl_device_bind(ramdisk_get_block_fd(ramdisk_), kFvmDriver,
-                                         strlen(kFvmDriver))));
+    ASSERT_OK(fvm_init(ramdisk_get_block_fd(ramdisk_), fvm::kBlockSize));
+
+    fdio_t* io = fdio_unsafe_fd_to_io(ramdisk_get_block_fd(ramdisk_));
+    ASSERT_NONNULL(io);
+    zx_status_t call_status;
+    zx_status_t status = fuchsia_device_ControllerBind(fdio_unsafe_borrow_channel(io),
+                                                       kFvmDriver, strlen(kFvmDriver),
+                                                       &call_status);
+    fdio_unsafe_release(io);
+    ASSERT_EQ(status, ZX_OK);
+    ASSERT_EQ(call_status, ZX_OK);
 
     char path[PATH_MAX];
     fbl::unique_fd fvm_fd;
@@ -329,7 +347,7 @@ bool TestDevice::CreateFvmPart(size_t device_size, size_t block_size) {
     // Allocate a FVM partition with the last slice unallocated.
     alloc_req_t req;
     memset(&req, 0, sizeof(alloc_req_t));
-    req.slice_count = (kDeviceSize / FVM_BLOCK_SIZE) - 1;
+    req.slice_count = (kDeviceSize / fvm::kBlockSize) - 1;
     memcpy(req.type, zxcrypt_magic, sizeof(zxcrypt_magic));
     for (uint8_t i = 0; i < GUID_LEN; ++i) {
         req.guid[i] = i;
@@ -337,10 +355,16 @@ bool TestDevice::CreateFvmPart(size_t device_size, size_t block_size) {
     snprintf(req.name, NAME_LEN, "data");
     fvm_part_.reset(fvm_allocate_partition(fvm_fd.get(), &req));
     ASSERT_TRUE(fvm_part_);
+    parent_caller_.reset(fvm_part_.get());
 
     // Save the topological path for rebinding
-    ASSERT_OK(ToStatus(
-        ioctl_device_get_topo_path(fvm_part_.get(), fvm_part_path_, sizeof(fvm_part_path_))));
+    size_t out_len;
+    status = fuchsia_device_ControllerGetTopologicalPath(parent_channel()->get(),
+                                                         &call_status, fvm_part_path_,
+                                                         sizeof(fvm_part_path_) - 1, &out_len);
+    ASSERT_EQ(status, ZX_OK);
+    ASSERT_EQ(call_status, ZX_OK);
+    fvm_part_path_[out_len] = 0;
 
     END_HELPER;
 }
@@ -349,29 +373,57 @@ bool TestDevice::Connect() {
     BEGIN_HELPER;
     ZX_DEBUG_ASSERT(!zxcrypt_);
 
-    ASSERT_OK(Volume::Unlock(parent(), key_, 0, &volume_));
+    ASSERT_OK(FdioVolume::Unlock(parent(), key_, 0, &volume_));
+    zx::channel zxc_manager_chan;
+    ASSERT_OK(volume_->OpenManager(kTimeout, zxc_manager_chan.reset_and_get_address()));
+    FdioVolumeManager volume_manager(std::move(zxc_manager_chan));
+    zx_status_t rc;
+    // Unseal may fail because the volume is already unsealed, so we also allow
+    // ZX_ERR_INVALID_STATE here.  If we fail to unseal the volume, the
+    // volume_->Open() call below will fail, so this is safe to ignore.
+    rc = volume_manager.Unseal(key_.get(), key_.len(), 0);
+    ASSERT_TRUE(rc == ZX_OK || rc == ZX_ERR_BAD_STATE);
     ASSERT_OK(volume_->Open(kTimeout, &zxcrypt_));
+    zxcrypt_caller_.reset(zxcrypt_.get());
 
-    block_info_t blk;
-    ASSERT_OK(ToStatus(ioctl_block_get_info(zxcrypt_.get(), &blk)));
-    block_size_ = blk.block_size;
-    block_count_ = blk.block_count;
+    fuchsia_hardware_block_BlockInfo block_info;
+    zx_status_t status;
+    ASSERT_OK(fuchsia_hardware_block_BlockGetInfo(zxcrypt_channel()->get(), &status,
+                                                  &block_info));
+    ASSERT_OK(status);
+    block_size_ = block_info.block_size;
+    block_count_ = block_info.block_count;
 
-    zx_handle_t fifo;
-    ASSERT_OK(ToStatus(ioctl_block_get_fifos(zxcrypt_.get(), &fifo)));
+    zx::fifo fifo;
+    ASSERT_OK(fuchsia_hardware_block_BlockGetFifo(zxcrypt_channel()->get(), &status,
+                                                  fifo.reset_and_get_address()));
+    ASSERT_OK(status);
     req_.group = 0;
-    ASSERT_OK(block_fifo_create_client(fifo, &client_));
+    ASSERT_OK(block_fifo_create_client(fifo.release(), &client_));
 
     // Create the vmo and get a transferable handle to give to the block server
     ASSERT_OK(zx::vmo::create(size(), 0, &vmo_));
-    zx_handle_t xfer;
-    ASSERT_OK(zx_handle_duplicate(vmo_.get(), ZX_RIGHT_SAME_RIGHTS, &xfer));
-    ASSERT_OK(ToStatus(ioctl_block_attach_vmo(zxcrypt_.get(), &xfer, &req_.vmoid)));
+    zx::vmo xfer_vmo;
+    ASSERT_EQ(vmo_.duplicate(ZX_RIGHT_SAME_RIGHTS, &xfer_vmo), ZX_OK);
+    fuchsia_hardware_block_VmoID vmoid;
+    ASSERT_OK(fuchsia_hardware_block_BlockAttachVmo(zxcrypt_channel()->get(),
+                                                    xfer_vmo.release(), &status, &vmoid));
+    ASSERT_OK(status);
+    req_.vmoid = vmoid.id;
 
     END_HELPER;
 }
 
 void TestDevice::Disconnect() {
+    if (volume_) {
+        zx::channel zxc_manager_chan;
+        volume_->OpenManager(kTimeout, zxc_manager_chan.reset_and_get_address());
+        if (zxc_manager_chan) {
+            FdioVolumeManager volume_manager(std::move(zxc_manager_chan));
+            volume_manager.Seal();
+        }
+    }
+
     if (client_) {
         memset(&req_, 0, sizeof(req_));
         block_fifo_release_client(client_);

@@ -1,0 +1,58 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+library("fdio") {
+  sdk = "shared"
+  sdk_headers = [
+    "lib/fdio/directory.h",
+    "lib/fdio/fd.h",
+    "lib/fdio/fdio.h",
+    "lib/fdio/io.h",
+    "lib/fdio/limits.h",
+    "lib/fdio/namespace.h",
+    "lib/fdio/private.h",
+    "lib/fdio/spawn.h",
+    "lib/fdio/unsafe.h",
+    "lib/fdio/vfs.h",
+    "lib/fdio/watcher.h",
+  ]
+  shared = true
+  sources = [
+    "bsdsocket.cpp",
+    "fd.cpp",
+    "fdio.c",
+    "get-vmo.cpp",
+    "namespace/local-connection.cpp",
+    "namespace/local-filesystem.cpp",
+    "namespace/local-vnode.cpp",
+    "namespace/namespace.cpp",
+    "null.cpp",
+    "remoteio.cpp",
+    "socket.cpp",
+    "spawn.cpp",
+    "stubs.cpp",
+    "uname.c",
+    "unistd.c",
+    "waitable.cpp",
+    "watcher.cpp",
+    "zxio.cpp",
+  ]
+  configs += [ "$zx/public/gn/config:visibility_hidden" ]
+  deps = [
+    "$zx/system/fidl/fuchsia-device:c",
+    "$zx/system/fidl/fuchsia-io:c",
+    "$zx/system/fidl/fuchsia-io:llcpp",
+    "$zx/system/fidl/fuchsia-ldsvc:c",
+    "$zx/system/fidl/fuchsia-net:c",
+    "$zx/system/fidl/fuchsia-process:c",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fidl",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zircon-internal",
+    "$zx/system/ulib/zx",
+    "$zx/system/ulib/zxio",
+    "$zx/system/ulib/zxs",
+  ]
+  configs += [ "$zx/public/gn/config:static-libc++" ]
+}

@@ -6,7 +6,7 @@
 #include <inttypes.h>
 #include <utility>
 
-#include <fvm/fvm.h>
+#include <fvm/format.h>
 #include <lib/fit/defer.h>
 #include <sys/ioctl.h>
 
@@ -25,8 +25,7 @@
 
 zx_status_t FvmContainer::Create(const char* path, size_t slice_size, off_t offset, off_t length,
                                  fbl::unique_ptr<FvmContainer>* out) {
-    fbl::unique_ptr<FvmContainer> fvmContainer(new FvmContainer(path, slice_size, offset,
-                                                                length));
+    fbl::unique_ptr<FvmContainer> fvmContainer(new FvmContainer(path, slice_size, offset, length));
 
     zx_status_t status;
     if ((status = fvmContainer->Init()) != ZX_OK) {
@@ -81,7 +80,8 @@ FvmContainer::FvmContainer(const char* path, size_t slice_size, off_t offset, of
     }
 
     // Attempt to load metadata from disk
-    if (info_.Load(fd_, disk_offset_, disk_size_) != ZX_OK) {
+    fvm::host::FdWrapper wrapper = fvm::host::FdWrapper(fd_.get());
+    if (info_.Load(&wrapper, disk_offset_, disk_size_) != ZX_OK) {
         exit(-1);
     }
 
@@ -114,7 +114,7 @@ zx_status_t FvmContainer::Verify() const {
     off_t start = 0;
     off_t end = disk_offset_ + info_.MetadataSize() * 2;
     size_t slice_index = 1;
-    for (size_t vpart_index = 1; vpart_index < FVM_MAX_ENTRIES; ++vpart_index) {
+    for (size_t vpart_index = 1; vpart_index < fvm::kMaxVPartitions; ++vpart_index) {
         fvm::vpart_entry_t* vpart = nullptr;
         start = end;
 
@@ -131,25 +131,25 @@ zx_status_t FvmContainer::Verify() const {
         size_t last_vslice = 0;
         size_t slice_count = 0;
         for (; slice_index <= sb->pslice_count; ++slice_index) {
-            fvm::slice_entry_t* slice = nullptr;
+            fvm::SliceEntry* slice = nullptr;
             if ((status = info_.GetSlice(slice_index, &slice)) != ZX_OK) {
                 return status;
             }
 
-            if (slice->Vpart() != vpart_index) {
+            if (slice->VPartition() != vpart_index) {
                 break;
             }
 
             end += slice_size_;
             slice_count++;
 
-            if (slice->Vslice() == last_vslice + 1) {
+            if (slice->VSlice() == last_vslice + 1) {
                 extent_lengths[extent_lengths.size() - 1] += slice_size_;
             } else {
                 extent_lengths.push_back(slice_size_);
             }
 
-            last_vslice = slice->Vslice();
+            last_vslice = slice->VSlice();
         }
 
         if (vpart->slices != slice_count) {
@@ -226,6 +226,7 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
     // Then, we update the on-disk metadata to reflect the new size of the disk.
     // To avoid collision between relocated slices, this is done on a temporary file.
     uint64_t pslice_count = info_.SuperBlock()->pslice_count;
+    fvm::FormatInfo format_info = fvm::FormatInfo::FromDiskSize(disk_size_, slice_size_);
     for (uint32_t index = 1; index <= pslice_count; index++) {
         zx_status_t status;
         fvm::slice_entry_t* slice = nullptr;
@@ -234,30 +235,30 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
             return status;
         }
 
-        if (slice->Vpart() == FVM_SLICE_ENTRY_FREE) {
+        if (slice->IsFree()) {
             continue;
         }
 
         fbl::Array<uint8_t> data(new uint8_t[slice_size_], slice_size_);
 
-        if (lseek(fd_.get(), fvm::SliceStart(disk_size_, slice_size_, index), SEEK_SET) < 0) {
+        if (lseek(fd_.get(), format_info.GetSliceStart(index), SEEK_SET) < 0) {
             fprintf(stderr, "Cannot seek to slice %u in current FVM\n", index);
             return ZX_ERR_BAD_STATE;
         }
 
         ssize_t r = read(fd_.get(), data.get(), slice_size_);
-        if (r != slice_size_) {
+        if (r < 0 || static_cast<size_t>(r) != slice_size_) {
             fprintf(stderr, "Failed to read data from FVM: %ld\n", r);
             return ZX_ERR_BAD_STATE;
         }
 
-        if (lseek(fd.get(), fvm::SliceStart(disk_size, slice_size_, index), SEEK_SET) < 0) {
+        if (lseek(fd.get(), format_info.GetSliceStart(index), SEEK_SET) < 0) {
             fprintf(stderr, "Cannot seek to slice %u in new FVM\n", index);
             return ZX_ERR_BAD_STATE;
         }
 
         r = write(fd.get(), data.get(), slice_size_);
-        if (r != slice_size_) {
+        if (r < 0 || static_cast<size_t>(r) != slice_size_) {
             fprintf(stderr, "Failed to write data to FVM: %ld\n", r);
             return ZX_ERR_BAD_STATE;
         }
@@ -269,7 +270,8 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
         return status;
     }
 
-    if ((status = info_.Write(fd, 0, disk_size)) != ZX_OK) {
+    fvm::host::FdWrapper wrapper = fvm::host::FdWrapper(fd.get());
+    if ((status = info_.Write(&wrapper, 0, disk_size)) != ZX_OK) {
         return status;
     }
 
@@ -328,7 +330,8 @@ zx_status_t FvmContainer::Commit() {
         }
     }
 
-    zx_status_t status = info_.Write(fd_, disk_offset_, disk_size_);
+    fvm::host::FdWrapper wrapper = fvm::host::FdWrapper(fd_.get());
+    zx_status_t status = info_.Write(&wrapper, disk_offset_, disk_size_);
     if (status != ZX_OK) {
         return status;
     }
@@ -348,7 +351,8 @@ size_t FvmContainer::SliceSize() const {
     return slice_size_;
 }
 
-zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) {
+zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name,
+                                       FvmReservation* reserve) {
     info_.CheckValid();
 
     fbl::unique_ptr<Format> format;
@@ -359,7 +363,7 @@ zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) 
     }
 
     uint32_t vpart_index;
-    uint8_t guid[FVM_GUID_LEN];
+    uint8_t guid[fvm::kGuidSize];
     format->Guid(guid);
     fvm::partition_descriptor_t descriptor;
     format->GetPartitionInfo(&descriptor);
@@ -367,7 +371,7 @@ zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) 
         return status;
     }
 
-    if ((status = format->MakeFvmReady(slice_size_, vpart_index)) != ZX_OK) {
+    if ((status = format->MakeFvmReady(slice_size_, vpart_index, reserve)) != ZX_OK) {
         return status;
     }
 
@@ -395,13 +399,14 @@ zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) 
             return status;
         }
 
-        uint32_t vslice = vslice_info.vslice_start / format->BlocksPerSlice();
+        uint32_t vslice =
+            static_cast<uint32_t>(vslice_info.vslice_start / format->BlocksPerSlice());
 
         for (unsigned i = 0; i < vslice_info.slice_count; i++) {
             uint32_t pslice;
 
-            if ((status = info_.AllocateSlice(format->VpartIndex(), vslice + i, &pslice))
-                != ZX_OK) {
+            if ((status = info_.AllocateSlice(format->VpartIndex(), vslice + i, &pslice)) !=
+                ZX_OK) {
                 return status;
             }
 
@@ -442,7 +447,7 @@ uint64_t FvmContainer::CalculateDiskSize() const {
 
     size_t required_slices = 0;
 
-    for (size_t index = 1; index < FVM_MAX_ENTRIES; index++) {
+    for (size_t index = 1; index < fvm::kMaxVPartitions; index++) {
         fvm::vpart_entry_t* vpart;
         ZX_ASSERT(info_.GetPartition(index, &vpart) == ZX_OK);
 
@@ -463,8 +468,8 @@ uint64_t FvmContainer::GetDiskSize() const {
 zx_status_t FvmContainer::WritePartition(unsigned part_index) {
     info_.CheckValid();
     if (part_index > partitions_.size()) {
-        fprintf(stderr, "Error: Tried to access partition %u / %zu\n",
-                part_index, partitions_.size());
+        fprintf(stderr, "Error: Tried to access partition %u / %zu\n", part_index,
+                partitions_.size());
         return ZX_ERR_OUT_OF_RANGE;
     }
 
@@ -504,7 +509,8 @@ zx_status_t FvmContainer::WriteExtent(unsigned extent_index, Format* format, uin
                 }
                 format->EmptyBlock();
             } else {
-                if ((status = format->FillBlock(vslice_info.block_offset + current_block)) != ZX_OK) {
+                if ((status = format->FillBlock(vslice_info.block_offset + current_block)) !=
+                    ZX_OK) {
                     fprintf(stderr, "Failed to read block from minfs\n");
                     return status;
                 }
@@ -526,18 +532,20 @@ zx_status_t FvmContainer::WriteExtent(unsigned extent_index, Format* format, uin
 zx_status_t FvmContainer::WriteData(uint32_t pslice, uint32_t block_offset, size_t block_size,
                                     void* data) {
     info_.CheckValid();
-
+    fvm::FormatInfo format_info = fvm::FormatInfo::FromDiskSize(disk_size_, slice_size_);
     if (block_offset * block_size > slice_size_) {
         fprintf(stderr, "Not enough space in slice\n");
         return ZX_ERR_OUT_OF_RANGE;
     }
 
-    if (lseek(fd_.get(), disk_offset_ + fvm::SliceStart(disk_size_, slice_size_, pslice) + block_offset * block_size, SEEK_SET) < 0) {
+    if (lseek(fd_.get(),
+              disk_offset_ + format_info.GetSliceStart(pslice) + block_offset * block_size,
+              SEEK_SET) < 0) {
         return ZX_ERR_BAD_STATE;
     }
 
     ssize_t r = write(fd_.get(), data, block_size);
-    if (r != block_size) {
+    if (r < 0 || static_cast<size_t>(r) != block_size) {
         fprintf(stderr, "Failed to write data to FVM\n");
         return ZX_ERR_BAD_STATE;
     }

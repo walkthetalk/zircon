@@ -119,10 +119,9 @@ namespace hid {
 // same report id.
 
 // Logical minimum and maximum per hid spec.
-// Please note that if min >= 0, max is actually an unsigned uint32_t.
 struct MinMax {
-    int32_t min;
-    int32_t max;
+    int64_t min;
+    int64_t max;
 };
 
 // Physical units descriptor.
@@ -217,6 +216,8 @@ struct ReportField {
 struct ReportDescriptor {
     uint8_t report_id;
 
+    // The byte size includes the 1 byte for the report ID if the report ID is
+    // not equal to zero.
     size_t input_byte_sz;
     size_t input_count;
     ReportField* input_fields;
@@ -228,16 +229,6 @@ struct ReportDescriptor {
     size_t feature_byte_sz;
     size_t feature_count;
     ReportField* feature_fields;
-
-    // TODO(dgilhooley) - Remove all of these fields below, they
-    // were created before input, output, feature fields and are now
-    // depreciated.
-
-    // This is the byte_sz of the input fields only
-    size_t byte_sz;
-    size_t count;
-    // The array of all fields (input, output, and feature)
-    ReportField* first_field;
 };
 
 struct DeviceDescriptor {
@@ -271,9 +262,6 @@ ParseResult ParseReportDescriptor(
     DeviceDescriptor** dev_desc);
 
 void FreeDeviceDescriptor(DeviceDescriptor* dev_desc);
-
-ReportField* GetFirstInputField(const DeviceDescriptor* dev_desc,
-                                size_t* count);
 
 Collection* GetAppCollection(const ReportField* field);
 

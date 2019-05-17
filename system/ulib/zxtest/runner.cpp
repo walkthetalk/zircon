@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <fbl/auto_call.h>
 #include <fbl/string_piece.h>
 #include <zxtest/base/runner.h>
 
@@ -19,7 +20,7 @@ void TestDriverImpl::Skip() {
 }
 
 bool TestDriverImpl::Continue() const {
-    return !has_fatal_failures_;
+    return !current_test_has_fatal_failures_;
 }
 
 void TestDriverImpl::OnTestStart(const TestCase& test_case, const TestInfo& test_info) {
@@ -40,12 +41,14 @@ void TestDriverImpl::OnTestFailure(const TestCase& test_case, const TestInfo& te
 
 void TestDriverImpl::OnAssertion(const Assertion& assertion) {
     status_ = TestStatus::kFailed;
-    has_fatal_failures_ = assertion.is_fatal();
+    current_test_has_any_failures_ = true;
+    current_test_has_fatal_failures_ = assertion.is_fatal();
     had_any_failures_ = true;
 }
 
 void TestDriverImpl::Reset() {
-    has_fatal_failures_ = false;
+    current_test_has_fatal_failures_ = false;
+    current_test_has_any_failures_ = false;
     status_ = TestStatus::kPassed;
 }
 
@@ -92,13 +95,21 @@ TestRef Runner::RegisterTest(const fbl::String& test_case_name, const fbl::Strin
 }
 
 int Runner::Run(const Runner::Options& options) {
+    options_ = &options;
+    auto reset_options = fbl::MakeAutoCall([this]() { options_ = nullptr; });
     summary_.total_iterations = options.repeat;
-    Filter(options.filter);
+    EnforceOptions(options);
 
     event_broadcaster_.OnProgramStart(*this);
-    for (int i = 0; i < options.repeat; ++i) {
+    bool end_execution = false;
+    for (int i = 0; (i < options.repeat || options.repeat == -1) && !end_execution; ++i) {
         event_broadcaster_.OnIterationStart(*this, i);
         event_broadcaster_.OnEnvironmentSetUp(*this);
+        // Set them up in order.
+        for (auto& environment : environments_) {
+            environment->SetUp();
+        }
+
         for (auto& test_case : test_cases_) {
             if (options.shuffle) {
                 test_case.Shuffle(options.seed);
@@ -106,11 +117,24 @@ int Runner::Run(const Runner::Options& options) {
 
             test_case.Run(&event_broadcaster_, &test_driver_);
 
+            // If there was any kind of failure, we should stop executing any other
+            // test case and just finish. TearDown do get called, this is treated
+            // as if everything ended here.
+            if (options.break_on_failure && test_driver_.HadAnyFailures()) {
+                end_execution = true;
+                break;
+            }
+
             if (options.shuffle) {
                 test_case.UnShuffle();
             }
         }
         event_broadcaster_.OnEnvironmentTearDown(*this);
+
+        // Tear them down in reverse order
+        for (size_t i = environments_.size(); i > 0; --i) {
+            environments_[i - 1]->TearDown();
+        }
         event_broadcaster_.OnIterationEnd(*this, i);
     }
     event_broadcaster_.OnProgramEnd(*this);
@@ -119,8 +143,10 @@ int Runner::Run(const Runner::Options& options) {
 }
 
 void Runner::List(const Runner::Options& options) {
+    options_ = &options;
+    auto reset_options = fbl::MakeAutoCall([this]() { options_ = nullptr; });
     summary_.total_iterations = options.repeat;
-    Filter(options.filter);
+    EnforceOptions(options);
     FILE* output = reporter_.stream();
 
     if (output == nullptr) {
@@ -139,16 +165,17 @@ void Runner::List(const Runner::Options& options) {
     }
 }
 
-void Runner::Filter(const fbl::String& pattern) {
+void Runner::EnforceOptions(const Runner::Options& options) {
     summary_.active_test_count = 0;
     summary_.active_test_case_count = 0;
-    const FilterOp filter_op = {.pattern = pattern};
+    const FilterOp filter_op = {.pattern = options.filter};
     for (auto& test_case : test_cases_) {
         // TODO(gevalentino): replace with filter function.
         test_case.Filter(filter_op);
         if (test_case.MatchingTestCount() > 0) {
             summary_.active_test_case_count++;
             summary_.active_test_count += test_case.MatchingTestCount();
+            test_case.SetReturnOnFailure(options.break_on_failure);
         }
     }
 }

@@ -11,7 +11,9 @@
 #include <arch/ops.h>
 #include <arch/thread.h>
 #include <debug.h>
+#include <fbl/intrusive_double_list.h>
 #include <kernel/cpu.h>
+#include <kernel/fair_task_state.h>
 #include <kernel/spinlock.h>
 #include <kernel/timer.h>
 #include <kernel/wait.h>
@@ -21,7 +23,8 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-// fwd decl for the user_thread member below.
+// fwd decls
+class OwnedWaitQueue;
 class ThreadDispatcher;
 
 __BEGIN_CDECLS
@@ -36,6 +39,9 @@ enum thread_state {
     THREAD_SUSPENDED,
     THREAD_DEATH,
 };
+
+// Returns a string constant for the given thread state.
+const char* ToString(enum thread_state state);
 
 enum thread_user_state_change {
     THREAD_USER_STATE_EXIT,
@@ -57,6 +63,7 @@ typedef void (*thread_tls_callback_t)(void* tls_value);
 #define THREAD_FLAG_FREE_STRUCT              (1 << 1)
 #define THREAD_FLAG_REAL_TIME                (1 << 2)
 #define THREAD_FLAG_IDLE                     (1 << 3)
+#define THREAD_FLAG_NO_BOOST                 (1 << 4)
 
 #define THREAD_SIGNAL_KILL                   (1 << 0)
 #define THREAD_SIGNAL_SUSPEND                (1 << 1)
@@ -87,6 +94,12 @@ typedef struct lockdep_state {
 } lockdep_state_t;
 
 typedef struct thread {
+    // Default constructor/destructor declared to be not-inline in order to
+    // avoid circular include dependencies involving thread, wait_queue, and
+    // OwnedWaitQueue.
+    thread();
+    ~thread();
+
     int magic;
     struct list_node thread_list_node;
 
@@ -115,13 +128,25 @@ typedef struct thread {
     int priority_boost;
     int inherited_priority;
 
+#if WITH_FAIR_SCHEDULER
+    // state used by the fair scheduler.
+    // TODO(eieio): Find a way to abstract the O(1) scheduler state so that code
+    // outside of the sched implementation uses a uniform interface to
+    // manipulate priority. This makes it possible to eliminate redundant state
+    // when one scheduler or another is enabled.
+    FairTaskState fair_task_state;
+#endif
+
     // current cpu the thread is either running on or in the ready queue, undefined otherwise
     cpu_num_t curr_cpu;
     cpu_num_t last_cpu;      // last cpu the thread ran on, INVALID_CPU if it's never run
     cpu_mask_t cpu_affinity; // mask of cpus that this thread can run on
 
     // if blocked, a pointer to the wait queue
-    struct wait_queue* blocking_wait_queue;
+    struct wait_queue* blocking_wait_queue TA_GUARDED(thread_lock) = nullptr;
+
+    // a list of the wait queues currently owned by this thread.
+    fbl::DoublyLinkedList<OwnedWaitQueue*> owned_wait_queues TA_GUARDED(thread_lock);
 
     // list of other wait queue heads if we're a head
     struct list_node wait_queue_heads_node;
@@ -131,9 +156,6 @@ typedef struct thread {
 
     // are we allowed to be interrupted on the current thing we're blocked/sleeping on
     bool interruptable;
-
-    // number of mutexes we currently hold
-    int mutexes_held;
 
 #if WITH_LOCK_DEP
     // state for runtime lock validation when in thread context
@@ -230,6 +252,14 @@ typedef struct thread {
 #else
 #define DEFAULT_STACK_SIZE ARCH_DEFAULT_STACK_SIZE
 #endif
+
+// TODO(johngro): Remove this when we have addressed ZX-3683.  Right now, this
+// is used in only one place (x86_bringup_aps in arch/x86/smp.cpp) outside of
+// thread.cpp.
+//
+// Normal users should only ever need to call either thread_create, or
+// thread_create_etc.
+void init_thread_struct(thread_t* t, const char* name);
 
 // functions
 void thread_init_early(void);
@@ -359,6 +389,25 @@ static inline bool thread_is_real_time_or_idle(thread_t* t) {
     return !!(t->flags & (THREAD_FLAG_REAL_TIME | THREAD_FLAG_IDLE));
 }
 
+// A thread may not participate in the scheduler's boost behavior if it is...
+//
+// 1) flagged as real-time
+// 2) flagged as idle
+// 3) flagged as "no boost"
+//
+// Note that flag #3 should *only* ever be used by kernel test code when
+// attempting to test priority inheritance chain propagation.  It is important
+// that these tests maintain rigorous control of the relationship between base
+// priority, inherited priority, and the resulting effective priority.  Allowing
+// the scheduler to introduce the concept of dynamic boost priority into the
+// calculation of effective priority makes writing tests like this more
+// difficult which is why we have an internal flag which can be used for
+// disabling this behavior.
+static inline bool thread_cannot_boost(thread_t* t) {
+    return !!(t->flags & (THREAD_FLAG_REAL_TIME | THREAD_FLAG_IDLE | THREAD_FLAG_NO_BOOST));
+}
+
+
 // the current thread
 #include <arch/current_thread.h>
 thread_t* get_current_thread(void);
@@ -405,7 +454,7 @@ static inline uint32_t thread_resched_disable_count(void) {
 // switch.
 //
 // Note that this does not disallow blocking operations
-// (e.g. mutex_acquire()).  Disabling preemption does not prevent switching
+// (e.g. mutex.Acquire()).  Disabling preemption does not prevent switching
 // away from the current thread if it blocks.
 //
 // A call to thread_preempt_disable() must be matched by a later call to
@@ -523,12 +572,12 @@ __END_CDECLS
 // Example usage:
 //
 //   AutoReschedDisable resched_disable;
-//   AutoLock al(&lock_);
+//   Guard<Mutex> al{&lock_};
 //   // Do some initial computation...
 //   resched_disable.Disable();
 //   // Possibly wake another thread...
 //
-// The AutoReschedDisable must be placed before the AutoLock to ensure that
+// The AutoReschedDisable must be placed before the Guard to ensure that
 // rescheduling is re-enabled only after releasing the mutex.
 class AutoReschedDisable {
 public:

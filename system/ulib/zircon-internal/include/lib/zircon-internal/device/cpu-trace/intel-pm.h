@@ -7,9 +7,8 @@
 
 #pragma once
 
-#include <lib/zircon-internal/device/cpu-trace/cpu-perf.h>
-
-__BEGIN_CDECLS
+#include <lib/zircon-internal/device/cpu-trace/perf-mon.h>
+#include <lib/zircon-internal/device/cpu-trace/common-pm.h>
 
 // MSRs
 
@@ -335,20 +334,10 @@ __BEGIN_CDECLS
 // These structs are used for communication between the device driver
 // and the kernel.
 
+namespace perfmon {
+
 // Properties of perf data collection on this system.
-typedef struct {
-    // The H/W Performance Monitor version.
-    uint16_t pm_version;
-    // The number of fixed events.
-    uint16_t num_fixed_events;
-    // The number of programmable events.
-    uint16_t num_programmable_events;
-    // The number of misc events.
-    uint16_t num_misc_events;
-    // For fixed events that are counters, the width in bits.
-    uint16_t fixed_counter_width;
-    // For programmable events that are counters, the width in bits.
-    uint16_t programmable_counter_width;
+struct X86PmuProperties : public PmuCommonProperties {
     // The PERF_CAPABILITIES MSR.
     uint64_t perf_capabilities;
     // The size of the LBR (Last Branch Record) stack.
@@ -356,15 +345,10 @@ typedef struct {
     // LBR is supported by the chip because the device is not recognized as
     // supporting it.
     uint32_t lbr_stack_size;
-} zx_x86_pmu_properties_t;
-
-// This is for passing buffer specs to the kernel.
-typedef struct {
-    zx_handle_t vmo;
-} zx_x86_pmu_buffer_t;
+};
 
 // PMU configuration.
-typedef struct {
+struct X86PmuConfig {
     // IA32_PERF_GLOBAL_CTRL
     uint64_t global_ctrl;
 
@@ -374,21 +358,21 @@ typedef struct {
     // IA32_DEBUGCTL
     uint64_t debug_ctrl;
 
-    // The id of the timebase counter to use.
+    // The id of the timebase counter to use or |kEventIdNone|.
     // A "timebase counter" is used to trigger collection of data from other
     // events. In other words it sets the sample rate for those events.
     // If zero, then no timebase is in use: Each event must trigger its own
     // data collection. Otherwise the value is the id of the timebase counter
     // to use, which must appear in one of |programmable_ids| or |fixed_ids|.
-    cpuperf_event_id_t timebase_id;
+    PmuEventId timebase_event;
 
     // Ids of each event. These values are written to the trace buffer to
     // identify the event.
     // The used entries begin at index zero and are consecutive (no holes).
-    cpuperf_event_id_t fixed_ids[IPM_MAX_FIXED_COUNTERS];
-    cpuperf_event_id_t programmable_ids[IPM_MAX_PROGRAMMABLE_COUNTERS];
+    PmuEventId fixed_events[IPM_MAX_FIXED_COUNTERS];
+    PmuEventId programmable_events[IPM_MAX_PROGRAMMABLE_COUNTERS];
     // Ids of other h/w events to collect data for.
-    cpuperf_event_id_t misc_ids[IPM_MAX_MISC_EVENTS];
+    PmuEventId misc_events[IPM_MAX_MISC_EVENTS];
 
     // Initial value of each counter.
     // The "misc" counters currently do not support initial values.
@@ -396,28 +380,16 @@ typedef struct {
     uint64_t programmable_initial_value[IPM_MAX_PROGRAMMABLE_COUNTERS];
 
     // Flags for each counter.
+    // The values are |perfmon::kPmuConfigFlag*|.
     uint32_t fixed_flags[IPM_MAX_FIXED_COUNTERS];
     uint32_t programmable_flags[IPM_MAX_PROGRAMMABLE_COUNTERS];
     uint32_t misc_flags[IPM_MAX_MISC_EVENTS];
-// Both of IPM_CONFIG_FLAG_{PC,TIMEBASE} cannot be set.
-#define IPM_CONFIG_FLAG_MASK     0x7
-// Collect aspace+pc values.
-// Cannot be set with IPM_CONFIG_FLAG_TIMEBASE unless the counter is
-// |timebase_id|.
-#define IPM_CONFIG_FLAG_PC       (1u << 0)
-// Collect this event's value when |timebase_id| counter's data is collected.
-// While redundant, it is ok to set this for the |timebase_id| counter.
-#define IPM_CONFIG_FLAG_TIMEBASE (1u << 1)
-// Collect the available set of last branches.
-// Branch data is emitted as CPUPERF_RECORD_LBR records.
-// Cannot be set with IPM_CONFIG_FLAG_TIMEBASE unless the counter is
-// |timebase_id|.
-// This is only available when the underlying system supports it.
-#define IPM_CONFIG_FLAG_LBR      (1u << 2)
 
     // IA32_PERFEVTSEL_*
-    uint64_t programmable_events[IPM_MAX_PROGRAMMABLE_COUNTERS];
-} zx_x86_pmu_config_t;
+    uint64_t programmable_hw_events[IPM_MAX_PROGRAMMABLE_COUNTERS];
+};
+
+} // namespace perfmon
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -469,5 +441,3 @@ typedef struct {
 // The value uses a non-standard encoding.
 // Just print in hex.
 #define IPM_MISC_REG_FLAG_RAW (1u << 1)
-
-__END_CDECLS

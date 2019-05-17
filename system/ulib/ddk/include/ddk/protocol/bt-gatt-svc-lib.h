@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_PROTOCOL_BT_GATT_SVC_LIB_H_
+#define DDK_PROTOCOL_BT_GATT_SVC_LIB_H_
 
 #include <string.h>
 
@@ -10,7 +11,7 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // BT SIG Base UUID for all 16/32 assigned UUID values.
 //
@@ -50,4 +51,6 @@ static inline int bt_gatt_compare_uuid(const bt_gatt_uuid_t* u1,
     return memcmp(u1->bytes, u2->bytes, 16);
 }
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // DDK_PROTOCOL_BT_GATT_SVC_LIB_H_

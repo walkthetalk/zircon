@@ -1,0 +1,96 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+declare_args() {
+  # If $clang_tool_dir is "", then this controls how the Clang toolchain
+  # binaries are found.  If true, then the standard prebuilt is used.
+  # Otherwise the tools are just expected to be found by the shell via `PATH`.
+  use_prebuilt_clang = true
+
+  # Directory where the Clang toolchain binaries ("clang", "llvm-nm", etc.) are
+  # found.  If this is "", then the behavior depends on $use_prebuilt_clang.
+  # This toolchain is expected to support both Fuchsia targets and the host.
+  clang_tool_dir = ""
+}
+
+# This is a string identifying the particular toolchain version in use.  Its
+# only purpose is to be unique enough that it changes when switching to a new
+# toolchain, so that recompilations with the new compiler can be triggered.
+#
+# When using the prebuilt, the CIPD instance ID of the prebuilt is perfect.
+# When not using the prebuilt, there isn't a quick way to extract the compiler
+# version.  But at least changing the setting to a different compiler will
+# change the string.
+clang_version_string = clang_tool_dir
+if (clang_tool_dir == "" && use_prebuilt_clang) {
+  _prebuilt_dir = "$zx/prebuilt/downloads/clang"
+  clang_tool_dir = "$_prebuilt_dir/bin"
+  _prebuilt_cipd_version =
+      read_file("$_prebuilt_dir/.versions/clang.cipd_version", "json")
+  clang_version_string = _prebuilt_cipd_version.instance_id
+}
+
+# TODO(TC-366): Ideally the toolchain itself would emit this info in
+# a readable (JSON) form.
+libcxxabi_dt_needed = [
+  "libc++abi.so.1",
+  "libunwind.so.1",
+]
+libcxx_dt_needed = [ "libc++.so.2" ] + libcxxabi_dt_needed
+
+# Generate a manifest file extracted from the Clang toolchain manifest.
+#
+# This acts like a manifest_file() target in the dependency graph of
+# another manifest_file() target (or a zbi() or zbi_input() target).
+# Its contents are extracted from the manifest file supplied by the
+# Clang toolchain.
+#
+# TODO(TC-366): Ideally the toolchain itself would emit this info in a
+# GN-readable (i.e. JSON) form.  Then this could be a resource() target
+# that extracted the file names at gen time.  Also it could be keyed by
+# things like compiler options (-fsanitize=foo, -stdlib++) to make this
+# more generic and e.g. get rid of libcxx_dt_needed.
+#
+# Parameters
+#
+#   args
+#     Required: Patterns to match (like sh `case`) in the lhs of the manifest.
+#     Type: list(string)
+#
+template("toolchain_manifest") {
+  if (defined(toolchain.shlib) && current_toolchain != toolchain.shlib) {
+    not_needed(invoker, [ "args" ])
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      public_deps = [
+        ":$target_name(${toolchain.shlib})",
+      ]
+    }
+  } else {
+    action(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [
+        # Note: Not ${toolchain.tool_dir} here because this might be GCC.
+        "$clang_tool_dir/../lib/${toolchain.target_tuple}.manifest",
+      ]
+      outputs = [
+        "$target_gen_dir/$target_name.manifest",
+      ]
+      script = "$zx/public/gn/toolchain/toolchain-manifest.sh"
+      args = rebase_path(sources + outputs, root_build_dir) + invoker.args
+      metadata = {
+        # This tells manifest_file() to fold this manifest in.
+        manifest_files = rebase_path(outputs, root_build_dir)
+      }
+    }
+  }
+}

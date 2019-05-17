@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_DRIVER_H_
+#define DDK_DRIVER_H_
 
 #include <zircon/types.h>
 #include <zircon/listnode.h>
 #include <zircon/compiler.h>
 #include <stdint.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 typedef struct zx_device zx_device_t;
 typedef struct zx_driver zx_driver_t;
@@ -79,9 +80,10 @@ typedef struct device_add_args {
     void* ctx;
 
     // Pointer to device's device protocol operations
-    zx_protocol_device_t* ops;
+    const zx_protocol_device_t* ops;
 
-    // Optional list of device properties
+    // Optional list of device properties.  This list cannot contain more than
+    // one property with an id in the range [BIND_TOPO_START, BIND_TOPO_END].
     zx_device_prop_t* props;
 
     // Number of device properties
@@ -140,6 +142,61 @@ zx_status_t device_remove(zx_device_t* device);
 zx_status_t device_rebind(zx_device_t* device);
 void device_make_visible(zx_device_t* device);
 
+// Retrieves a profile handle into |out_profile| from the scheduler for the
+// given |priority| and |name|. Ownership of |out_profile| is given to the
+// caller. See fuchsia.scheduler.ProfileProvider for more detail.
+//
+// The profile handle can be used with zx_object_set_profile() to control thread
+// priority.
+//
+// The current arguments are transitional, and will likely change in the future.
+zx_status_t device_get_profile(zx_device_t* device, uint32_t priority, const char* name,
+                               zx_handle_t* out_profile);
+
+// A description of a part of a device component.  It provides a bind program
+// that will match a device on the path from the root of the device tree to the
+// target device.
+typedef struct device_component_part {
+    uint32_t instruction_count;
+    const zx_bind_inst_t* match_program;
+} device_component_part_t;
+
+// A description of a device that makes up part of a composite device.  The
+// particular device is identified by a sequence of part descriptions.  Each
+// part description must match either the target device or one of its ancestors.
+// The first element in |parts| must describe the root of the device tree.  The
+// last element in |parts| must describe the target device itself.  The
+// remaining elements of |parts| must match devices on the path from the root to
+// the target device, in order.  Some of those devices may be skipped, but every
+// element of |parts| must have a match.  Every device on the path that has a
+// property from the range [BIND_TOPO_START, BIND_TOPO_END] must be matched to
+// an element of |parts|.  This sequences of matches between |parts| and devices
+// must be unique.
+typedef struct device_component {
+    uint32_t parts_count;
+    const device_component_part_t* parts;
+} device_component_t;
+
+// Create a composite device with the properties |props| out of the devices
+// described by |components|.  The composite device will reside in the same
+// devhost as the device that matches |components[coresident_device_index]|,
+// unless |coresident_device_index| is UINT32_MAX, in which case it reside in
+// a new devhost.  Once all of the component devices are found, the composite
+// device will be published with protocol_id ZX_PROTOCOL_COMPOSITE and the
+// given properties.  A driver may then bind to the created device, and
+// access its parents via the protocol operations returned by
+// get_protocol(ZX_PROTOCOL_COMPOSITE).
+//
+// |name| must be no longer than ZX_DEVICE_NAME_MAX, and is used primarily as a
+// diagnostic.
+//
+// |dev| must be the zx_device_t corresponding to the "sys" device (i.e., the
+// Platform Bus Driver's device).
+zx_status_t device_add_composite(
+        zx_device_t* dev, const char* name, const zx_device_prop_t* props, size_t props_count,
+        const device_component_t* components, size_t components_count,
+        uint32_t coresident_device_index);
+
 #define ROUNDUP(a, b)   (((a) + ((b)-1)) & ~((b)-1))
 #define ROUNDDOWN(a, b) ((a) & ~((b)-1))
 #define ALIGN(a, b) ROUNDUP(a, b)
@@ -170,4 +227,6 @@ enum {
 #include <ddk/protodefs.h>
 };
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // DDK_DRIVER_H_

@@ -4,7 +4,7 @@ This document describes how to add tracing to device drivers.
 
 ## Overview
 
-Please read [Fuchsia Tracing System Design](../tracing/design.md)
+Please read [Fuchsia Tracing System Design](../../../docs/development/tracing/design.md)
 for an overview of tracing.
 
 ## Trace Provider
@@ -62,60 +62,48 @@ unrelated data from a different trace provider.
 The event name is included in the trace to describe what the event
 is about. It is typically unique for each event.
 
-Note that currently the default is that no code will be generated
-by the addition of these `TRACE_*()` macros. Akin to <assert.h>'s use of
-`#define NDEBUG` to disable `assert()`s, tracing uses `#define NTRACE` to
-disable tracing. `NTRACE` is currently defined by default unless
-`ENABLE_DRIVER_TRACING=true` is passed to `make`. See below.
+### BUILD.gn additions
 
-### Makefile additions
-
-The following addition to your driver's `rules.mk` file is needed to
+The following addition to your driver's `BUILD.gn` target is needed to
 pick up tracing support:
 
-```make
-ifeq ($(call TOBOOL,$(ENABLE_DRIVER_TRACING)),true)
-MODULE_STATIC_LIBS += system/ulib/trace.driver
-endif
-MODULE_HEADER_DEPS += system/ulib/trace system/ulib/trace-engine
+```gn
+driver("my_driver") {
+  deps = [
+    ...
+    "$zx/system/ulib/trace:headers"
+    "$zx/system/ulib/trace:trace-driver",
+  ]
+}
 ```
 
-## Booting with tracing
+## Building with tracing
 
-To be super conservative, not only does tracing currently require a special
-compile flag to enable it: `ENABLE_DRIVER_TRACING=true`,
-it also requires an extra kernel command line flag to enable it:
-`driver.tracing.enable=1`
-
-`ENABLE_DRIVER_TRACING=true` is now the default. To disable compiling in
-driver tracing support, pass `ENABLE_DRIVER_TRACING=false` to make.
-
-`driver.tracing.enable=1` is also now the default. To disable partipation
-of drivers in Fuchsia tracing, boot the kernel with `driver.tracing.enable=0`.
-
-Example:
-
-First build:
+The following needs to be passed to fx set in order to trace drivers
+that are loaded during boot: `--with-base=//garnet/packages/prod:tracing`.
 
 ```sh
-$ fx set $arch
-$ fx build-zircon
+$ fx set ${PRODUCT}.${BOARD} --with-base=//garnet/packages/prod:tracing
 $ fx build
 ```
 
-Then boot. With QEMU:
+The issue is that without this option then TraceManager won't be present
+when the driver starts and thus the driver won't be able to participate
+in tracing when TraceManager is started later.
 
-```sh
-$ fx run -k -N
-```
+See the documentation for (fx)[../../../docs/development/workflows/fx.md]
+or even just the output of `fx help` and especially `fx help set` for further
+documentation of running `fx` in general and `fx set` specifically.
 
-Or on h/w (augment with options specific to your h/w):
+## Booting with tracing
 
-```sh
-$ fx serve
-```
+To be conservative, tracing uses a kernel command line flag to enable it:
+`driver.tracing.enable=1`.
+`driver.tracing.enable=1` is the default. To disable partipation
+of drivers in Fuchsia tracing, boot the kernel with `driver.tracing.enable=0`.
 
-These extra requirements will be removed once tracing support stabilizes.
+Then boot. See the documentation for your hardware or qemu for instructions
+for booting the device. Tracing doesn't require anything special during boot.
 
 ## Using tracing
 
@@ -126,7 +114,7 @@ These examples use the category from the source additions described above.
 Example:
 
 ```sh
-fuchsia$ trace record --categories=example:example1
+fuchsia$ trace record --categories=example:example1,kernel:sched,kernel:meta
 host$ fx cp --to-host /data/trace.json trace.json
 ```
 
@@ -135,8 +123,16 @@ host and it will copy the files directly to your host and prepare them for
 viewing with the Chrome trace viewer.
 
 ```sh
-host$ fx traceutil record --categories=example:example1
+host$ fx traceutil record \
+  --categories=example:example1,kernel:sched,kernel:meta
 ```
 
-See the [Tracing Usage Guide](https://fuchsia.googlesource.com/garnet/+/master/docs/tracing_usage_guide.md)
+The categories `kernel:sched,kernel:meta` should always be present if you
+want to visualize the results. The visualizer wants to associate trace data
+with threads and processes, and thus it needs the data provided by the kernel
+via these categories.
+
+## Further Reading
+
+See the [Tracing Documentation](../../../docs/development/tracing/README.md)
 for further info.

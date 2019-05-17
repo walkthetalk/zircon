@@ -15,13 +15,14 @@
 #include <fbl/canary.h>
 #include <fbl/mutex.h>
 #include <object/dispatcher.h>
+#include <object/handle.h>
 
 #include <sys/types.h>
 
 class TimerDispatcher final : public SoloDispatcher<TimerDispatcher, ZX_DEFAULT_TIMER_RIGHTS> {
 public:
     static zx_status_t Create(uint32_t options,
-                              fbl::RefPtr<Dispatcher>* dispatcher,
+                              KernelHandle<TimerDispatcher>* handle,
                               zx_rights_t* rights);
 
     ~TimerDispatcher() final;
@@ -40,7 +41,6 @@ private:
     void SetTimerLocked(bool cancel_first) TA_REQ(get_lock());
     bool CancelTimerLocked() TA_REQ(get_lock());
 
-    fbl::Canary<fbl::magic("TIMR")> canary_;
     const slack_mode slack_mode_;
     dpc_t timer_dpc_;
     zx_time_t deadline_ TA_GUARDED(get_lock());

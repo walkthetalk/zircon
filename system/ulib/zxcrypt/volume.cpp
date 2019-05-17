@@ -4,40 +4,23 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
-#include <unistd.h>
 
 #include <crypto/bytes.h>
 #include <crypto/cipher.h>
 #include <crypto/hkdf.h>
 #include <crypto/secret.h>
-#include <ddk/device.h>
-#include <ddk/driver.h>
-#include <ddk/protocol/block.h>
 #include <fbl/algorithm.h>
-#include <fbl/auto_call.h>
-#include <fbl/macros.h>
-#include <fbl/string_buffer.h>
-#include <fbl/unique_fd.h>
-#include <fbl/unique_ptr.h>
-#include <memory>
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
-#include <lib/fdio/debug.h>
-#include <lib/sync/completion.h>
-#include <lib/zx/vmo.h>
+#include <lib/zircon-internal/debug.h>
 #include <zircon/compiler.h>
 #include <zircon/device/block.h>
 #include <zircon/errors.h>
 #include <zircon/status.h>
 #include <zircon/types.h>
 #include <zxcrypt/volume.h>
-
-#include <utility>
 
 #define ZXDEBUG 0
 
@@ -64,9 +47,6 @@ static_assert(Volume::kBufferSize % PAGE_SIZE == 0, "kBufferSize must be page al
 
 namespace {
 
-// The zxcrypt driver
-const char* kDriverLib = "/boot/driver/zxcrypt.so";
-
 // The number of metadata blocks in a reserved metadata slice, each holding a copy of the
 // superblock.
 const size_t kMetadataBlocks = 2;
@@ -79,97 +59,10 @@ const char* kWrapIvLabel = "wrap iv %" PRIu64;
 // Header is type GUID | instance GUID | version.
 const size_t kHeaderLen = sizeof(zxcrypt_magic) + GUID_LEN + sizeof(uint32_t);
 
-void SyncComplete(void* cookie, zx_status_t status, block_op_t* block) {
-    // Use the 32bit command field to shuttle the response back to the callsite that's waiting on
-    // the completion
-    block->command = status;
-    sync_completion_signal(static_cast<sync_completion_t*>(cookie));
-}
-
-// Performs synchronous I/O
-zx_status_t SyncIO(zx_device_t* dev, uint32_t cmd, void* buf, size_t off, size_t len) {
-    zx_status_t rc;
-
-    if (!dev || !buf || len == 0) {
-        xprintf("bad parameter(s): dev=%p, buf=%p, len=%zu\n", dev, buf, len);
-        return ZX_ERR_INVALID_ARGS;
-    }
-
-    block_impl_protocol_t proto;
-    if ((rc = device_get_protocol(dev, ZX_PROTOCOL_BLOCK, &proto)) != ZX_OK) {
-        xprintf("block protocol not support\n");
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    zx::vmo vmo;
-    if ((rc = zx::vmo::create(len, 0, &vmo)) != ZX_OK) {
-        xprintf("zx::vmo::create failed: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-
-    block_info_t info;
-    size_t op_size;
-    block_impl_query(&proto, &info, &op_size);
-
-    size_t bsz = info.block_size;
-    ZX_DEBUG_ASSERT(off / bsz <= UINT32_MAX);
-    ZX_DEBUG_ASSERT(len / bsz <= UINT32_MAX);
-    fbl::AllocChecker ac;
-    std::unique_ptr<char[]> raw;
-    if constexpr (alignof(block_op_t) > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
-        raw = std::unique_ptr<char[]>(
-            new (static_cast<std::align_val_t>(alignof(block_op_t)), &ac) char[op_size]);
-    } else {
-        raw = std::unique_ptr<char[]>(
-            new (&ac) char[op_size]);
-    }
-    if (!ac.check()) {
-        return ZX_ERR_NO_MEMORY;
-    }
-    block_op_t* block = reinterpret_cast<block_op_t*>(raw.get());
-
-    sync_completion_t completion;
-    sync_completion_reset(&completion);
-
-    block->command = cmd;
-    block->rw.vmo = vmo.get();
-    block->rw.length = static_cast<uint32_t>(len / bsz);
-    block->rw.offset_dev = static_cast<uint32_t>(off / bsz);
-    block->rw.offset_vmo = 0;
-
-    if (cmd == BLOCK_OP_WRITE && (rc = vmo.write(buf, 0, len)) != ZX_OK) {
-        xprintf("zx::vmo::write failed: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-
-    block_impl_queue(&proto, block, SyncComplete, &completion);
-    sync_completion_wait(&completion, ZX_TIME_INFINITE);
-
-    rc = block->command;
-    if (rc != ZX_OK) {
-        xprintf("Block I/O failed: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-
-    if (cmd == BLOCK_OP_READ && (rc = vmo.read(buf, 0, len)) != ZX_OK) {
-        xprintf("zx::vmo::read failed: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-
-    return ZX_OK;
-}
-
 } // namespace
 
-Volume::Volume(fbl::unique_fd&& fd) {
+Volume::Volume() {
     Reset();
-    fd_ = std::move(fd);
-    dev_ = nullptr;
-}
-
-Volume::Volume(zx_device_t* dev) {
-    Reset();
-    dev_ = dev;
 }
 
 Volume::~Volume() {}
@@ -192,82 +85,6 @@ void Volume::Reset() {
     digest_ = crypto::digest::kUninitialized;
 }
 
-zx_status_t Volume::Init(fbl::unique_fd fd, fbl::unique_ptr<Volume>* out) {
-    zx_status_t rc;
-
-    if (!fd || !out) {
-        xprintf("bad parameter(s): fd=%d, out=%p\n", fd.get(), out);
-        return ZX_ERR_INVALID_ARGS;
-    }
-
-    fbl::AllocChecker ac;
-    fbl::unique_ptr<Volume> volume(new (&ac) Volume(std::move(fd)));
-    if (!ac.check()) {
-        xprintf("allocation failed: %zu bytes\n", sizeof(Volume));
-        return ZX_ERR_NO_MEMORY;
-    }
-
-    if ((rc = volume->Init()) != ZX_OK) {
-        return rc;
-    }
-
-    *out = std::move(volume);
-    return ZX_OK;
-}
-
-zx_status_t Volume::Create(fbl::unique_fd fd, const crypto::Secret& key,
-                           fbl::unique_ptr<Volume>* out) {
-    zx_status_t rc;
-
-    fbl::unique_ptr<Volume> volume;
-    if ((rc = Volume::Init(std::move(fd), &volume)) != ZX_OK ||
-        (rc = volume->CreateBlock()) != ZX_OK || (rc = volume->SealBlock(key, 0)) != ZX_OK ||
-        (rc = volume->CommitBlock()) != ZX_OK) {
-        return rc;
-    }
-
-    if (out) {
-        *out = std::move(volume);
-    }
-    return ZX_OK;
-}
-
-zx_status_t Volume::Unlock(fbl::unique_fd fd, const crypto::Secret& key, key_slot_t slot,
-                           fbl::unique_ptr<Volume>* out) {
-    zx_status_t rc;
-
-    fbl::unique_ptr<Volume> volume;
-    if ((rc = Volume::Init(std::move(fd), &volume)) != ZX_OK ||
-        (rc = volume->Unlock(key, slot)) != ZX_OK) {
-        return rc;
-    }
-
-    *out = std::move(volume);
-    return ZX_OK;
-}
-
-zx_status_t Volume::Unlock(zx_device_t* dev, const crypto::Secret& key, key_slot_t slot,
-                           fbl::unique_ptr<Volume>* out) {
-    zx_status_t rc;
-
-    if (!dev || !out) {
-        xprintf("bad parameter(s): dev=%p, out=%p\n", dev, out);
-        return ZX_ERR_INVALID_ARGS;
-    }
-    fbl::AllocChecker ac;
-    fbl::unique_ptr<Volume> volume(new (&ac) Volume(dev));
-    if (!ac.check()) {
-        xprintf("allocation failed: %zu bytes\n", sizeof(Volume));
-        return ZX_ERR_NO_MEMORY;
-    }
-    if ((rc = volume->Init()) != ZX_OK || (rc = volume->Unlock(key, slot)) != ZX_OK) {
-        return rc;
-    }
-
-    *out = std::move(volume);
-    return ZX_OK;
-}
-
 zx_status_t Volume::Unlock(const crypto::Secret& key, key_slot_t slot) {
     zx_status_t rc;
 
@@ -284,95 +101,8 @@ zx_status_t Volume::Unlock(const crypto::Secret& key, key_slot_t slot) {
     return ZX_ERR_ACCESS_DENIED;
 }
 
-zx_status_t Volume::Open(const zx::duration& timeout, fbl::unique_fd* out) {
-    zx_status_t rc;
-    ssize_t res;
-
-    // Get the full device path
-    fbl::StringBuffer<PATH_MAX> path;
-    path.Resize(path.capacity());
-    if ((res = ioctl_device_get_topo_path(fd_.get(), path.data(), path.capacity())) < 0) {
-        rc = static_cast<zx_status_t>(res);
-        xprintf("could not find parent device: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-    path.Resize(strlen(path.c_str()));
-    path.Append("/zxcrypt/block");
-
-    // Early return if already bound
-    fbl::unique_fd fd(open(path.c_str(), O_RDWR));
-    if (fd) {
-        out->reset(fd.release());
-        return ZX_OK;
-    }
-
-    // Bind the device
-    if ((res = ioctl_device_bind(fd_.get(), kDriverLib, strlen(kDriverLib))) < 0) {
-        rc = static_cast<zx_status_t>(res);
-        xprintf("could not bind zxcrypt driver: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-    if ((rc = wait_for_device(path.c_str(), timeout.get())) != ZX_OK) {
-        xprintf("zxcrypt driver failed to bind: %s\n", zx_status_get_string(rc));
-        return rc;
-    }
-    fd.reset(open(path.c_str(), O_RDWR));
-    if (!fd) {
-        xprintf("failed to open zxcrypt volume\n");
-        return ZX_ERR_NOT_FOUND;
-    }
-
-    out->reset(fd.release());
-    return ZX_OK;
-}
-
-zx_status_t Volume::Bind(crypto::Cipher::Direction direction, crypto::Cipher* cipher) const {
-    zx_status_t rc;
-    ZX_DEBUG_ASSERT(dev_); // Cannot bind from library
-
-    if (!cipher) {
-        xprintf("bad parameter(s): cipher=%p\n", cipher);
-        return ZX_ERR_INVALID_ARGS;
-    }
-    if (!block_.get()) {
-        xprintf("not initialized\n");
-        return ZX_ERR_BAD_STATE;
-    }
-    if ((rc = cipher->Init(cipher_, direction, data_key_, data_iv_, block_.len())) != ZX_OK) {
-        return rc;
-    }
-
-    return ZX_OK;
-}
-
-zx_status_t Volume::Enroll(const crypto::Secret& key, key_slot_t slot) {
-    zx_status_t rc;
-    ZX_DEBUG_ASSERT(!dev_); // Cannot enroll from driver
-
-    if ((rc = SealBlock(key, slot)) != ZX_OK || (rc = CommitBlock()) != ZX_OK) {
-        return rc;
-    }
-
-    return ZX_OK;
-}
-
-zx_status_t Volume::Revoke(key_slot_t slot) {
-    zx_status_t rc;
-    ZX_DEBUG_ASSERT(!dev_); // Cannot revoke from driver
-
-    zx_off_t off;
-    crypto::Bytes invalid;
-    if ((rc = GetSlotOffset(slot, &off)) != ZX_OK || (rc = invalid.Randomize(slot_len_)) != ZX_OK ||
-        (rc = block_.Copy(invalid, off)) != ZX_OK || (rc = CommitBlock()) != ZX_OK) {
-        return rc;
-    }
-
-    return ZX_OK;
-}
-
 zx_status_t Volume::Shred() {
     zx_status_t rc;
-    ZX_DEBUG_ASSERT(!dev_); // Cannot shred from driver
 
     if (!block_.get()) {
         xprintf("not initialized\n");
@@ -390,8 +120,6 @@ zx_status_t Volume::Shred() {
 
     return ZX_OK;
 }
-
-// Configuration methods
 
 zx_status_t Volume::GetSlotOffset(key_slot_t slot, zx_off_t* out) const {
     if (!block_.get()) {
@@ -416,8 +144,8 @@ zx_status_t Volume::Init() {
     zx_status_t rc;
 
     // Get block info; align our blocks to pages
-    block_info_t blk;
-    if ((rc = Ioctl(IOCTL_BLOCK_GET_INFO, nullptr, 0, &blk, sizeof(blk))) < 0) {
+    BlockInfo blk;
+    if ((rc = GetBlockInfo(&blk)) != ZX_OK) {
         xprintf("failed to get block info: %s\n", zx_status_get_string(rc));
         return rc;
     }
@@ -433,37 +161,35 @@ zx_status_t Volume::Init() {
         return rc;
     }
     // Get FVM info
-    fvm_info_t fvm;
-    switch ((rc = Ioctl(IOCTL_BLOCK_FVM_QUERY, nullptr, 0, &fvm, sizeof(fvm)))) {
+    uint64_t fvm_slice_size;
+    switch ((rc = GetFvmSliceSize(&fvm_slice_size))) {
     case ZX_OK: {
         // This *IS* an FVM partition.
         // Ensure first kReservedSlices + 1 slices are allocated
-        size_t blocks_per_slice = fvm.slice_size / blk.block_size;
+        size_t blocks_per_slice = fvm_slice_size / blk.block_size;
         reserved_blocks_ = fbl::round_up(reserved_blocks_, blocks_per_slice);
         reserved_slices_ = reserved_blocks_ / blocks_per_slice;
         size_t required = reserved_slices_ + 1;
         size_t range = 1;
-        query_request_t request;
-        query_response_t response;
-        extend_request_t extend;
         for (size_t i = 0; i < required; i += range) {
             // Ask about the next contiguous range
-            request.count = 1;
-            request.vslice_start[0] = i + 1;
-            if ((rc = Ioctl(IOCTL_BLOCK_FVM_VSLICE_QUERY, &request, sizeof(request), &response,
-                            sizeof(response))) < 0 ||
-                response.count == 0 || (range = response.vslice_range[0].count) == 0) {
-                xprintf("ioctl_block_fvm_vslice_query failed: %s\n", zx_status_get_string(rc));
+            SliceRegion ranges[MAX_SLICE_REGIONS];
+            uint64_t slice_count;
+            if ((rc = DoBlockFvmVsliceQuery(i + 1, ranges, &slice_count)) != ZX_OK ||
+                slice_count == 0 ||
+                ((range = ranges[0].count) == 0)) {
+                xprintf("FVM Vslice Query failed: %s\n", zx_status_get_string(rc));
                 return rc;
             }
             // If already allocated, continue
-            if (response.vslice_range[0].allocated) {
+            if (ranges[0].allocated) {
                 continue;
             };
             // Otherwise, allocate it
-            extend.offset = i + 1;
-            extend.length = fbl::min(required - i, range);
-            if ((rc = Ioctl(IOCTL_BLOCK_FVM_EXTEND, &extend, sizeof(extend), nullptr, 0)) < 0) {
+            uint64_t extend_start_slice = i + 1;
+            uint64_t extend_length = fbl::min(required - i, range);
+
+            if ((rc = DoBlockFvmExtend(extend_start_slice, extend_length)) != ZX_OK) {
                 xprintf("failed to extend FVM partition: %s\n", zx_status_get_string(rc));
                 return rc;
             }
@@ -472,8 +198,10 @@ zx_status_t Volume::Init() {
     }
     case ZX_ERR_NOT_SUPPORTED:
         // This is *NOT* an FVM partition.
+        xprintf("Not an FVM partition\n");
         break;
     default:
+        xprintf("init failed: %s\n", zx_status_get_string(rc));
         // An error occurred
         return rc;
     }
@@ -519,7 +247,21 @@ zx_status_t Volume::DeriveSlotKeys(const crypto::Secret& key, key_slot_t slot) {
 
     crypto::HKDF hkdf;
     char label[kMaxLabelLen];
-    if ((rc = hkdf.Init(digest_, key, guid_)) != ZX_OK) {
+
+    // We tolerate 128-bit keys here because some hardware we wish to operate on
+    // only has 128-bits of random keys in hardware.  We believe that this
+    // entropy is sufficient for our purposes.
+    size_t key_len = key.len();
+    if (key_len == 16) {
+        rc = hkdf.Init(digest_, key, guid_, crypto::HKDF::ALLOW_WEAK_KEY);
+    } else if (key_len == 32) {
+        rc = hkdf.Init(digest_, key, guid_);
+    } else {
+        xprintf("invalid key length %lu (acceptable values are 16, 32)\n", key_len);
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if (rc != ZX_OK) {
+        xprintf("hkdf.Init failed %s\n", zx_status_get_string(rc));
         return rc;
     }
     snprintf(label, kMaxLabelLen, kWrapKeyLabel, slot);
@@ -633,12 +375,28 @@ zx_status_t Volume::SealBlock(const crypto::Secret& key, key_slot_t slot) {
     zx_off_t off;
     zx_off_t data_key_off = 0;
     zx_off_t data_iv_off = data_key_.len();
-    if ((rc = GetSlotOffset(slot, &off)) != ZX_OK ||
-        (rc = ptext.Copy(data_key_.get(), data_key_.len(), data_key_off)) != ZX_OK ||
-        (rc = ptext.Copy(data_iv_.get(), data_iv_.len(), data_iv_off)) != ZX_OK ||
-        (rc = DeriveSlotKeys(key, slot)) != ZX_OK ||
-        (rc = aead.InitSeal(aead_, wrap_key_, wrap_iv_)) != ZX_OK ||
-        (rc = aead.Seal(ptext, header_, &nonce, &ctext)) != ZX_OK) {
+    if ((rc = GetSlotOffset(slot, &off)) != ZX_OK) {
+        xprintf("GetSlotOffset for slot %" PRIu64 " failed: %s\n", slot, zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = ptext.Copy(data_key_.get(), data_key_.len(), data_key_off)) != ZX_OK) {
+        xprintf("ptext.Copy (key) failed: %s", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = ptext.Copy(data_iv_.get(), data_iv_.len(), data_iv_off)) != ZX_OK) {
+        xprintf("ptext.Copy (iv) failed: %s", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = DeriveSlotKeys(key, slot)) != ZX_OK) {
+        xprintf("DeriveSlotKeys failed: %s", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = aead.InitSeal(aead_, wrap_key_, wrap_iv_)) != ZX_OK) {
+        xprintf("aead.InitSeal failed: %s", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = aead.Seal(ptext, header_, &nonce, &ctext)) != ZX_OK) {
+        xprintf("aead.Seal failed: %s", zx_status_get_string(rc));
         return rc;
     }
     // Check that we'll be able to unseal.
@@ -679,92 +437,56 @@ zx_status_t Volume::UnsealBlock(const crypto::Secret& key, key_slot_t slot) {
     uint8_t* key_buf;
     crypto::AEAD aead;
     crypto::Bytes ctext, ptext;
-    if ((rc = Configure(Version(ntohl(version)))) != ZX_OK ||
-        (rc = GetSlotOffset(slot, &off)) != ZX_OK || (rc = DeriveSlotKeys(key, slot)) != ZX_OK ||
-        (rc = crypto::Cipher::GetKeyLen(cipher_, &key_len)) != ZX_OK ||
-        (rc = crypto::Cipher::GetIVLen(cipher_, &iv_len)) != ZX_OK ||
-        (rc = data_key_.Allocate(key_len, &key_buf)) != ZX_OK ||
-        (rc = ctext.Copy(block_.get() + off, slot_len_)) != ZX_OK ||
-        (rc = aead.InitOpen(aead_, wrap_key_, wrap_iv_)) != ZX_OK ||
-        (rc = header_.Copy(block_.get(), kHeaderLen)) != ZX_OK) {
+    if ((rc = Configure(Version(ntohl(version)))) != ZX_OK) {
+        xprintf("Configure failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = GetSlotOffset(slot, &off)) != ZX_OK) {
+        xprintf("GetSlotOffset failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = DeriveSlotKeys(key, slot)) != ZX_OK) {
+        xprintf("DeriveSlotKeys failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = crypto::Cipher::GetKeyLen(cipher_, &key_len)) != ZX_OK) {
+        xprintf("Cipher::GetKeyLen failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = crypto::Cipher::GetIVLen(cipher_, &iv_len)) != ZX_OK) {
+        xprintf("Cipher::GetIVLen failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = data_key_.Allocate(key_len, &key_buf)) != ZX_OK) {
+        xprintf("Secret::Allocate failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = ctext.Copy(block_.get() + off, slot_len_)) != ZX_OK) {
+        xprintf("ctext.Copy failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = aead.InitOpen(aead_, wrap_key_, wrap_iv_)) != ZX_OK) {
+        xprintf("aead.InitOpen failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = header_.Copy(block_.get(), kHeaderLen)) != ZX_OK) {
+        xprintf("header_.Copy failed: %s\n", zx_status_get_string(rc));
         return rc;
     }
 
     // Extract nonce from IV.
     zx_off_t nonce;
     memcpy(&nonce, wrap_iv_.get(), sizeof(nonce));
-    if ((rc = aead.Open(nonce, ctext, header_, &ptext)) != ZX_OK ||
-        (rc = data_iv_.Copy(ptext.get() + key_len, iv_len)) != ZX_OK) {
+    if ((rc = aead.Open(nonce, ctext, header_, &ptext)) != ZX_OK) {
+        xprintf("aead.Open failed: %s\n", zx_status_get_string(rc));
+        return rc;
+    }
+    if ((rc = data_iv_.Copy(ptext.get() + key_len, iv_len)) != ZX_OK) {
+        xprintf("data_iv_.Copy failed: %s\n", zx_status_get_string(rc));
         return rc;
     }
     memcpy(key_buf, ptext.get(), key_len);
 
-    return ZX_OK;
-}
-
-// Device methods
-
-zx_status_t Volume::Ioctl(int op, const void* in, size_t in_len, void* out, size_t out_len) {
-    // Don't include debug messages here; some errors (e.g. ZX_ERR_NOT_SUPPORTED)
-    // are expected under certain conditions (e.g. calling FVM ioctls on a non-FVM
-    // device).  Handle error reporting at the call sites instead.
-    if (dev_) {
-        size_t actual;
-        return device_ioctl(dev_, op, in, in_len, out, out_len, &actual);
-    }
-
-    ssize_t res;
-    if ((res = fdio_ioctl(fd_.get(), op, in, in_len, out, out_len)) < 0) {
-        return static_cast<zx_status_t>(res);
-    }
-
-    return ZX_OK;
-}
-
-zx_status_t Volume::Read() {
-    if (dev_) {
-        return SyncIO(dev_, BLOCK_OP_READ, block_.get(), offset_, block_.len());
-    }
-
-    if (lseek(fd_.get(), offset_, SEEK_SET) < 0) {
-        xprintf("lseek(%d, %" PRIu64 ", SEEK_SET) failed: %s\n", fd_.get(), offset_,
-                strerror(errno));
-        return ZX_ERR_IO;
-    }
-    ssize_t res;
-    if ((res = read(fd_.get(), block_.get(), block_.len())) < 0) {
-        xprintf("read(%d, %p, %zu) failed: %s\n", fd_.get(), block_.get(), block_.len(),
-                strerror(errno));
-        return ZX_ERR_IO;
-    }
-    if (static_cast<size_t>(res) != block_.len()) {
-        xprintf("short read: have %zd, need %zu\n", res, block_.len());
-        return ZX_ERR_IO;
-    }
-
-    return ZX_OK;
-}
-
-zx_status_t Volume::Write() {
-    if (dev_) {
-        return SyncIO(dev_, BLOCK_OP_WRITE, block_.get(), offset_, block_.len());
-    }
-
-    if (lseek(fd_.get(), offset_, SEEK_SET) < 0) {
-        xprintf("lseek(%d, %" PRIu64 ", SEEK_SET) failed: %s\n", fd_.get(), offset_,
-                strerror(errno));
-        return ZX_ERR_IO;
-    }
-    ssize_t res;
-    if ((res = write(fd_.get(), block_.get(), block_.len())) < 0) {
-        xprintf("write(%d, %p, %zu) failed: %s\n", fd_.get(), block_.get(), block_.len(),
-                strerror(errno));
-        return ZX_ERR_IO;
-    }
-    if (static_cast<size_t>(res) != block_.len()) {
-        xprintf("short write: have %zd, need %zu\n", res, block_.len());
-        return ZX_ERR_IO;
-    }
     return ZX_OK;
 }
 

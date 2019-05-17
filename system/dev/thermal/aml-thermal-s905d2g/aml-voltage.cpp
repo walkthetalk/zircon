@@ -22,7 +22,7 @@ constexpr int kInvalidIndex = -1;
 
 } // namespace
 
-zx_status_t AmlVoltageRegulator::Init(zx_device_t* parent, opp_info_t* opp_info) {
+zx_status_t AmlVoltageRegulator::Init(zx_device_t* parent, aml_opp_info_t* opp_info) {
     ZX_DEBUG_ASSERT(opp_info);
 
     // Create a PWM period = 1250, hwpwm - 1 to signify using PWM_D from PWM_C/D.
@@ -36,12 +36,12 @@ zx_status_t AmlVoltageRegulator::Init(zx_device_t* parent, opp_info_t* opp_info)
     // Initialize the PWM.
     zx_status_t status = pwm_->Init(parent);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "aml-voltage: Could not inititalize PWM: %d\n", status);
+        zxlogf(ERROR, "aml-voltage: Could not initialize PWM: %d\n", status);
         return status;
     }
 
     // Get the voltage-table metadata.
-    memcpy(&opp_info_, opp_info, sizeof(opp_info_t));
+    memcpy(&opp_info_, opp_info, sizeof(aml_opp_info_t));
 
     current_voltage_index_ = kInvalidIndex;
 

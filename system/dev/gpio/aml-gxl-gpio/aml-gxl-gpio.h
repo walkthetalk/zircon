@@ -6,7 +6,7 @@
 
 #include <ddk/protocol/platform/bus.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <ddktl/protocol/gpioimpl.h>
 #include <ddktl/protocol/platform/device.h>
 #include <fbl/array.h>
@@ -73,6 +73,9 @@ public:
     zx_status_t GpioImplGetInterrupt(uint32_t pin, uint32_t flags, zx::interrupt* out_irq);
     zx_status_t GpioImplReleaseInterrupt(uint32_t pin);
     zx_status_t GpioImplSetPolarity(uint32_t pin, uint32_t polarity);
+    zx_status_t GpioImplSetDriveStrength(uint32_t index, uint8_t mA) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 
     void DdkUnbind() { DdkRemove(); }
     void DdkRelease() { delete this; }

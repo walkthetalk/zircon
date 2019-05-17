@@ -11,6 +11,8 @@
 
 #include "test_library.h"
 
+// TODO(FIDL-458): Merge with max_handle_tests.
+
 namespace {
 
 class MaxBytesLibrary : public TestLibrary {
@@ -205,22 +207,26 @@ xunion XUnionWithUnboundedOutOfLineObject {
   string s;
 };
 
-interface SomeInterface {};
-
-struct UsingSomeInterface {
-  SomeInterface value;
+struct StructWithOptionalEmptyXUnion {
+  EmptyXUnion? opt_empty;
 };
 
-struct UsingOptSomeInterface {
-  SomeInterface? value;
+protocol SomeProtocol {};
+
+struct UsingSomeProtocol {
+  SomeProtocol value;
 };
 
-struct UsingRequestSomeInterface {
-  request<SomeInterface> value;
+struct UsingOptSomeProtocol {
+  SomeProtocol? value;
 };
 
-struct UsingOptRequestSomeInterface {
-  request<SomeInterface>? value;
+struct UsingRequestSomeProtocol {
+  request<SomeProtocol> value;
+};
+
+struct UsingOptRequestSomeProtocol {
+  request<SomeProtocol>? value;
 };
 
 )FIDL") {}
@@ -500,55 +506,57 @@ static bool xunions() {
     EXPECT_EQ(unbounded->typeshape.Size(), 24);
     EXPECT_EQ(unbounded->typeshape.MaxOutOfLine(), std::numeric_limits<uint32_t>::max());
 
-    // TODO(apang): More tests here
+    auto opt_empty = test_library.LookupStruct("StructWithOptionalEmptyXUnion");
+    EXPECT_EQ(opt_empty->typeshape.Size(), 24);
+    EXPECT_EQ(opt_empty->typeshape.MaxOutOfLine(), 0);
 
     END_TEST;
 }
 
-bool interfaces_and_request_of_interfaces() {
+bool protocols_and_request_of_protocols() {
     BEGIN_TEST;
 
     MaxBytesLibrary test_library;
     EXPECT_TRUE(test_library.Compile());
 
-    auto using_some_interface = test_library.LookupStruct("UsingSomeInterface");
-    EXPECT_NONNULL(using_some_interface);
-    EXPECT_EQ(using_some_interface->typeshape.Size(), 4);
-    EXPECT_EQ(using_some_interface->typeshape.Alignment(), 4);
-    EXPECT_EQ(using_some_interface->typeshape.MaxOutOfLine(), 0);
+    auto using_some_protocol = test_library.LookupStruct("UsingSomeProtocol");
+    EXPECT_NONNULL(using_some_protocol);
+    EXPECT_EQ(using_some_protocol->typeshape.Size(), 4);
+    EXPECT_EQ(using_some_protocol->typeshape.Alignment(), 4);
+    EXPECT_EQ(using_some_protocol->typeshape.MaxOutOfLine(), 0);
 
-    auto using_opt_some_interface = test_library.LookupStruct("UsingOptSomeInterface");
-    EXPECT_NONNULL(using_opt_some_interface);
-    EXPECT_EQ(using_opt_some_interface->typeshape.Size(), 4);
-    EXPECT_EQ(using_opt_some_interface->typeshape.Alignment(), 4);
-    EXPECT_EQ(using_opt_some_interface->typeshape.MaxOutOfLine(), 0);
+    auto using_opt_some_protocol = test_library.LookupStruct("UsingOptSomeProtocol");
+    EXPECT_NONNULL(using_opt_some_protocol);
+    EXPECT_EQ(using_opt_some_protocol->typeshape.Size(), 4);
+    EXPECT_EQ(using_opt_some_protocol->typeshape.Alignment(), 4);
+    EXPECT_EQ(using_opt_some_protocol->typeshape.MaxOutOfLine(), 0);
 
-    auto using_request_some_interface = test_library.LookupStruct("UsingRequestSomeInterface");
-    EXPECT_NONNULL(using_request_some_interface);
-    EXPECT_EQ(using_request_some_interface->typeshape.Size(), 4);
-    EXPECT_EQ(using_request_some_interface->typeshape.Alignment(), 4);
-    EXPECT_EQ(using_request_some_interface->typeshape.MaxOutOfLine(), 0);
+    auto using_request_some_protocol = test_library.LookupStruct("UsingRequestSomeProtocol");
+    EXPECT_NONNULL(using_request_some_protocol);
+    EXPECT_EQ(using_request_some_protocol->typeshape.Size(), 4);
+    EXPECT_EQ(using_request_some_protocol->typeshape.Alignment(), 4);
+    EXPECT_EQ(using_request_some_protocol->typeshape.MaxOutOfLine(), 0);
 
-    auto using_opt_request_some_interface = test_library.LookupStruct("UsingOptRequestSomeInterface");
-    EXPECT_NONNULL(using_opt_request_some_interface);
-    EXPECT_EQ(using_opt_request_some_interface->typeshape.Size(), 4);
-    EXPECT_EQ(using_opt_request_some_interface->typeshape.Alignment(), 4);
-    EXPECT_EQ(using_opt_request_some_interface->typeshape.MaxOutOfLine(), 0);
+    auto using_opt_request_some_protocol = test_library.LookupStruct("UsingOptRequestSomeProtocol");
+    EXPECT_NONNULL(using_opt_request_some_protocol);
+    EXPECT_EQ(using_opt_request_some_protocol->typeshape.Size(), 4);
+    EXPECT_EQ(using_opt_request_some_protocol->typeshape.Alignment(), 4);
+    EXPECT_EQ(using_opt_request_some_protocol->typeshape.MaxOutOfLine(), 0);
 
     END_TEST;
 }
 
-bool recursive_opt_request() {
+bool recursive_request() {
   BEGIN_TEST;
 
   TestLibrary library(R"FIDL(
 library example;
 
 struct WebMessage {
-  request<MessagePort>? opt_message_port;
+  request<MessagePort> message_port_req;
 };
 
-interface MessagePort {
+protocol MessagePort {
   PostMessage(WebMessage message) -> (bool success);
 };
 )FIDL");
@@ -559,6 +567,8 @@ interface MessagePort {
   EXPECT_EQ(web_message->typeshape.Size(), 4);
   EXPECT_EQ(web_message->typeshape.Alignment(), 4);
   EXPECT_EQ(web_message->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(web_message->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(web_message->typeshape.Depth(), 0);
 
   auto message_port = library.LookupInterface("MessagePort");
   EXPECT_NONNULL(message_port);
@@ -569,22 +579,418 @@ interface MessagePort {
   EXPECT_EQ(post_message_request->typeshape.Size(), 24);
   EXPECT_EQ(post_message_request->typeshape.Alignment(), 8);
   EXPECT_EQ(post_message_request->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(post_message_request->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(post_message_request->typeshape.Depth(), 0);
+
+  END_TEST;
+}
+
+bool recursive_opt_request() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct WebMessage {
+  request<MessagePort>? opt_message_port_req;
+};
+
+protocol MessagePort {
+  PostMessage(WebMessage message) -> (bool success);
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto web_message = library.LookupStruct("WebMessage");
+  EXPECT_NONNULL(web_message);
+  EXPECT_EQ(web_message->typeshape.Size(), 4);
+  EXPECT_EQ(web_message->typeshape.Alignment(), 4);
+  EXPECT_EQ(web_message->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(web_message->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(web_message->typeshape.Depth(), 0);
+
+  auto message_port = library.LookupInterface("MessagePort");
+  EXPECT_NONNULL(message_port);
+  EXPECT_EQ(message_port->methods.size(), 1);
+  auto& post_message = message_port->methods[0];
+  auto post_message_request = post_message.maybe_request;
+  EXPECT_NONNULL(post_message_request);
+  EXPECT_EQ(post_message_request->typeshape.Size(), 24);
+  EXPECT_EQ(post_message_request->typeshape.Alignment(), 8);
+  EXPECT_EQ(post_message_request->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(post_message_request->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(post_message_request->typeshape.Depth(), 0);
+
+  END_TEST;
+}
+
+bool recursive_protocol() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct WebMessage {
+  MessagePort message_port;
+};
+
+protocol MessagePort {
+  PostMessage(WebMessage message) -> (bool success);
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto web_message = library.LookupStruct("WebMessage");
+  EXPECT_NONNULL(web_message);
+  EXPECT_EQ(web_message->typeshape.Size(), 4);
+  EXPECT_EQ(web_message->typeshape.Alignment(), 4);
+  EXPECT_EQ(web_message->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(web_message->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(web_message->typeshape.Depth(), 0);
+
+  auto message_port = library.LookupInterface("MessagePort");
+  EXPECT_NONNULL(message_port);
+  EXPECT_EQ(message_port->methods.size(), 1);
+  auto& post_message = message_port->methods[0];
+  auto post_message_request = post_message.maybe_request;
+  EXPECT_NONNULL(post_message_request);
+  EXPECT_EQ(post_message_request->typeshape.Size(), 24);
+  EXPECT_EQ(post_message_request->typeshape.Alignment(), 8);
+  EXPECT_EQ(post_message_request->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(post_message_request->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(post_message_request->typeshape.Depth(), 0);
+
+  END_TEST;
+}
+
+bool recursive_opt_protocol() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct WebMessage {
+  MessagePort? opt_message_port;
+};
+
+protocol MessagePort {
+  PostMessage(WebMessage message) -> (bool success);
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto web_message = library.LookupStruct("WebMessage");
+  EXPECT_NONNULL(web_message);
+  EXPECT_EQ(web_message->typeshape.Size(), 4);
+  EXPECT_EQ(web_message->typeshape.Alignment(), 4);
+  EXPECT_EQ(web_message->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(web_message->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(web_message->typeshape.Depth(), 0);
+
+  auto message_port = library.LookupInterface("MessagePort");
+  EXPECT_NONNULL(message_port);
+  EXPECT_EQ(message_port->methods.size(), 1);
+  auto& post_message = message_port->methods[0];
+  auto post_message_request = post_message.maybe_request;
+  EXPECT_NONNULL(post_message_request);
+  EXPECT_EQ(post_message_request->typeshape.Size(), 24);
+  EXPECT_EQ(post_message_request->typeshape.Alignment(), 8);
+  EXPECT_EQ(post_message_request->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(post_message_request->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(post_message_request->typeshape.Depth(), 0);
+
+  END_TEST;
+}
+
+bool recursive_struct() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct TheStruct {
+  TheStruct? opt_one_more;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto the_struct = library.LookupStruct("TheStruct");
+  EXPECT_NONNULL(the_struct);
+  EXPECT_EQ(the_struct->typeshape.Size(), 8);
+  EXPECT_EQ(the_struct->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(the_struct->typeshape.MaxOutOfLine(), 0);
+  // TODO(FIDL-457): Incorrectly saturating, there are no handles here.
+  EXPECT_EQ(the_struct->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(the_struct->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  END_TEST;
+}
+
+bool recursive_struct_with_handles() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct TheStruct {
+  handle<vmo> some_handle;
+  TheStruct? opt_one_more;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto the_struct = library.LookupStruct("TheStruct");
+  EXPECT_NONNULL(the_struct);
+  EXPECT_EQ(the_struct->typeshape.Size(), 16);
+  EXPECT_EQ(the_struct->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(the_struct->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(the_struct->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(the_struct->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  END_TEST;
+}
+
+bool co_recursive_struct() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct A {
+    B? foo;
+};
+
+struct B {
+    A? bar;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto struct_a = library.LookupStruct("A");
+  EXPECT_NONNULL(struct_a);
+  EXPECT_EQ(struct_a->typeshape.Size(), 8);
+  EXPECT_EQ(struct_a->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_a->typeshape.MaxOutOfLine(), 16);
+  // TODO(FIDL-457): Incorrectly saturating, there are no handles here.
+  EXPECT_EQ(struct_a->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_a->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  auto struct_b = library.LookupStruct("B");
+  EXPECT_NONNULL(struct_b);
+  EXPECT_EQ(struct_b->typeshape.Size(), 8);
+  EXPECT_EQ(struct_b->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_b->typeshape.MaxOutOfLine(), 8);
+  // TODO(FIDL-457): Incorrectly saturating, there are no handles here.
+  EXPECT_EQ(struct_b->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_b->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  END_TEST;
+}
+
+bool co_recursive_struct_with_handles() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct A {
+    handle a;
+    B? foo;
+};
+
+struct B {
+    handle b;
+    A? bar;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto struct_a = library.LookupStruct("A");
+  EXPECT_NONNULL(struct_a);
+  EXPECT_EQ(struct_a->typeshape.Size(), 16);
+  EXPECT_EQ(struct_a->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_a->typeshape.MaxOutOfLine(), 32);
+  EXPECT_EQ(struct_a->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_a->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  auto struct_b = library.LookupStruct("B");
+  EXPECT_NONNULL(struct_b);
+  EXPECT_EQ(struct_b->typeshape.Size(), 16);
+  EXPECT_EQ(struct_b->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_b->typeshape.MaxOutOfLine(), 16);
+  EXPECT_EQ(struct_b->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_b->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  END_TEST;
+}
+
+bool co_recursive_struct2() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct Foo {
+    Bar b;
+};
+
+struct Bar {
+    Foo? f;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto struct_foo = library.LookupStruct("Foo");
+  EXPECT_NONNULL(struct_foo);
+  EXPECT_EQ(struct_foo->typeshape.Size(), 8);
+  EXPECT_EQ(struct_foo->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_foo->typeshape.MaxOutOfLine(), 0);
+  // TODO(FIDL-457): Incorrectly saturating, there are no handles here.
+  EXPECT_EQ(struct_foo->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_foo->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  auto struct_bar = library.LookupStruct("Bar");
+  EXPECT_NONNULL(struct_bar);
+  EXPECT_EQ(struct_bar->typeshape.Size(), 8);
+  EXPECT_EQ(struct_bar->typeshape.Alignment(), 8);
+  // TODO(FIDL-457): Imprecision here, max out-ofline should be infinite.
+  EXPECT_EQ(struct_bar->typeshape.MaxOutOfLine(), 0);
+  // TODO(FIDL-457): Incorrectly saturating, there are no handles here.
+  EXPECT_EQ(struct_bar->typeshape.MaxHandles(), std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(struct_bar->typeshape.Depth(), std::numeric_limits<uint32_t>::max());
+
+  END_TEST;
+}
+
+bool struct_two_deep() {
+  BEGIN_TEST;
+
+  TestLibrary library(R"FIDL(
+library example;
+
+struct DiffEntry {
+    vector<uint8>:256 key;
+
+    Value? base;
+    Value? left;
+    Value? right;
+};
+
+struct Value {
+    Buffer? value;
+    Priority priority;
+};
+
+struct Buffer {
+    handle<vmo> vmo;
+    uint64 size;
+};
+
+enum Priority {
+    EAGER = 0;
+    LAZY = 1;
+};
+)FIDL");
+  ASSERT_TRUE(library.Compile());
+
+  auto buffer = library.LookupStruct("Buffer");
+  EXPECT_NONNULL(buffer);
+  EXPECT_EQ(buffer->typeshape.Size(), 16);
+  EXPECT_EQ(buffer->typeshape.Alignment(), 8);
+  EXPECT_EQ(buffer->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(buffer->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(buffer->typeshape.Depth(), 0);
+
+  auto value = library.LookupStruct("Value");
+  EXPECT_NONNULL(value);
+  EXPECT_EQ(value->typeshape.Size(), 16);
+  EXPECT_EQ(value->typeshape.Alignment(), 8);
+  EXPECT_EQ(value->typeshape.MaxOutOfLine(), 16);
+  EXPECT_EQ(buffer->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(value->typeshape.Depth(), 1);
+
+  auto diff_entry = library.LookupStruct("DiffEntry");
+  EXPECT_NONNULL(diff_entry);
+  EXPECT_EQ(diff_entry->typeshape.Size(), 40);
+  EXPECT_EQ(diff_entry->typeshape.Alignment(), 8);
+  EXPECT_EQ(diff_entry->typeshape.MaxOutOfLine(), 352);
+  // TODO(FIDL-457): max 3 handles, since each Value has one.
+  EXPECT_EQ(buffer->typeshape.MaxHandles(), 1);
+  EXPECT_EQ(diff_entry->typeshape.Depth(), 2);
+
+  END_TEST;
+}
+
+bool protocol_child_and_parent() {
+  BEGIN_TEST;
+
+  SharedAmongstLibraries shared;
+  TestLibrary parent_library("parent.fidl", R"FIDL(
+library parent;
+
+[FragileBase]
+protocol Parent {
+  Sync() -> ();
+};
+)FIDL", &shared);
+  ASSERT_TRUE(parent_library.Compile());
+
+  TestLibrary child_library("child.fidl", R"FIDL(
+library child;
+
+using parent;
+
+protocol Child {
+  compose parent.Parent;
+};
+)FIDL", &shared);
+  ASSERT_TRUE(child_library.AddDependentLibrary(std::move(parent_library)));
+  ASSERT_TRUE(child_library.Compile());
+
+  auto child = child_library.LookupInterface("Child");
+  EXPECT_NONNULL(child);
+  EXPECT_EQ(child->all_methods.size(), 1);
+  auto& sync = child->all_methods[0];
+  auto sync_request = sync->maybe_request;
+  EXPECT_NONNULL(sync_request);
+  EXPECT_EQ(sync_request->typeshape.Size(), 16);
+  EXPECT_EQ(sync_request->typeshape.Alignment(), 8);
+  EXPECT_EQ(sync_request->typeshape.MaxOutOfLine(), 0);
+  EXPECT_EQ(sync_request->typeshape.MaxHandles(), 0);
+  EXPECT_EQ(sync_request->typeshape.Depth(), 0);
 
   END_TEST;
 }
 
 } // namespace
 
-BEGIN_TEST_CASE(max_bytes_tests);
-RUN_TEST(simple_structs);
-RUN_TEST(simple_tables);
-RUN_TEST(optional_structs);
-RUN_TEST(optional_tables);
-RUN_TEST(unions);
-RUN_TEST(vectors);
-RUN_TEST(strings);
-RUN_TEST(arrays);
-RUN_TEST(xunions);
-RUN_TEST(interfaces_and_request_of_interfaces);
-RUN_TEST(recursive_opt_request);
-END_TEST_CASE(max_bytes_tests);
+BEGIN_TEST_CASE(max_bytes_tests)
+RUN_TEST(simple_structs)
+RUN_TEST(simple_tables)
+RUN_TEST(optional_structs)
+RUN_TEST(optional_tables)
+RUN_TEST(unions)
+RUN_TEST(vectors)
+RUN_TEST(strings)
+RUN_TEST(arrays)
+RUN_TEST(xunions)
+RUN_TEST(protocols_and_request_of_protocols)
+RUN_TEST(recursive_request)
+RUN_TEST(recursive_opt_request)
+RUN_TEST(recursive_protocol)
+RUN_TEST(recursive_opt_protocol)
+RUN_TEST(recursive_struct)
+RUN_TEST(recursive_struct_with_handles)
+RUN_TEST(co_recursive_struct)
+RUN_TEST(co_recursive_struct_with_handles)
+RUN_TEST(co_recursive_struct2)
+RUN_TEST(struct_two_deep)
+RUN_TEST(protocol_child_and_parent)
+END_TEST_CASE(max_bytes_tests)

@@ -59,10 +59,10 @@ bool basics() {
                 // Pretend that squaring numbers is hard and takes time
                 // to finish...
                 return utils::sleep_for_a_little_while()
-                    .then([i](fit::result<>) {
+                    .then([i](const fit::result<>&) {
                         return fit::ok(i * i);
                     });
-            }).then([](fit::result<int> square) -> fit::result<int, const char*> {
+            }).then([](const fit::result<int>& square) -> fit::result<int, const char*> {
                 if (square.value() % 2 == 0)
                     return fit::ok(square.value() / 2);
                 return fit::error("square is odd");
@@ -399,7 +399,137 @@ bool make_promise_with_continuation() {
     END_TEST;
 }
 
-auto make_ok_promise(int value) {
+bool make_result_promise() {
+    BEGIN_TEST;
+
+    fake_context fake_context;
+
+    // Argument type: fit::result<int, char>
+    {
+        auto p = fit::make_result_promise(fit::result<int, char>(fit::ok(42)));
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<int, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::ok, result.state());
+        EXPECT_EQ(42, result.value());
+    }
+
+    // Argument type: fit::ok_result<int> with inferred types
+    {
+        auto p = fit::make_result_promise(fit::ok(42));
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
+        fit::result<int, void> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::ok, result.state());
+        EXPECT_EQ(42, result.value());
+    }
+
+    // Argument type: fit::ok_result<int> with explicit types
+    {
+        auto p = fit::make_result_promise<int, char>(fit::ok(42));
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<int, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::ok, result.state());
+        EXPECT_EQ(42, result.value());
+    }
+
+    // Argument type: fit::error_result<char> with inferred types
+    {
+        auto p = fit::make_result_promise(fit::error('x'));
+        static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<void, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::error, result.state());
+        EXPECT_EQ('x', result.error());
+    }
+
+    // Argument type: fit::error_result<char> with explicit types
+    {
+        auto p = fit::make_result_promise<int, char>(fit::error('x'));
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<int, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::error, result.state());
+        EXPECT_EQ('x', result.error());
+    }
+
+    // Argument type: fit::pending_result with inferred types
+    {
+        auto p = fit::make_result_promise(fit::pending());
+        static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
+        fit::result<void, void> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::pending, result.state());
+    }
+
+    // Argument type: fit::pending_result with explicit types
+    {
+        auto p = fit::make_result_promise<int, char>(fit::pending());
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<int, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::pending, result.state());
+    }
+
+    END_TEST;
+}
+
+bool make_ok_promise() {
+    BEGIN_TEST;
+
+    fake_context fake_context;
+
+    // Argument type: int
+    {
+        auto p = fit::make_ok_promise(42);
+        static_assert(std::is_same<int, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
+        fit::result<int, void> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::ok, result.state());
+        EXPECT_EQ(42, result.value());
+    }
+
+    // Argument type: none (void)
+    {
+        auto p = fit::make_ok_promise();
+        static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
+        fit::result<void, void> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::ok, result.state());
+    }
+
+    END_TEST;
+}
+
+bool make_error_promise() {
+    BEGIN_TEST;
+
+    fake_context fake_context;
+
+    // Argument type: int
+    {
+        auto p = fit::make_error_promise('x');
+        static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<char, decltype(p)::error_type>::value, "");
+        fit::result<void, char> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::error, result.state());
+        EXPECT_EQ('x', result.error());
+    }
+
+    // Argument type: none (void)
+    {
+        auto p = fit::make_error_promise();
+        static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
+        static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
+        fit::result<void, void> result = p(fake_context);
+        EXPECT_EQ(fit::result_state::error, result.state());
+    }
+
+    END_TEST;
+}
+
+auto make_checked_ok_promise(int value) {
     return fit::make_promise([value, count = 0]() mutable -> fit::result<int, char> {
         ASSERT_CRITICAL(count == 0);
         ++count;
@@ -407,7 +537,16 @@ auto make_ok_promise(int value) {
     });
 }
 
-auto make_error_promise(char error) {
+auto make_move_only_promise(int value) {
+    return fit::make_promise([value, count = 0]() mutable
+                             -> fit::result<std::unique_ptr<int>, char> {
+        ASSERT_CRITICAL(count == 0);
+        ++count;
+        return fit::ok(std::make_unique<int>(value));
+    });
+}
+
+auto make_checked_error_promise(char error) {
     return fit::make_promise([error, count = 0]() mutable -> fit::result<int, char> {
         ASSERT_CRITICAL(count == 0);
         ++count;
@@ -442,12 +581,12 @@ bool then_combinator() {
     fake_context fake_context;
 
     // Chaining on OK.
-    // Handler signature: fit::result<>(fit::result<int, char>).
+    // Handler signature: fit::result<>(const fit::result<int, char>&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_ok_promise(42)
-                .then([&](fit::result<int, char> result) -> fit::result<> {
+                .then([&](const fit::result<int, char>& result) -> fit::result<> {
                     ASSERT_CRITICAL(result.value() == 42);
                     if (++run_count == 2)
                         return fit::ok();
@@ -471,12 +610,12 @@ bool then_combinator() {
     }
 
     // Chaining on ERROR.
-    // Handler signature: fit::result<>(fit::result<int, char>).
+    // Handler signature: fit::result<>(const fit::result<int, char>&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_error_promise('x')
-                .then([&](fit::result<int, char> result) -> fit::result<> {
+                .then([&](const fit::result<int, char>& result) -> fit::result<> {
                     ASSERT_CRITICAL(result.error() == 'x');
                     if (++run_count == 2)
                         return fit::ok();
@@ -503,12 +642,7 @@ bool then_combinator() {
     {
         uint64_t run_count = 0;
         auto p =
-            make_ok_promise(42)
-                .then([&](fit::result<int, char> result)
-                          -> fit::result<int, char> {
-                    run_count++;
-                    return fit::ok(result.value() + 1);
-                })
+            make_checked_ok_promise(42)
                 .then([&](fit::result<int, char>& result)
                           -> fit::result<int, char> {
                     run_count++;
@@ -516,12 +650,6 @@ bool then_combinator() {
                 })
                 .then([&](const fit::result<int, char>& result)
                           -> fit::result<int, char> {
-                    run_count++;
-                    return fit::ok(result.value() + 1);
-                })
-                .then([&](fit::context& context, fit::result<int, char> result)
-                          -> fit::result<int, char> {
-                    ASSERT_CRITICAL(&context == &fake_context);
                     run_count++;
                     return fit::ok(result.value() + 1);
                 })
@@ -540,9 +668,9 @@ bool then_combinator() {
 
         fit::result<int, char> result = p(fake_context);
         EXPECT_FALSE(p);
-        EXPECT_EQ(6, run_count);
+        EXPECT_EQ(4, run_count);
         EXPECT_EQ(fit::result_state::ok, result.state());
-        EXPECT_EQ(48, result.value());
+        EXPECT_EQ(46, result.value());
     }
 
     END_TEST;
@@ -554,12 +682,12 @@ bool and_then_combinator() {
     fake_context fake_context;
 
     // Chaining on OK.
-    // Handler signature: fit::result<>(int).
+    // Handler signature: fit::result<>(const int&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_ok_promise(42)
-                .and_then([&](int value) -> fit::result<void, char> {
+                .and_then([&](const int& value) -> fit::result<void, char> {
                     ASSERT_CRITICAL(value == 42);
                     if (++run_count == 2)
                         return fit::error('y');
@@ -584,12 +712,12 @@ bool and_then_combinator() {
     }
 
     // Chaining on ERROR.
-    // Handler signature: fit::result<>(int).
+    // Handler signature: fit::result<>(const int&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_error_promise('x')
-                .and_then([&](int value) -> fit::result<void, char> {
+                .and_then([&](const int& value) -> fit::result<void, char> {
                     run_count++;
                     return fit::pending();
                 });
@@ -610,12 +738,7 @@ bool and_then_combinator() {
     {
         uint64_t run_count = 0;
         auto p =
-            make_ok_promise(42)
-                .and_then([&](int value)
-                              -> fit::result<int, char> {
-                    run_count++;
-                    return fit::ok(value + 1);
-                })
+            make_checked_ok_promise(42)
                 .and_then([&](int& value)
                               -> fit::result<int, char> {
                     run_count++;
@@ -623,12 +746,6 @@ bool and_then_combinator() {
                 })
                 .and_then([&](const int& value)
                               -> fit::result<int, char> {
-                    run_count++;
-                    return fit::ok(value + 1);
-                })
-                .and_then([&](fit::context& context, int value)
-                              -> fit::result<int, char> {
-                    ASSERT_CRITICAL(&context == &fake_context);
                     run_count++;
                     return fit::ok(value + 1);
                 })
@@ -646,9 +763,9 @@ bool and_then_combinator() {
                 });
 
         fit::result<int, char> result = p(fake_context);
-        EXPECT_EQ(6, run_count);
+        EXPECT_EQ(4, run_count);
         EXPECT_EQ(fit::result_state::ok, result.state());
-        EXPECT_EQ(48, result.value());
+        EXPECT_EQ(46, result.value());
         EXPECT_FALSE(p);
     }
 
@@ -661,12 +778,12 @@ bool or_else_combinator() {
     fake_context fake_context;
 
     // Chaining on OK.
-    // Handler signature: fit::result<>(char).
+    // Handler signature: fit::result<>(const char&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_ok_promise(42)
-                .or_else([&](char error) -> fit::result<int> {
+                .or_else([&](const char& error) -> fit::result<int> {
                     run_count++;
                     return fit::pending();
                 });
@@ -684,12 +801,12 @@ bool or_else_combinator() {
     }
 
     // Chaining on ERROR.
-    // Handler signature: fit::result<>(char).
+    // Handler signature: fit::result<>(const char&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_error_promise('x')
-                .or_else([&](char error) -> fit::result<int> {
+                .or_else([&](const char& error) -> fit::result<int> {
                     ASSERT_CRITICAL(error == 'x');
                     if (++run_count == 2)
                         return fit::ok(43);
@@ -717,45 +834,34 @@ bool or_else_combinator() {
     {
         uint64_t run_count = 0;
         auto p =
-            make_error_promise('a')
-                .or_else([&](char error)
-                             -> fit::result<int, char> {
-                    run_count++;
-                    return fit::error(error + 1);
-                })
+            make_checked_error_promise('a')
                 .or_else([&](char& error)
                              -> fit::result<int, char> {
                     run_count++;
-                    return fit::error(error + 1);
+                    return fit::error(static_cast<char>(error + 1));
                 })
                 .or_else([&](const char& error)
                              -> fit::result<int, char> {
                     run_count++;
-                    return fit::error(error + 1);
-                })
-                .or_else([&](fit::context& context, char error)
-                             -> fit::result<int, char> {
-                    ASSERT_CRITICAL(&context == &fake_context);
-                    run_count++;
-                    return fit::error(error + 1);
+                    return fit::error(static_cast<char>(error + 1));
                 })
                 .or_else([&](fit::context& context, char& error)
                              -> fit::result<int, char> {
                     ASSERT_CRITICAL(&context == &fake_context);
                     run_count++;
-                    return fit::error(error + 1);
+                    return fit::error(static_cast<char>(error + 1));
                 })
                 .or_else([&](fit::context& context, const char& error)
                              -> fit::result<int, char> {
                     ASSERT_CRITICAL(&context == &fake_context);
                     run_count++;
-                    return fit::error(error + 1);
+                    return fit::error(static_cast<char>(error + 1));
                 });
 
         fit::result<int, char> result = p(fake_context);
-        EXPECT_EQ(6, run_count);
+        EXPECT_EQ(4, run_count);
         EXPECT_EQ(fit::result_state::error, result.state());
-        EXPECT_EQ('g', result.error());
+        EXPECT_EQ('e', result.error());
         EXPECT_FALSE(p);
     }
 
@@ -768,12 +874,12 @@ bool inspect_combinator() {
     fake_context fake_context;
 
     // Chaining on OK.
-    // Handler signature: void(fit::result<int, char>).
+    // Handler signature: void(const fit::result<int, char>&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_ok_promise(42)
-                .inspect([&](fit::result<int, char> result) {
+                .inspect([&](const fit::result<int, char>& result) {
                     ASSERT_CRITICAL(result.value() == 42);
                     run_count++;
                 });
@@ -791,12 +897,12 @@ bool inspect_combinator() {
     }
 
     // Chaining on ERROR.
-    // Handler signature: void(fit::result<int, char>).
+    // Handler signature: void(const fit::result<int, char>&).
     {
         uint64_t run_count = 0;
         auto p =
             make_delayed_error_promise('x')
-                .inspect([&](fit::result<int, char> result) {
+                .inspect([&](const fit::result<int, char>& result) {
                     ASSERT_CRITICAL(result.error() == 'x');
                     run_count++;
                 });
@@ -817,11 +923,7 @@ bool inspect_combinator() {
     {
         uint64_t run_count = 0;
         auto p =
-            make_ok_promise(42)
-                .inspect([&](fit::result<int, char> result) {
-                    ASSERT_CRITICAL(result.value() == 42);
-                    run_count++;
-                })
+            make_checked_ok_promise(42)
                 .inspect([&](fit::result<int, char>& result) {
                     ASSERT_CRITICAL(result.value() == 42);
                     run_count++;
@@ -829,11 +931,6 @@ bool inspect_combinator() {
                 })
                 .inspect([&](const fit::result<int, char>& result) {
                     ASSERT_CRITICAL(result.value() == 43);
-                    run_count++;
-                })
-                .inspect([&](fit::context& context, fit::result<int, char> result) {
-                    ASSERT_CRITICAL(result.value() == 43);
-                    ASSERT_CRITICAL(&context == &fake_context);
                     run_count++;
                 })
                 .inspect([&](fit::context& context, fit::result<int, char>& result) {
@@ -850,7 +947,7 @@ bool inspect_combinator() {
 
         fit::result<int, char> result = p(fake_context);
         EXPECT_FALSE(p);
-        EXPECT_EQ(6, run_count);
+        EXPECT_EQ(4, run_count);
         EXPECT_EQ(fit::result_state::ok, result.state());
         EXPECT_EQ(44, result.value());
     }
@@ -906,7 +1003,7 @@ bool wrap_with_combinator() {
     // Apply a wrapper which steals a promise's result th
     auto p = make_delayed_ok_promise(42)
                  .wrap_with(wrapper)
-                 .then([&](fit::result<>) { successor_run_count++; });
+                 .then([&](const fit::result<>&) { successor_run_count++; });
     static_assert(std::is_same<void, decltype(p)::value_type>::value, "");
     static_assert(std::is_same<void, decltype(p)::error_type>::value, "");
 
@@ -955,8 +1052,8 @@ bool join_combinator() {
     fake_context fake_context;
 
     auto p = fit::join_promises(
-        make_ok_promise(42),
-        make_error_promise('x').or_else([](char error) {
+        make_checked_ok_promise(42),
+        make_checked_error_promise('x').or_else([](const char& error) {
             return fit::error('y');
         }),
         make_delayed_ok_promise(55));
@@ -980,14 +1077,42 @@ bool join_combinator() {
     END_TEST;
 }
 
+bool join_combinator_move_only_result() {
+    BEGIN_TEST;
+
+    fake_context fake_context;
+
+    // Add 1 + 2 to get 3, using a join combinator with a "then" continuation
+    // to demonstrate how to optionally return an error.
+    auto p = fit::join_promises(make_move_only_promise(1), make_move_only_promise(2))
+        .then([] (fit::result<std::tuple<fit::result<std::unique_ptr<int>, char>,
+                                         fit::result<std::unique_ptr<int>, char>>>& wrapped_result)
+                  -> fit::result<std::unique_ptr<int>, char> {
+            auto results = wrapped_result.take_value();
+            if (std::get<0>(results).is_error() || std::get<1>(results).is_error()) {
+                return fit::error('e');
+            } else {
+                int value = *std::get<0>(results).value() + *std::get<1>(results).value();
+                return fit::ok(std::make_unique<int>(value));
+            }
+        });
+    EXPECT_TRUE(p);
+    fit::result<std::unique_ptr<int>, char> result = p(fake_context);
+    EXPECT_FALSE(p);
+    EXPECT_EQ(fit::result_state::ok, result.state());
+    EXPECT_EQ(3, *result.value());
+
+    END_TEST;
+}
+
 bool join_vector_combinator() {
     BEGIN_TEST;
 
     fake_context fake_context;
 
     std::vector<fit::promise<int, char>> promises;
-    promises.push_back(make_ok_promise(42));
-    promises.push_back(make_error_promise('x').or_else([](char error) {
+    promises.push_back(make_checked_ok_promise(42));
+    promises.push_back(make_checked_error_promise('x').or_else([](const char& error) {
         return fit::error('y');
     }));
     promises.push_back(make_delayed_ok_promise(55));
@@ -1218,56 +1343,35 @@ void diagnose_handler_with_too_few_arguments() {
 void diagnose_handler_with_too_many_arguments() {
     // Expected between 1 and 2 arguments, got 3.
     fit::make_promise([] {})
-        .then([](fit::context&, fit::result<>, int excess) {});
+        .then([](fit::context&, const fit::result<>&, int excess) {});
 }
 #endif
 #if 0
 void diagnose_handler_with_invalid_context_arg() {
     // When there are two argument, the first must be fit::context&.
     fit::make_promise([] {})
-        .then([](fit::result<>, int excess) {});
+        .then([](const fit::result<>&, int excess) {});
 }
 #endif
 #if 0
 void diagnose_handler_with_invalid_result_arg() {
     // The result type must match that produced by the prior.
     fit::make_promise([] {})
-        .then([](fit::result<int>& result) {});
-}
-#endif
-#if 0
-void diagnose_handler_with_invalid_move_only_result_arg() {
-    // Move-only types must be passed by reference not by value.
-    fit::make_promise([] { return fit::ok(move_only{}); })
-        .then([](fit::result<move_only> result) {});
+        .then([](const fit::result<int>& result) {});
 }
 #endif
 #if 0
 void diagnose_handler_with_invalid_value_arg() {
     // The value type must match that produced by the prior.
     fit::make_promise([] { return fit::ok(3.2f); })
-        .and_then([](int value) {});
-}
-#endif
-#if 0
-void diagnose_handler_with_invalid_move_only_value_arg() {
-    // The value type must match that produced by the prior.
-    fit::make_promise([] { return fit::ok(move_only{}); })
-        .and_then([](move_only value) {});
+        .and_then([](const int& value) {});
 }
 #endif
 #if 0
 void diagnose_handler_with_invalid_error_arg() {
     // The error type must match that produced by the prior.
     fit::make_promise([] { return fit::error(3.2f); })
-        .or_else([](int error) {});
-}
-#endif
-#if 0
-void diagnose_handler_with_invalid_move_only_error_arg() {
-    // The error type must match that produced by the prior.
-    fit::make_promise([] { return fit::error(move_only{}); })
-        .or_else([](move_only error) {});
+        .or_else([](const int& error) {});
 }
 #endif
 
@@ -1280,6 +1384,9 @@ RUN_TEST(assignment_and_swap)
 RUN_TEST(comparison_with_nullptr)
 RUN_TEST(make_promise)
 RUN_TEST(make_promise_with_continuation)
+RUN_TEST(make_result_promise)
+RUN_TEST(make_ok_promise)
+RUN_TEST(make_error_promise)
 RUN_TEST(then_combinator)
 RUN_TEST(and_then_combinator)
 RUN_TEST(or_else_combinator)
@@ -1288,6 +1395,7 @@ RUN_TEST(discard_result_combinator)
 RUN_TEST(wrap_with_combinator)
 RUN_TEST(box_combinator)
 RUN_TEST(join_combinator)
+RUN_TEST(join_combinator_move_only_result)
 RUN_TEST(join_vector_combinator)
 
 // suppress -Wunneeded-internal-declaration

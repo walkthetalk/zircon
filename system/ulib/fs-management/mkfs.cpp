@@ -12,11 +12,15 @@
 
 #include <fbl/algorithm.h>
 #include <fbl/string_buffer.h>
+#include <fbl/unique_fd.h>
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
 #include <lib/fdio/limits.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fdio/vfs.h>
+#include <lib/zx/channel.h>
 #include <zircon/compiler.h>
 #include <zircon/device/vfs.h>
 #include <zircon/processargs.h>
@@ -26,21 +30,18 @@ namespace {
 
 zx_status_t MkfsNativeFs(const char* binary, const char* device_path, LaunchCallback cb,
                          const mkfs_options_t* options) {
-    zx_handle_t hnd[FDIO_MAX_HANDLES * 2];
-    uint32_t ids[FDIO_MAX_HANDLES * 2];
-    size_t n = 0;
-    int device_fd;
-    if ((device_fd = open(device_path, O_RDWR)) < 0) {
+    fbl::unique_fd device_fd;
+    device_fd.reset(open(device_path, O_RDWR));
+    if (!device_fd) {
         fprintf(stderr, "Failed to open device\n");
         return ZX_ERR_BAD_STATE;
     }
-    zx_status_t status;
-    if ((status = fdio_transfer_fd(device_fd, FS_FD_BLOCKDEVICE, hnd + n, ids + n)) <= 0) {
-        fprintf(stderr, "Failed to access device handle\n");
-        return status != 0 ? status : ZX_ERR_BAD_STATE;
+    zx::channel block_device;
+    zx_status_t status = fdio_get_service_handle(device_fd.release(),
+                                                 block_device.reset_and_get_address());
+    if (status != ZX_OK) {
+        return status;
     }
-    n += status;
-
     fbl::Vector<const char*> argv;
     argv.push_back(binary);
     if (options->verbose) {
@@ -53,13 +54,18 @@ zx_status_t MkfsNativeFs(const char* binary, const char* device_path, LaunchCall
         argv.push_back(fvm_data_slices.c_str());
     }
     argv.push_back("mkfs");
-    status = static_cast<zx_status_t>(cb(static_cast<int>(argv.size()), argv.get(), hnd, ids, n));
+    argv.push_back(nullptr);
+
+    zx_handle_t hnd = block_device.release();
+    uint32_t id = FS_HANDLE_BLOCK_DEVICE_ID;
+    status = static_cast<zx_status_t>(cb(static_cast<int>(argv.size() - 1), argv.get(),
+                                         &hnd, &id, 1));
     return status;
 }
 
 zx_status_t MkfsFat(const char* device_path, LaunchCallback cb, const mkfs_options_t* options) {
-    const char* argv[] = {"/boot/bin/mkfs-msdosfs", device_path};
-    return cb(fbl::count_of(argv), argv, NULL, NULL, 0);
+    const char* argv[] = {"/boot/bin/mkfs-msdosfs", device_path, nullptr};
+    return cb(fbl::count_of(argv) - 1, argv, NULL, NULL, 0);
 }
 
 } // namespace

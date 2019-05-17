@@ -10,9 +10,11 @@
 #include <ddk/metadata.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/i2c-lib.h>
+#include <ddk/protocol/composite.h>
 #include <ddk/protocol/ethernet.h>
 #include <ddk/protocol/platform/device.h>
 #include <ddk/protocol/platform-device-lib.h>
+#include <fbl/algorithm.h>
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <fbl/unique_ptr.h>
@@ -27,31 +29,61 @@ namespace eth {
 #define MCU_I2C_REG_BOOT_EN_WOL 0x21
 #define MCU_I2C_REG_BOOT_EN_WOL_RESET_ENABLE 0x03
 
-void AmlEthernet::EthBoardResetPhy() {
+zx_status_t AmlEthernet::EthBoardResetPhy() {
     gpios_[PHY_RESET].Write(0);
     zx_nanosleep(zx_deadline_after(ZX_MSEC(100)));
     gpios_[PHY_RESET].Write(1);
     zx_nanosleep(zx_deadline_after(ZX_MSEC(100)));
+    return ZX_OK;
 }
 
 zx_status_t AmlEthernet::InitPdev() {
-    if (!pdev_.is_valid()) {
-        return ZX_ERR_NO_RESOURCES;
+    composite_protocol_t composite;
+
+    auto status = device_get_protocol(parent(), ZX_PROTOCOL_COMPOSITE, &composite);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "Could not get composite protocol\n");
+        return status;
     }
 
-    zx_status_t status;
-    for (uint32_t i = 0; i < countof(gpios_); i++) {
-        gpios_[i] = pdev_.GetGpio(i);
-        if (!gpios_[i].is_valid()) {
-            return ZX_ERR_NO_RESOURCES;
-        }
+    zx_device_t* components[COMPONENT_COUNT];
+    size_t actual;
+    composite_get_components(&composite, components, fbl::count_of(components), &actual);
+    if (actual != fbl::count_of(components)) {
+        zxlogf(ERROR, "could not get components\n");
+        return ZX_ERR_NOT_SUPPORTED;
     }
 
-    // I2c for MCU messages.
-    i2c_ = pdev_.GetI2c(0);
-    if (!i2c_.is_valid()) {
-        return ZX_ERR_NO_RESOURCES;
+    pdev_protocol_t pdev;
+    status = device_get_protocol(components[COMPONENT_PDEV], ZX_PROTOCOL_PDEV, &pdev);
+    if (status !=  ZX_OK) {
+        zxlogf(ERROR, "Could not get PDEV protocol\n");
+        return status;
     }
+    pdev_ = &pdev;
+
+    i2c_protocol_t i2c;
+    status = device_get_protocol(components[COMPONENT_I2C], ZX_PROTOCOL_I2C, &i2c);
+    if (status !=  ZX_OK) {
+        zxlogf(ERROR, "Could not get I2C protocol\n");
+        return status;
+    }
+    i2c_ = &i2c;
+
+    gpio_protocol_t gpio;
+    status = device_get_protocol(components[COMPONENT_RESET_GPIO], ZX_PROTOCOL_GPIO, &gpio);
+    if (status !=  ZX_OK) {
+        zxlogf(ERROR, "Could not get GPIO protocol\n");
+        return status;
+    }
+    gpios_[PHY_RESET] = &gpio;
+
+    status = device_get_protocol(components[COMPONENT_INTR_GPIO], ZX_PROTOCOL_GPIO, &gpio);
+    if (status !=  ZX_OK) {
+        zxlogf(ERROR, "Could not get GPIO protocol\n");
+        return status;
+    }
+    gpios_[PHY_INTR] = &gpio;
 
     // Map amlogic peripheral control registers.
     status = pdev_.MapMmio(MMIO_PERIPH, &periph_mmio_);
@@ -101,7 +133,7 @@ zx_status_t AmlEthernet::Bind() {
     // Populate board specific information
     eth_dev_metadata_t mac_info;
     size_t actual;
-    status = device_get_metadata(parent(), DEVICE_METADATA_PRIVATE, &mac_info,
+    status = device_get_metadata(parent(), DEVICE_METADATA_ETH_MAC_DEVICE, &mac_info,
                                  sizeof(eth_dev_metadata_t), &actual);
     if (status != ZX_OK || actual != sizeof(eth_dev_metadata_t)) {
         zxlogf(ERROR, "aml-ethernet: Could not get MAC metadata %d\n", status);
@@ -113,17 +145,7 @@ zx_status_t AmlEthernet::Bind() {
         {BIND_PLATFORM_DEV_DID, 0, mac_info.did},
     };
 
-    device_add_args_t args = {};
-    args.version = DEVICE_ADD_ARGS_VERSION;
-    args.name = "aml-ethernet";
-    args.ctx = this;
-    args.ops = &ddk_device_proto_;
-    args.proto_id = ddk_proto_id_;
-    args.proto_ops = ddk_proto_ops_;
-    args.props = props;
-    args.prop_count = countof(props);
-
-    return pdev_.DeviceAdd(0, &args, &zxdev_);
+    return DdkAdd("aml-ethernet", 0, props, fbl::count_of(props));
 }
 
 void AmlEthernet::DdkUnbind() {
@@ -134,7 +156,7 @@ void AmlEthernet::DdkRelease() {
     delete this;
 }
 
-zx_status_t AmlEthernet::Create(zx_device_t* parent) {
+zx_status_t AmlEthernet::Create(void* ctx, zx_device_t* parent) {
     fbl::AllocChecker ac;
     auto eth_device = fbl::make_unique_checked<AmlEthernet>(&ac, parent);
     if (!ac.check()) {
@@ -160,8 +182,19 @@ zx_status_t AmlEthernet::Create(zx_device_t* parent) {
     return ZX_OK;
 }
 
+static zx_driver_ops_t driver_ops = [](){
+    zx_driver_ops_t ops = {};
+    ops.version = DRIVER_OPS_VERSION;
+    ops.bind = AmlEthernet::Create;
+    return ops;
+}();
+
 } // namespace eth
 
-extern "C" zx_status_t aml_eth_bind(void* ctx, zx_device_t* parent) {
-    return eth::AmlEthernet::Create(parent);
-}
+// clang-format off
+ZIRCON_DRIVER_BEGIN(aml_eth, eth::driver_ops, "aml-ethernet", "0.1", 4)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_COMPOSITE),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_AMLOGIC),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_AMLOGIC_S912),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_AMLOGIC_ETH),
+ZIRCON_DRIVER_END(aml_eth)

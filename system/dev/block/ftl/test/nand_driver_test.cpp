@@ -10,7 +10,7 @@
 #include <ddk/driver.h>
 #include <ddktl/protocol/nand.h>
 #include <ddktl/protocol/badblock.h>
-#include <unittest/unittest.h>
+#include <zxtest/zxtest.h>
 
 namespace {
 
@@ -61,13 +61,13 @@ class FakeNand : public ddk::NandProtocol<FakeNand> {
             uint8_t data;
             uint64_t vmo_addr = operation->rw.offset_data_vmo * kRealPageSize;
             zx_vmo_read(operation->rw.data_vmo, &data, vmo_addr, sizeof(data));
-            if (data != 'd') {
+            if (data != 'd' && result_ == ZX_OK) {
                 result_ = ZX_ERR_IO;
             }
 
             vmo_addr = operation->rw.offset_oob_vmo * kRealPageSize;
             zx_vmo_read(operation->rw.oob_vmo, &data, vmo_addr, sizeof(data));
-            if (data != 'o') {
+            if (data != 'o' && result_ == ZX_OK) {
                 result_ = ZX_ERR_IO;
             }
         }
@@ -118,13 +118,11 @@ class FakeBadBlock : public ddk::BadBlockProtocol<FakeBadBlock> {
     zx_status_t result_ = ZX_OK;
 };
 
-class NandTester {
+class NandDriverTest : public zxtest::Test {
   public:
-    NandTester() {}
-
     nand_protocol_t* nand_proto() { return nand_proto_.proto(); }
     bad_block_protocol_t* bad_block_proto() { return bad_block_proto_.proto(); }
-    nand_operation_t& operation() { return nand_proto_.operation(); }
+    nand_operation_t& nand_operation() { return nand_proto_.operation(); }
     FakeNand* nand() { return &nand_proto_; }
     FakeBadBlock* bad_block() { return &bad_block_proto_; }
 
@@ -133,35 +131,23 @@ class NandTester {
     FakeBadBlock bad_block_proto_;
 };
 
-bool TrivialLifetimeTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
-    END_TEST;
+TEST_F(NandDriverTest, TrivialLifetime) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
 }
 
-bool InitTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, Init) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
-    END_TEST;
 }
 
-bool InitFailureTest() {
-    BEGIN_TEST;
-    NandTester tester;
-
-    tester.bad_block()->set_result(ZX_ERR_BAD_STATE);
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, InitFailure) {
+    bad_block()->set_result(ZX_ERR_BAD_STATE);
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_NE(nullptr, driver->Init());
-    END_TEST;
 }
 
-bool ReadTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, Read) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
@@ -169,7 +155,7 @@ bool ReadTest() {
 
     ASSERT_EQ(ftl::kNdmOk, driver->NandRead(5, 2, data.get(), oob.get()));
 
-    nand_operation_t& operation = tester.operation();
+    nand_operation_t& operation = nand_operation();
     EXPECT_EQ(NAND_OP_READ, operation.command);
     EXPECT_EQ(2 * 2, operation.rw.length);
     EXPECT_EQ(5 * 2, operation.rw.offset_nand);
@@ -177,55 +163,43 @@ bool ReadTest() {
     EXPECT_EQ(2 * 2, operation.rw.offset_oob_vmo);
     EXPECT_EQ('d', data[0]);
     EXPECT_EQ('o', oob[0]);
-    END_TEST;
 }
 
-bool ReadFailureTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, ReadFailure) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
     fbl::Array<uint8_t> oob(new uint8_t[kOobSize * 2], kOobSize * 2);
 
-    tester.nand()->set_result(ZX_ERR_BAD_STATE);
+    nand()->set_result(ZX_ERR_BAD_STATE);
     ASSERT_EQ(ftl::kNdmFatalError, driver->NandRead(5, 2, data.get(), oob.get()));
-    END_TEST;
 }
 
-bool ReadEccUnsafeTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, ReadEccUnsafe) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
     fbl::Array<uint8_t> oob(new uint8_t[kOobSize * 2], kOobSize * 2);
 
-    tester.nand()->set_ecc_bits(kEccBits / 2 + 1);
+    nand()->set_ecc_bits(kEccBits / 2 + 1);
     ASSERT_EQ(ftl::kNdmUnsafeEcc, driver->NandRead(5, 2, data.get(), oob.get()));
-    END_TEST;
 }
 
-bool ReadEccFailureTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, ReadEccFailure) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
     fbl::Array<uint8_t> oob(new uint8_t[kOobSize * 2], kOobSize * 2);
 
-    tester.nand()->set_ecc_bits(kEccBits + 1);
+    nand()->set_ecc_bits(kEccBits + 1);
     ASSERT_EQ(ftl::kNdmUncorrectableEcc, driver->NandRead(5, 2, data.get(), oob.get()));
-    END_TEST;
 }
 
-bool WriteTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, Write) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
@@ -235,19 +209,29 @@ bool WriteTest() {
 
     ASSERT_EQ(ftl::kNdmOk, driver->NandWrite(5, 2, data.get(), oob.get()));
 
-    nand_operation_t& operation = tester.operation();
+    nand_operation_t& operation = nand_operation();
     EXPECT_EQ(NAND_OP_WRITE, operation.command);
     EXPECT_EQ(2 * 2, operation.rw.length);
     EXPECT_EQ(5 * 2, operation.rw.offset_nand);
     EXPECT_EQ(0, operation.rw.offset_data_vmo);
     EXPECT_EQ(2 * 2, operation.rw.offset_oob_vmo);
-    END_TEST;
 }
 
-bool WriteFailureTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, WriteFailure) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
+    ASSERT_EQ(nullptr, driver->Init());
+
+    fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
+    fbl::Array<uint8_t> oob(new uint8_t[kOobSize * 2], kOobSize * 2);
+    memset(data.get(), 'd', data.size());
+    memset(oob.get(), 'e', oob.size());  // Unexpected value.
+    nand()->set_result(ZX_ERR_BAD_STATE);
+
+    ASSERT_EQ(ftl::kNdmFatalError, driver->NandWrite(5, 2, data.get(), oob.get()));
+}
+
+TEST_F(NandDriverTest, WriteFailureBadBlock) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     fbl::Array<uint8_t> data(new uint8_t[kPageSize * 2], kPageSize * 2);
@@ -256,60 +240,43 @@ bool WriteFailureTest() {
     memset(oob.get(), 'e', oob.size());  // Unexpected value.
 
     ASSERT_EQ(ftl::kNdmError, driver->NandWrite(5, 2, data.get(), oob.get()));
-    END_TEST;
 }
 
-bool EraseTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, Erase) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     ASSERT_EQ(ftl::kNdmOk, driver->NandErase(5 * kBlockSize));
 
-    nand_operation_t& operation = tester.operation();
+    nand_operation_t& operation = nand_operation();
     EXPECT_EQ(NAND_OP_ERASE, operation.command);
     EXPECT_EQ(1, operation.erase.num_blocks);
     EXPECT_EQ(5, operation.erase.first_block);
-    END_TEST;
 }
 
-bool EraseFailureTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, EraseFailure) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
-    tester.nand()->set_result(ZX_ERR_BAD_STATE);
-    ASSERT_EQ(ftl::kNdmError, driver->NandErase(5 * kBlockSize));
-    END_TEST;
+    nand()->set_result(ZX_ERR_BAD_STATE);
+    ASSERT_EQ(ftl::kNdmFatalError, driver->NandErase(5 * kBlockSize));
 }
 
-bool IsBadBlockTest() {
-    BEGIN_TEST;
-    NandTester tester;
-    auto driver = ftl::NandDriver::Create(tester.nand_proto(), tester.bad_block_proto());
+TEST_F(NandDriverTest, EraseFailureBadBlock) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
+    ASSERT_EQ(nullptr, driver->Init());
+
+    nand()->set_result(ZX_ERR_IO);
+    ASSERT_EQ(ftl::kNdmError, driver->NandErase(5 * kBlockSize));
+}
+
+TEST_F(NandDriverTest, IsBadBlock) {
+    auto driver = ftl::NandDriver::Create(nand_proto(), bad_block_proto());
     ASSERT_EQ(nullptr, driver->Init());
 
     ASSERT_FALSE(driver->IsBadBlock(0));
     ASSERT_TRUE(driver->IsBadBlock(1 * kBlockSize));
     ASSERT_FALSE(driver->IsBadBlock(2 * kBlockSize));
-    END_TEST;
 }
 
 }  // namespace
-
-BEGIN_TEST_CASE(NandDriverTests)
-RUN_TEST_SMALL(TrivialLifetimeTest)
-RUN_TEST_SMALL(InitTest)
-RUN_TEST_SMALL(InitFailureTest)
-RUN_TEST_SMALL(ReadTest)
-RUN_TEST_SMALL(ReadFailureTest)
-RUN_TEST_SMALL(ReadEccUnsafeTest)
-RUN_TEST_SMALL(ReadEccFailureTest)
-RUN_TEST_SMALL(WriteTest)
-RUN_TEST_SMALL(WriteFailureTest)
-RUN_TEST_SMALL(EraseTest)
-RUN_TEST_SMALL(EraseFailureTest)
-RUN_TEST_SMALL(IsBadBlockTest)
-END_TEST_CASE(NandDriverTests)

@@ -5,28 +5,36 @@
 // https://opensource.org/licenses/MIT
 
 #include <object/pager_dispatcher.h>
+
+#include <lib/counters.h>
 #include <object/thread_dispatcher.h>
 #include <trace.h>
 #include <vm/page_source.h>
 
 #define LOCAL_TRACE 0
 
-zx_status_t PagerDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher, zx_rights_t* rights) {
+KCOUNTER(dispatcher_pager_create_count, "dispatcher.pager.create")
+KCOUNTER(dispatcher_pager_destroy_count, "dispatcher.pager.destroy")
+
+zx_status_t PagerDispatcher::Create(KernelHandle<PagerDispatcher>* handle, zx_rights_t* rights) {
     fbl::AllocChecker ac;
-    auto disp = new (&ac) PagerDispatcher();
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) PagerDispatcher()));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
 
     *rights = default_rights();
-    *dispatcher = fbl::AdoptRef<Dispatcher>(disp);
+    *handle = ktl::move(new_handle);
     return ZX_OK;
 }
 
-PagerDispatcher::PagerDispatcher() : SoloDispatcher() {}
+PagerDispatcher::PagerDispatcher() : SoloDispatcher() {
+    kcounter_add(dispatcher_pager_create_count, 1);
+}
 
 PagerDispatcher::~PagerDispatcher() {
     DEBUG_ASSERT(srcs_.is_empty());
+    kcounter_add(dispatcher_pager_destroy_count, 1);
 }
 
 zx_status_t PagerDispatcher::CreateSource(fbl::RefPtr<PortDispatcher> port,
@@ -126,7 +134,7 @@ void PagerSource::ClearAsyncRequest(page_request_t* request) {
     ASSERT(!closed_);
 
     if (request == active_request_) {
-        // Condition on whether or not we atually cancel the packet, to make sure
+        // Condition on whether or not we actually cancel the packet, to make sure
         // we don't race with a call to PagerSource::Free.
         if (port_->CancelQueued(&packet_)) {
             OnPacketFreedLocked();

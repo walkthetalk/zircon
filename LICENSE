@@ -5,6 +5,7 @@ kernel/LICENSE and scripts/LICENSE.
 The Third Party Components (third_party/...) are under various
 licenses (of the BSD, MIT, or Zlib style), which may be found in the
 root directory of each component, respectively.
+
 All other components and materials, including the Zircon System
 (system/...) and Bootloader (bootloader/...), are under a BSD-style
 license, copies of which may be found in system/LICENSE and

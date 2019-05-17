@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <unittest/unittest.h>
 #include <zircon/compiler.h>
@@ -40,6 +41,10 @@ constexpr int WATCHDOG_TIMEOUT_NOT_RUNNING = INT_MAX;
 static int base_timeout_seconds = DEFAULT_BASE_TIMEOUT_SECONDS;
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Cond used to wait on the watchdog thread starting.
+static pthread_cond_t init_cond = PTHREAD_COND_INITIALIZER;
+static bool init_done = false;
 
 // The name of the current test.
 // Used to report which test timed out.
@@ -121,6 +126,9 @@ static __NO_RETURN void watchdog_signal_timeout(const char* name) {
 static void* watchdog_thread_func(void* arg) {
     pthread_mutex_lock(&mutex);
 
+    init_done = true;
+    pthread_cond_signal(&init_cond);
+
     for (;;) {
         // Has watchdog_terminate() been called?
         // Test this here, before calling pthread_cond_timedwait(), so that
@@ -132,6 +140,8 @@ static void* watchdog_thread_func(void* arg) {
             break;
         }
 
+        // Use REALTIME because that's the default clock for conds and
+        // OSX doesn't include the pthread APIs for changing it.
         struct timespec delay;
         clock_gettime(CLOCK_REALTIME, &delay);
         delay.tv_sec += WATCHDOG_TICK_SECONDS;
@@ -144,7 +154,7 @@ static void* watchdog_thread_func(void* arg) {
         assert(result == 0 || result == ETIMEDOUT);
 
         struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t now_nanos = timespec_to_nanoseconds(&now);
         assert (now_nanos >= test_start_time);
         uint64_t elapsed_nanos = now_nanos - test_start_time;
@@ -172,7 +182,21 @@ static void* watchdog_thread_func(void* arg) {
 void watchdog_initialize() {
     if (watchdog_is_enabled()) {
         tests_running = true;
-        int res = pthread_create(&watchdog_thread, NULL, &watchdog_thread_func, NULL);
+
+        // We don't want the watchdog thread to commit pages while tests are running as that
+        // muddies page usage stats. To avoid that, wait for the thread to start before running
+        // the tests. Currently, the watchdog thread always uses the unsafe stacks during
+        // initialization; if that changes, then we'll need to explicitly write to it.
+
+        pthread_mutex_lock(&mutex);
+        int res = pthread_create(&watchdog_thread, nullptr, &watchdog_thread_func, NULL);
+        if (res == 0) {
+            while (!init_done) {
+                pthread_cond_wait(&init_cond, &mutex);
+            }
+        }
+        pthread_mutex_unlock(&mutex);
+
         if (res != 0) {
             unittest_printf_critical("ERROR STARTING WATCHDOG THREAD: %d(%s)\n", res, strerror(res));
             exit(WATCHDOG_ERRCODE);
@@ -194,7 +218,7 @@ void watchdog_start(test_type_t type, const char* name) {
         test_name = name;
         active_timeout_seconds = test_timeout_for_type(type);
         struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        clock_gettime(CLOCK_MONOTONIC, &now);
         test_start_time = timespec_to_nanoseconds(&now);
         pthread_mutex_unlock(&mutex);
     }

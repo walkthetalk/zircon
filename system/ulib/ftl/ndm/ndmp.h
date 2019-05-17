@@ -6,26 +6,25 @@
 
 #include <inc/config.h>
 
-#if INC_NDM
 #include <stdlib.h>
 #include <string.h>
-#include <stdio_tfs.h>
+#include <stdio.h>
 #include <errno.h>
 
+#include <ftl_private.h>
 #include <sys.h>
-#include <modules.h>
 #include <kprivate/ndm.h>
 
-/***********************************************************************/
-/* Configuration                                                       */
-/***********************************************************************/
+//
+// Configuration.
+//
 #undef NDM_DEBUG
 #define NDM_DEBUG FALSE    // TRUE for TargetNDM debug output
 #define RDBACK_CHECK FALSE // TRUE for metadata read-back check
 
-/***********************************************************************/
-/* Symbol Definitions                                                  */
-/***********************************************************************/
+//
+// Symbol Definitions.
+//
 #define CTRL_SIG_SZ 7 // ctrl sig bytes
 #define CTRL_SIG "NDMTA01"
 
@@ -48,7 +47,7 @@
 
 // Actions that can cause a block to go bad
 #define ERASE_BLOCK 1
-#define WRITE_PAGE 2//
+#define WRITE_PAGE 2
 
 //
 // Layout for the spare area:
@@ -62,9 +61,9 @@
 #define EB_LAST_RESERVED 14
 #define EB_REG_MARK 15  // NDM control page iff zero
 
-/***********************************************************************/
-/* Type Declarations                                                   */
-/***********************************************************************/
+//
+// Type Declarations.
+//
 
 // <key, value> pair
 typedef struct {
@@ -114,19 +113,15 @@ struct ndm {
     int (*read_pages)(ui32 pn, ui32 count, ui8* data, ui8* spare, void* dev);
     int (*xfr_page)(ui32 old_pn, ui32 new_pn, ui8* data, ui8* old_spare, ui8* new_spare,
                     int encode_spare, void* dev);
-#if INC_FFS_NDM_MLC || INC_FTL_NDM_MLC
+#if INC_FTL_NDM_MLC
     ui32 (*pair_offset)(ui32 page_offset, void* dev);
 #endif
     int (*read_decode_spare)(ui32 pn, ui8* spare, void* dev);
     int (*read_spare)(ui32 pn, ui8* spare, void* dev);
     int (*page_blank)(ui32 pn, ui8* data, ui8* spare, void* dev);
-#if INC_FTL_NDM
     int (*check_page)(ui32 pn, ui8* data, ui8* spr, int* stat, void* dev);
-#endif
     int (*erase_block)(ui32 pn, void* dev);
-#if INC_FTL_NDM || INC_FFS_NDM
     int (*is_block_bad)(ui32 pn, void* dev);
-#endif
 
     // Device Dependent Variables
     void* dev;         // optional value set by driver
@@ -137,26 +132,23 @@ struct ndm {
     ui32 pgs_per_blk;  // number of pages in a block
     ui32 page_size;    // page size in bytes
     ui8 eb_size;       // spare area size in bytes
-    ui8 dev_type;      // NAND device type
 };
 
-/***********************************************************************/
-/* Variable Declarations                                               */
-/***********************************************************************/
+//
+// Variable Declarations.
+//
 extern CircLink NdmDevs;
 extern SEM NdmSem;
 
-/***********************************************************************/
-/* Function Prototypes                                                 */
-/***********************************************************************/
+//
+// Function Prototypes.
+//
 int ndmInitBadBlock(CNDM ndm, ui32 b);
 int ndmWrCtrl(NDM ndm);
 void ndmCkMeta(NDM ndm);
 int ndmMarkBadBlock(NDM ndm, ui32 arg, ui32 action);
-void* ndmAddFatFTL(NDM ndm, ui32 part_num, FtlNdmVol* ftl, FatVol* fat);
 
 #if NDM_DEBUG
 int printf(const char*, ...);
 #endif
 
-#endif // INC_NDM

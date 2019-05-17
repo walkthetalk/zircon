@@ -48,7 +48,7 @@ The VIM2 has 3 buttons on the left side of the board. On the board schematic, SW
 Booting Zircon on the VIM2 requires a custom bootloader.
 
 ### [Googlers only]
-Within Google, this can be found at [go/vim2-bootloader](http://go/vim2-bootloader). Download the .bin file and follow the instructions in the document.
+Within Google, this can be found at [go/vim2-bootloader](http://go.corp.google.com/vim2-bootloader). Download the .bin file and follow the instructions in the document.
 
 If you are not at Google, hang on until we make this publicly available.
 
@@ -58,7 +58,8 @@ in the kernel boot log. You should see something like: "cmdline: fuchsia-bootloa
 ## Building Zircon
 
 ```
-make -j32 arm64
+gn gen build-zircon
+ninja -C build-zircon
 ```
 
 Be sure you've already set up your network before proceeding to the next step.
@@ -78,7 +79,7 @@ The device should boot into zedboot by default.
 If you are working from the garnet layer of above, run the following:
 
 ```
-fx flash vim2 --pave
+fx flash --pave
 ```
 
 In order to get into zedboot you can reboot into the recovery:
@@ -100,7 +101,7 @@ scripts/netboot-zircon ./build-arm64
 To netboot garnet, run the following under the fuchsia directory:
 
 ```
-fx set arm64 --netboot && fx full-build && fx netboot -1
+fx set arm64 --board vim2 --netboot && fx full-build && fx netboot -1
 ```
 
 You should be able to see "Issued boot command to ..." message printed out if this step is successful.
@@ -110,7 +111,7 @@ You should be able to see "Issued boot command to ..." message printed out if th
 Paving is available from garnet layers and above. Run the following under the fuchsia directory:
 
 ```
-fx set arm64 && fx full-build && fx pave -1
+fx set arm64 --release --board vim2 && fx full-build && fx pave -1
 ```
 
 ### Fuchsia logo

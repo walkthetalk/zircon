@@ -41,7 +41,61 @@ bool parsing_reserved_words_in_struct_test() {
     TestLibrary library(R"FIDL(
 library example;
 
+struct struct {
+    bool field;
+};
+
 struct InStruct {
+    struct foo;
+
+    bool as;
+    bool library;
+    bool using;
+
+    bool array;
+    bool handle;
+    bool request;
+    bool string;
+    bool vector;
+
+    bool bool;
+    bool int8;
+    bool int16;
+    bool int32;
+    bool int64;
+    bool uint8;
+    bool uint16;
+    bool uint32;
+    bool uint64;
+    bool float32;
+    bool float64;
+
+    bool true;
+    bool false;
+
+    bool reserved;
+};
+)FIDL");
+    EXPECT_TRUE(library.Compile());
+
+    END_TEST;
+}
+
+// Test that otherwise reserved words can be appropriarely parsed when context
+// is clear.
+bool parsing_reserved_words_in_union_test() {
+    BEGIN_TEST;
+
+    TestLibrary library(R"FIDL(
+library example;
+
+struct struct {
+    bool field;
+};
+
+union InUnion {
+    struct foo;
+
     bool as;
     bool library;
     bool using;
@@ -83,33 +137,39 @@ bool parsing_reserved_words_in_interface_test() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface InInterface {
-    01: as(bool as);
-    02: library(bool library);
-    03: using(bool using);
+struct struct {
+    bool field;
+};
 
-    11: array(bool array);
-    12: handle(bool handle);
-    13: request(bool request);
-    14: string(bool string);
-    15: vector(bool vector);
+protocol InProtocol {
+    as(bool as);
+    library(bool library);
+    using(bool using);
 
-    31: bool(bool bool);
-    32: int8(bool int8);
-    33: int16(bool int16);
-    34: int32(bool int32);
-    35: int64(bool int64);
-    36: uint8(bool uint8);
-    37: uint16(bool uint16);
-    38: uint32(bool uint32);
-    39: uint64(bool uint64);
-    40: float32(bool float32);
-    41: float64(bool float64);
+    array(bool array);
+    handle(bool handle);
+    request(bool request);
+    string(bool string);
+    vector(bool vector);
 
-    51: true(bool true);
-    52: false(bool false);
+    bool(bool bool);
+    int8(bool int8);
+    int16(bool int16);
+    int32(bool int32);
+    int64(bool int64);
+    uint8(bool uint8);
+    uint16(bool uint16);
+    uint32(bool uint32);
+    uint64(bool uint64);
+    float32(bool float32);
+    float64(bool float64);
 
-    61: reserved(bool reserved);
+    true(bool true);
+    false(bool false);
+
+    reserved(bool reserved);
+
+    foo(struct arg, int32 arg2, struct arg3);
 };
 )FIDL");
     EXPECT_TRUE(library.Compile());
@@ -229,15 +289,48 @@ struct Empty {
     END_TEST;
 }
 
+bool warn_on_type_alias_before_imports() {
+    BEGIN_TEST;
+
+    SharedAmongstLibraries shared;
+    TestLibrary dependency("dependent.fidl", R"FIDL(
+library dependent;
+
+struct Something {};
+)FIDL", &shared);
+    ASSERT_TRUE(dependency.Compile());
+
+    TestLibrary library("example.fidl", R"FIDL(
+library example;
+
+using foo = int16;
+using dependent;
+
+struct UseDependent {
+    dependent.Something field;
+};
+)FIDL", &shared);
+    ASSERT_TRUE(library.AddDependentLibrary(std::move(dependency)));
+    ASSERT_TRUE(library.Compile());
+
+    const auto& warnings = library.warnings();
+    ASSERT_EQ(warnings.size(), 1);
+    ASSERT_STR_STR(warnings[0].data(), "library imports must be grouped at top-of-file");
+
+    END_TEST;
+}
+
 } // namespace
 
-BEGIN_TEST_CASE(parser_tests);
-RUN_TEST(bad_compound_identifier_test);
-RUN_TEST(parsing_reserved_words_in_struct_test);
-RUN_TEST(parsing_reserved_words_in_interface_test);
-RUN_TEST(bad_char_at_sign_test);
-RUN_TEST(bad_char_slash_test);
-RUN_TEST(bad_identifier_test);
-RUN_TEST(invalid_character_test);
-RUN_TEST(empty_struct_test);
-END_TEST_CASE(parser_tests);
+BEGIN_TEST_CASE(parsing_tests)
+RUN_TEST(bad_compound_identifier_test)
+RUN_TEST(parsing_reserved_words_in_struct_test)
+RUN_TEST(parsing_reserved_words_in_union_test)
+RUN_TEST(parsing_reserved_words_in_interface_test)
+RUN_TEST(bad_char_at_sign_test)
+RUN_TEST(bad_char_slash_test)
+RUN_TEST(bad_identifier_test)
+RUN_TEST(invalid_character_test)
+RUN_TEST(empty_struct_test)
+RUN_TEST(warn_on_type_alias_before_imports)
+END_TEST_CASE(parsing_tests)

@@ -7,13 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <utility>
+
 #include <fbl/unique_fd.h>
-#include <fs-management/ram-nand.h>
 #include <fuchsia/hardware/nand/c/fidl.h>
 #include <lib/fzl/fdio.h>
-#include <unittest/unittest.h>
-
-#include <utility>
+#include <ramdevice-client/ramnand.h>
+#include <zxtest/zxtest.h>
 
 namespace {
 
@@ -27,7 +27,7 @@ fuchsia_hardware_nand_RamNandInfo BuildConfig() {
 class NandDevice {
   public:
       explicit NandDevice(const fuchsia_hardware_nand_RamNandInfo& config = BuildConfig()) {
-          if (fs_mgmt::RamNand::Create(&config, &ram_nand_) == ZX_OK) {
+          if (ramdevice_client::RamNand::Create(&config, &ram_nand_) == ZX_OK) {
               // caller_ want's to own the device, so we re-open it even though
               // ram_nand_ already has it open.
               fbl::unique_fd device(dup(ram_nand_->fd().get()));
@@ -43,13 +43,12 @@ class NandDevice {
 
   private:
 
-    std::optional<fs_mgmt::RamNand> ram_nand_;
+    std::optional<ramdevice_client::RamNand> ram_nand_;
     fzl::FdioCaller caller_;
     DISALLOW_COPY_ASSIGN_AND_MOVE(NandDevice);
 };
 
-bool TrivialLifetimeTest() {
-    BEGIN_TEST;
+TEST(RamNandCtlTest, TrivialLifetime) {
     fbl::String path;
     {
         NandDevice device;
@@ -59,33 +58,30 @@ bool TrivialLifetimeTest() {
 
     fbl::unique_fd found(open(path.c_str(), O_RDWR));
     ASSERT_FALSE(found);
-    END_TEST;
 }
 
-bool ExportConfigTest() {
-    BEGIN_TEST;
+TEST(RamNandCtlTest, ExportConfig) {
     fuchsia_hardware_nand_RamNandInfo config = BuildConfig();
     config.export_nand_config = true;
 
     NandDevice device(config);
     ASSERT_TRUE(device.IsValid());
-    END_TEST;
 }
 
-bool ExportPartitionsTest() {
-    BEGIN_TEST;
+TEST(RamNandCtlTest, ExportPartitions) {
     fuchsia_hardware_nand_RamNandInfo config = BuildConfig();
     config.export_partition_map = true;
 
     NandDevice device(config);
     ASSERT_TRUE(device.IsValid());
-    END_TEST;
+}
+
+TEST(RamNandCtlTest, CreateFailure) {
+    fuchsia_hardware_nand_RamNandInfo config = BuildConfig();
+    config.nand_info.num_blocks = 0;
+
+    NandDevice device(config);
+    ASSERT_FALSE(device.IsValid());
 }
 
 }  // namespace
-
-BEGIN_TEST_CASE(RamNandCtlTests)
-RUN_TEST_SMALL(TrivialLifetimeTest)
-RUN_TEST_SMALL(ExportConfigTest)
-RUN_TEST_SMALL(ExportPartitionsTest)
-END_TEST_CASE(RamNandCtlTests)

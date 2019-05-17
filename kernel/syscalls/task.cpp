@@ -35,13 +35,6 @@
 #include "priv.h"
 
 #define LOCAL_TRACE 0
-#define THREAD_SET_PRIORITY_EXPERIMENT 1
-
-#if THREAD_SET_PRIORITY_EXPERIMENT
-#include <kernel/cmdline.h>
-#include <kernel/thread.h>
-#include <lk/init.h>
-#endif
 
 namespace {
 
@@ -50,20 +43,6 @@ constexpr size_t kMaxDebugWriteBlock = 64 * 1024u * 1024u;
 
 // Assume the typical set-policy call has 8 items or less.
 constexpr size_t kPolicyBasicInlineCount = 8;
-
-#if THREAD_SET_PRIORITY_EXPERIMENT
-// This was initially set to false by default. See ZX-940 for the rationale
-// for being enabled by default.
-bool thread_set_priority_allowed = true;
-void thread_set_priority_experiment_init_hook(uint) {
-    thread_set_priority_allowed = !cmdline_get_bool("thread.set.priority.disable", false);
-    printf("thread set priority experiment is : %s\n",
-           thread_set_priority_allowed ? "ENABLED" : "DISABLED");
-}
-LK_INIT_HOOK(thread_set_priority_experiment,
-             thread_set_priority_experiment_init_hook,
-             LK_INIT_LEVEL_THREADING - 1);
-#endif
 
 // TODO(ZX-1025): copy_user_string may truncate the incoming string,
 // and may copy extra data past the NUL.
@@ -106,7 +85,14 @@ union thread_state_local_buffer_t {
 zx_status_t validate_thread_state_input(uint32_t in_topic, size_t in_len, size_t* out_len) {
     switch (in_topic) {
     case ZX_THREAD_STATE_GENERAL_REGS:
-        *out_len = sizeof(zx_thread_state_general_regs_t);
+        // We are temporarily supporting programs that pass in the length of
+        // the old struct.
+        // TODO(ZX-3883): remove after old struct users have been migrated
+        if (in_len >= sizeof(__old_zx_thread_state_general_regs_t) &&
+            in_len < sizeof(zx_thread_state_general_regs_t))
+            *out_len = sizeof(__old_zx_thread_state_general_regs_t);
+        else
+            *out_len = sizeof(zx_thread_state_general_regs_t);
         break;
     case ZX_THREAD_STATE_FP_REGS:
         *out_len = sizeof(zx_thread_state_fp_regs_t);
@@ -171,18 +157,18 @@ zx_status_t sys_thread_create(zx_handle_t process_handle,
     uint32_t pid = (uint32_t)process->get_koid();
 
     // create the thread dispatcher
-    fbl::RefPtr<Dispatcher> thread_dispatcher;
+    KernelHandle<ThreadDispatcher> handle;
     zx_rights_t thread_rights;
     result = ThreadDispatcher::Create(ktl::move(process), options, sp,
-                                      &thread_dispatcher, &thread_rights);
+                                      &handle, &thread_rights);
     if (result != ZX_OK)
         return result;
 
-    uint32_t tid = (uint32_t)thread_dispatcher->get_koid();
+    uint32_t tid = (uint32_t)handle.dispatcher()->get_koid();
     ktrace(TAG_THREAD_CREATE, tid, pid, 0, 0);
     ktrace_name(TAG_THREAD_NAME, tid, pid, buf);
 
-    return out->make(ktl::move(thread_dispatcher), thread_rights);
+    return out->make(ktl::move(handle), thread_rights);
 }
 
 // zx_status_t zx_thread_start
@@ -201,7 +187,8 @@ zx_status_t sys_thread_start(zx_handle_t handle, zx_vaddr_t thread_entry,
     }
 
     ktrace(TAG_THREAD_START, (uint32_t)thread->get_koid(), 0, 0, 0);
-    return thread->Start(thread_entry, stack, arg1, arg2, /* initial_thread= */ false);
+    return thread->Start(ThreadDispatcher::EntryState{thread_entry, stack, arg1, arg2},
+                         /* initial_thread= */ false);
 }
 
 void sys_thread_exit() {
@@ -266,28 +253,25 @@ zx_status_t sys_thread_write_state(zx_handle_t handle, uint32_t kind,
     if (status != ZX_OK)
         return ZX_ERR_INVALID_ARGS;
 
+    // Don't clobber new registers if this program uses the old struct.
+    // TODO(ZX-3883): remove after old struct users have been migrated
+    if (kind == ZX_THREAD_STATE_GENERAL_REGS &&
+        local_buffer_len == sizeof(__old_zx_thread_state_general_regs_t)) {
+        zx_thread_state_general_regs_t current_regs;
+        status = thread->ReadState(ZX_THREAD_STATE_GENERAL_REGS, &current_regs,
+                                   sizeof(current_regs));
+        if (status != ZX_OK)
+            return status;
+#if defined(__x86_64__)
+        local_buffer.general_regs.fs_base = current_regs.fs_base;
+        local_buffer.general_regs.gs_base = current_regs.gs_base;
+#else
+        local_buffer.general_regs.tpidr = current_regs.tpidr;
+#endif
+    }
+
     return thread->WriteState(static_cast<zx_thread_state_topic_t>(kind), &local_buffer,
                               local_buffer_len);
-}
-
-// See ZX-940
-// zx_status_t zx_thread_set_priority
-zx_status_t sys_thread_set_priority(int32_t prio) {
-#if THREAD_SET_PRIORITY_EXPERIMENT
-    // If the experimental zx_thread_set_priority has not been enabled using the
-    // kernel command line option, simply deny this request.
-    if (!thread_set_priority_allowed)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    if ((prio < LOWEST_PRIORITY) || (prio > HIGHEST_PRIORITY))
-        return ZX_ERR_INVALID_ARGS;
-
-    thread_set_priority(get_current_thread(), prio);
-
-    return ZX_OK;
-#else
-    return ZX_ERR_NOT_SUPPORTED;
-#endif
 }
 
 // zx_status_t zx_task_suspend
@@ -302,12 +286,12 @@ zx_status_t sys_task_suspend(zx_handle_t handle, user_out_handle* token) {
     if (status != ZX_OK)
         return status;
 
-    fbl::RefPtr<SuspendTokenDispatcher> suspend_token;
+    KernelHandle<SuspendTokenDispatcher> new_token;
     zx_rights_t rights;
-    status = SuspendTokenDispatcher::Create(ktl::move(task), &suspend_token, &rights);
+    status = SuspendTokenDispatcher::Create(ktl::move(task), &new_token, &rights);
 
     if (status == ZX_OK)
-        status = token->make(ktl::move(suspend_token), rights);
+        status = token->make(ktl::move(new_token), rights);
 
     return status;
 }
@@ -334,7 +318,7 @@ zx_status_t sys_process_create(zx_handle_t job_handle,
     // We check the policy against the process calling zx_process_create, which
     // is the operative policy, rather than against |job_handle|. Access to
     // |job_handle| is controlled by the rights associated with the handle.
-    zx_status_t result = up->QueryBasicPolicy(ZX_POL_NEW_PROCESS);
+    zx_status_t result = up->EnforceBasicPolicy(ZX_POL_NEW_PROCESS);
     if (result != ZX_OK)
         return result;
 
@@ -361,25 +345,26 @@ zx_status_t sys_process_create(zx_handle_t job_handle,
     }
 
     // create a new process dispatcher
-    fbl::RefPtr<Dispatcher> proc_dispatcher;
-    fbl::RefPtr<VmAddressRegionDispatcher> vmar_dispatcher;
+    KernelHandle<ProcessDispatcher> new_process_handle;
+    KernelHandle<VmAddressRegionDispatcher> new_vmar_handle;
     zx_rights_t proc_rights, vmar_rights;
     result = ProcessDispatcher::Create(ktl::move(job), sp, options,
-                                       &proc_dispatcher, &proc_rights,
-                                       &vmar_dispatcher, &vmar_rights);
+                                       &new_process_handle, &proc_rights,
+                                       &new_vmar_handle, &vmar_rights);
     if (result != ZX_OK)
         return result;
 
-    uint32_t koid = (uint32_t)proc_dispatcher->get_koid();
+    uint32_t koid = (uint32_t)new_process_handle.dispatcher()->get_koid();
     ktrace(TAG_PROC_CREATE, koid, 0, 0, 0);
     ktrace_name(TAG_PROC_NAME, koid, 0, buf);
 
     // Give arch-specific tracing a chance to record process creation.
-    arch_trace_process_create(koid, vmar_dispatcher->vmar()->aspace()->arch_aspace().arch_table_phys());
+    arch_trace_process_create(
+        koid, new_vmar_handle.dispatcher()->vmar()->aspace()->arch_aspace().arch_table_phys());
 
-    result = proc_handle->make(ktl::move(proc_dispatcher), proc_rights);
+    result = proc_handle->make(ktl::move(new_process_handle), proc_rights);
     if (result == ZX_OK)
-        result = vmar_handle->make(ktl::move(vmar_dispatcher), vmar_rights);
+        result = vmar_handle->make(ktl::move(new_vmar_handle), vmar_rights);
     return result;
 }
 
@@ -424,16 +409,18 @@ zx_status_t sys_process_start(zx_handle_t process_handle, zx_handle_t thread_han
     // test that the thread belongs to the starting process
     if (thread->process() != process.get())
         return ZX_ERR_ACCESS_DENIED;
-    if (!arg_handle)
-        return ZX_ERR_BAD_HANDLE;
-    if (!arg_handle->HasRights(ZX_RIGHT_TRANSFER))
-        return ZX_ERR_ACCESS_DENIED;
 
-    auto arg_nhv = process->MapHandleToValue(arg_handle);
-    process->AddHandle(ktl::move(arg_handle));
+    zx_handle_t arg_nhv = ZX_HANDLE_INVALID;
+    if (arg_handle) {
+        if (!arg_handle->HasRights(ZX_RIGHT_TRANSFER))
+            return ZX_ERR_ACCESS_DENIED;
+        arg_nhv = process->MapHandleToValue(arg_handle);
+        process->AddHandle(ktl::move(arg_handle));
+    }
 
-    status = thread->Start(pc, sp, static_cast<uintptr_t>(arg_nhv),
-                           arg2, /* initial_thread */ true);
+    status =
+        thread->Start(ThreadDispatcher::EntryState{pc, sp, static_cast<uintptr_t>(arg_nhv), arg2},
+                      /* initial_thread */ true);
     if (status != ZX_OK) {
         // Remove |arg_handle| from the process that failed to start.
         process->RemoveHandle(arg_nhv);
@@ -591,13 +578,17 @@ zx_status_t sys_process_write_memory(zx_handle_t handle, zx_vaddr_t vaddr,
 }
 
 // helper routine for sys_task_kill
-template <typename T>
+template <typename T, bool retcode>
 static zx_status_t kill_task(fbl::RefPtr<Dispatcher> dispatcher) {
     auto task = DownCastDispatcher<T>(&dispatcher);
     if (!task)
         return ZX_ERR_WRONG_TYPE;
 
-    task->Kill();
+    if constexpr (retcode) {
+        task->Kill(ZX_TASK_RETCODE_SYSCALL_KILL);
+    } else {
+        task->Kill();
+    }
     return ZX_OK;
 }
 
@@ -614,12 +605,12 @@ zx_status_t sys_task_kill(zx_handle_t task_handle) {
 
     // see if it's a process or thread and dispatch accordingly
     switch (dispatcher->get_type()) {
-    case ZX_OBJ_TYPE_PROCESS:
-        return kill_task<ProcessDispatcher>(ktl::move(dispatcher));
-    case ZX_OBJ_TYPE_THREAD:
-        return kill_task<ThreadDispatcher>(ktl::move(dispatcher));
     case ZX_OBJ_TYPE_JOB:
-        return kill_task<JobDispatcher>(ktl::move(dispatcher));
+        return kill_task<JobDispatcher, true>(ktl::move(dispatcher));
+    case ZX_OBJ_TYPE_PROCESS:
+        return kill_task<ProcessDispatcher, true>(ktl::move(dispatcher));
+    case ZX_OBJ_TYPE_THREAD:
+        return kill_task<ThreadDispatcher, false>(ktl::move(dispatcher));
     default:
         return ZX_ERR_WRONG_TYPE;
     }
@@ -646,11 +637,11 @@ zx_status_t sys_job_create(zx_handle_t parent_job, uint32_t options,
         }
     }
 
-    fbl::RefPtr<Dispatcher> job;
+    KernelHandle<JobDispatcher> handle;
     zx_rights_t rights;
-    status = JobDispatcher::Create(options, ktl::move(parent), &job, &rights);
+    status = JobDispatcher::Create(options, ktl::move(parent), &handle, &rights);
     if (status == ZX_OK)
-        status = out->make(ktl::move(job), rights);
+        status = out->make(ktl::move(handle), rights);
     return status;
 }
 

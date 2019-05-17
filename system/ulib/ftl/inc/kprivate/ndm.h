@@ -68,7 +68,7 @@ typedef struct {
     ui32 is_block_bad;    // number of is_block_bad() calls
 } NdmDvrStats;
 
-// Driver Interface Structure
+// TargetNDM Configuration Structure
 typedef struct {
     ui32 num_blocks;     // total number of blocks on device
     ui32 max_bad_blocks; // maximum number of bad blocks
@@ -86,7 +86,7 @@ typedef struct {
     int (*read_pages)(ui32 pn, ui32 count, ui8* data, ui8* spare, void* dev);
     int (*transfer_page)(ui32 old_pn, ui32 new_pn, ui8* data, ui8* old_spare, ui8* new_spare,
                          int encode_spare, void* dev);
-#if INC_FFS_NDM_MLC || INC_FTL_NDM_MLC
+#if INC_FTL_NDM_MLC
     ui32 (*pair_offset)(ui32 page_offset, void* dev);
 #endif
     int (*read_decode_spare)(ui32 pn, ui8* spare, void* dev);
@@ -102,10 +102,6 @@ typedef struct {
     int (*rd_raw_page)(ui32 p, void* data, void* dev);
 #endif
 } NDMDrvr;
-
-// NDM Control Block
-typedef struct ndm* NDM;
-typedef const struct ndm* CNDM;
 
 /***********************************************************************/
 /* Functions Prototypes                                                */
@@ -123,23 +119,13 @@ int ndmSetNumPartitions(NDM ndm, ui32 num_partitions);
 int ndmReadPartition(CNDM ndm, NDMPartition* part, ui32 part_num);
 const NDMPartition* ndmGetPartition(CNDM ndm, ui32 part_num);
 int ndmWritePartition(NDM ndm, const NDMPartition* part, ui32 part_num, const char* name);
-int ndmErasePartition(NDM ndm, ui32 part_num);
-void ndmDeletePartition(CNDM ndm, ui32 part_num);
 void ndmDeletePartitionTable(NDM ndm);
 int ndmSavePartitionTable(NDM ndm);
 int ndmDelVols(CNDM ndm);
 int ndmDelVol(CNDM ndm, ui32 part_num);
-int ndmWrFatPartition(NDM ndm, ui32 part_num);
 
-// User Volume API
-int ndmEraseBlock(ui32 pn, void* ndm_ptr);
-int ndmReadPages(ui32 start_pn, ui32 count, void* data, void* spare, void* ndm_ptr);
-int ndmWritePages(ui32 start_pn, ui32 count, const void* data, void* spare, void* ndm_ptr);
-
-// FAT/XFS/FFS Volume API
-int ndmAddVolFatFTL(NDM ndm, ui32 part_no, FtlNdmVol* ftl, FatVol* fat);
-int ndmAddVolXfsFTL(NDM ndm, ui32 part_no, FtlNdmVol* ftl, XfsVol* xfs);
-int ndmAddVolFFS(NDM ndm, ui32 part_num, FfsVol* ffs_dvr);
+// FTL Volume API
+int ndmAddVolFTL(NDM ndm, ui32 part_no, FtlNdmVol* ftl, XfsVol* xfs);
 
 // Driver Test/Special Routines
 int ndmExtractBBL(NDM ndm);

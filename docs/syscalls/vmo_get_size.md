@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-vmo_get_size - read the current size of a VMO object
+Read the current size of a VMO object.
 
 ## SYNOPSIS
 
@@ -41,7 +41,7 @@ of failure, a negative error value is returned.
 
 ## SEE ALSO
 
- - [`zx_vmo_clone()`]
+ - [`zx_vmo_create_child()`]
  - [`zx_vmo_create()`]
  - [`zx_vmo_op_range()`]
  - [`zx_vmo_read()`]
@@ -50,7 +50,7 @@ of failure, a negative error value is returned.
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 
-[`zx_vmo_clone()`]: vmo_clone.md
+[`zx_vmo_create_child()`]: vmo_create_child.md
 [`zx_vmo_create()`]: vmo_create.md
 [`zx_vmo_op_range()`]: vmo_op_range.md
 [`zx_vmo_read()`]: vmo_read.md

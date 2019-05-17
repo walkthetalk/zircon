@@ -32,7 +32,7 @@ void UsbVirtualDevice::UsbDciRequestQueue(usb_request_t* req,
     bus_->UsbDciRequestQueue(req, complete_cb);
 }
 
-zx_status_t UsbVirtualDevice::UsbDciSetInterface(const usb_dci_interface_t* dci_intf) {
+zx_status_t UsbVirtualDevice::UsbDciSetInterface(const usb_dci_interface_protocol_t* dci_intf) {
     return bus_->UsbDciSetInterface(dci_intf);
 }
 
@@ -43,6 +43,10 @@ zx_status_t UsbVirtualDevice::UsbDciConfigEp(const usb_endpoint_descriptor_t* ep
 
 zx_status_t UsbVirtualDevice::UsbDciDisableEp(uint8_t ep_address) {
     return bus_->UsbDciDisableEp(ep_address);
+}
+
+zx_status_t UsbVirtualDevice::UsbDciCancelAll(uint8_t ep) {
+    return bus_->UsbDciCancelAll(ep);
 }
 
 zx_status_t UsbVirtualDevice::UsbDciEpSetStall(uint8_t ep_address) {

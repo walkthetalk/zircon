@@ -52,6 +52,7 @@ typedef struct __attribute__((packed)) intel_serialio_i2c_regs {
     uint32_t _reserved4[21];
     uint32_t comp_param1;
     uint32_t comp_ver;
+    uint32_t comp_type;
 } intel_serialio_i2c_regs;
 _Static_assert(sizeof(intel_serialio_i2c_regs) <= 0x200, "bad struct");
 
@@ -153,6 +154,9 @@ typedef struct intel_serialio_i2c_device {
     uint16_t fmp_scl_hcnt;
     uint16_t fmp_scl_lcnt;
 
+    uint8_t rx_fifo_depth;
+    uint8_t tx_fifo_depth;
+
     struct list_node slave_list;
 
     mtx_t mutex;
@@ -177,6 +181,8 @@ zx_status_t intel_serialio_i2c_wait_for_stop_detect(
 zx_status_t intel_serialio_i2c_issue_rx(
     intel_serialio_i2c_device_t* controller,
     uint32_t data_cmd);
+zx_status_t intel_serialio_i2c_flush_rx_full_irq(
+    intel_serialio_i2c_device_t* controller);
 zx_status_t intel_serialio_i2c_read_rx(
     intel_serialio_i2c_device_t* controller,
     uint8_t* data);

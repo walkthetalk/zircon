@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FDIO_LIMITS_H_
+#define LIB_FDIO_LIMITS_H_
 
 #include <limits.h>
 
 // Maximum number of fds per process.
-#define FDIO_MAX_FD 256
-
-// Maximum handles used in open/clone/create.
-#define FDIO_MAX_HANDLES 3
+// TODO(ZX-3951): Investigate making the array expand dynamically to avoid
+// having to increase this further.
+#define FDIO_MAX_FD 1024
 
 // fdio_ops_t's read/write are able to do io of
 // at least this size.
@@ -21,3 +21,5 @@
 
 // Maximum length of a filename.
 #define FDIO_MAX_FILENAME NAME_MAX
+
+#endif  // LIB_FDIO_LIMITS_H_

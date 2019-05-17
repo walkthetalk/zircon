@@ -16,8 +16,8 @@
 
 #include "eth-client.h"
 
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/hardware/ethernet/c/fidl.h>
-#include <zircon/device/device.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/time.h>
@@ -27,7 +27,9 @@
 #include <inet6/netifc.h>
 
 #include <lib/fdio/io.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fdio/watcher.h>
 
 #define ALIGN(n, a) (((n) + ((a) - 1)) & ~((a) - 1))
@@ -63,6 +65,8 @@ static zx_handle_t netsvc = ZX_HANDLE_INVALID;
 static eth_client_t* eth;
 static uint8_t netmac[6];
 static size_t netmtu;
+
+static bool netifc_open_quiet = false;
 
 static zx_handle_t iovmo;
 static void* iobuf;
@@ -255,7 +259,9 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
         return ZX_OK;
     }
 
-    printf("netifc: ? /dev/class/ethernet/%s\n", fn);
+    if (!netifc_open_quiet) {
+        printf("netifc: ? /dev/class/ethernet/%s\n", fn);
+    }
 
     mtx_lock(&eth_lock);
     int fd;
@@ -263,15 +269,28 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
         goto finish;
     }
 
+    zx_status_t status = fdio_get_service_handle(fd, &netsvc);
+    if (status != ZX_OK) {
+        goto fail_close_svc;
+    }
+
     // If an interface was specified, check the topological path of this device and reject it if it
     // doesn't match.
     if (cookie != NULL) {
         const char* interface = cookie;
         char buf[1024];
-        if (ioctl_device_get_topo_path(fd, buf, sizeof(buf)) < 0) {
-            close(fd);
-            goto finish;
+        zx_status_t call_status;
+        size_t actual_len;
+        status = fuchsia_device_ControllerGetTopologicalPath(netsvc, &call_status,
+                                                             buf, sizeof(buf) - 1, &actual_len);
+        if (status == ZX_OK) {
+            status = call_status;
         }
+        if (status != ZX_OK) {
+            goto fail_close_svc;
+        }
+        buf[actual_len] = 0;
+
         const char* topo_path = buf;
         // Skip the instance sigil if it's present in either the topological path or the given
         // interface path.
@@ -279,14 +298,8 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
         if (interface[0] == '@') interface++;
 
         if (strncmp(topo_path, interface, sizeof(buf))) {
-            close(fd);
-            goto finish;
+            goto fail_close_svc;
         }
-    }
-
-    zx_status_t status = fdio_get_service_handle(fd, &netsvc);
-    if (status != ZX_OK) {
-        goto finish;
     }
 
     fuchsia_hardware_ethernet_Info info;
@@ -325,7 +338,8 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
             iovmo = ZX_HANDLE_INVALID;
             goto fail_close_svc;
         }
-        printf("netifc: create %zu eth buffers\n", eth_buffer_count);
+        if (!netifc_open_quiet)
+            printf("netifc: create %zu eth buffers\n", eth_buffer_count);
         // assign data chunks to ethbufs
         for (unsigned n = 0; n < eth_buffer_count; n++) {
             eth_buffer_base[n].magic = ETH_BUFFER_MAGIC;
@@ -349,7 +363,7 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
         goto fail_destroy_client;
     }
 
-    ip6_init(netmac);
+    ip6_init(netmac, netifc_open_quiet);
 
     // enqueue rx buffers
     for (unsigned n = 0; n < NET_BUFFERS; n++) {
@@ -363,7 +377,8 @@ static zx_status_t netifc_open_cb(int dirfd, int event, const char* fn, void* co
     }
 
     mtx_unlock(&eth_lock);
-    printf("netsvc: using /dev/class/ethernet/%s\n", fn);
+    if (!netifc_open_quiet)
+        printf("netsvc: using /dev/class/ethernet/%s\n", fn);
 
     // stop polling
     return ZX_ERR_STOP;
@@ -379,7 +394,9 @@ finish:
     return ZX_OK;
 }
 
-int netifc_open(const char* interface) {
+int netifc_open(const char* interface, bool quiet) {
+    netifc_open_quiet = quiet;
+
     int dirfd;
     if ((dirfd = open("/dev/class/ethernet", O_DIRECTORY|O_RDONLY)) < 0) {
         return -1;

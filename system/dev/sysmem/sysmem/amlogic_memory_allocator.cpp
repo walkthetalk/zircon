@@ -56,7 +56,7 @@ zx_status_t AmlogicMemoryAllocator::Allocate(size_t size, zx::vmo* vmo) {
         }
     }
 
-    auto region = fbl::make_unique<Region>();
+    auto region = std::make_unique<Region>();
     zx_status_t status = protected_allocator_.GetRegion(size, ZX_PAGE_SIZE, region->region);
 
     if (status != ZX_OK) {
@@ -65,6 +65,7 @@ zx_status_t AmlogicMemoryAllocator::Allocate(size_t size, zx::vmo* vmo) {
     }
     // The VMO created here is a sub-region of contiguous_vmo_.
     // TODO: stop handing out phsyical VMOs when we can hand out non-COW clone VMOs instead.
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     status = zx_vmo_create_physical(get_root_resource(), region->region->base, size,
                                     vmo->reset_and_get_address());
     if (status != ZX_OK) {
@@ -76,5 +77,11 @@ zx_status_t AmlogicMemoryAllocator::Allocate(size_t size, zx::vmo* vmo) {
         DRIVER_ERROR("Failed to create duplicate VMO: %d\n", status);
         return status;
     }
+    return ZX_OK;
+}
+
+zx_status_t AmlogicMemoryAllocator::GetProtectedMemoryInfo(uint64_t* base, uint64_t* size) {
+    *base = start_;
+    *size = size_;
     return ZX_OK;
 }

@@ -21,8 +21,8 @@ bool no_two_same_attribute_test() {
 library fidl.test.dupattributes;
 
 [dup = "first", dup = "second"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
@@ -43,8 +43,8 @@ library fidl.test.dupattributes;
 
 /// first
 [Doc = "second"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
@@ -87,8 +87,8 @@ bool warn_on_close_attribute_test() {
 library fidl.test.dupattributes;
 
 [Duc = "should be Doc"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
@@ -100,6 +100,31 @@ interface A {
     END_TEST;
 }
 
+// This tests our ability to treat warnings as errors.  It is here because this
+// is the most convenient warning.
+bool warnings_as_errors_test() {
+    BEGIN_TEST;
+
+    TestLibrary library("dup_attributes.fidl", R"FIDL(
+library fidl.test.dupattributes;
+
+[Duc = "should be Doc"]
+protocol A {
+    MethodA();
+};
+
+)FIDL");
+    library.set_warnings_as_errors(true);
+    EXPECT_FALSE(library.Compile());
+    auto warnings = library.warnings();
+    ASSERT_EQ(warnings.size(), 0);
+    auto errors = library.errors();
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_STR_STR(errors[0].c_str(), "suspect attribute with name 'Duc'; did you mean 'Doc'?");
+
+    END_TEST;
+}
+
 bool empty_transport() {
     BEGIN_TEST;
 
@@ -107,15 +132,15 @@ bool empty_transport() {
 library fidl.test.transportattributes;
 
 [Transport]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
     EXPECT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "invalid value");
+    ASSERT_STR_STR(errors[0].c_str(), "invalid transport");
 
     END_TEST;
 }
@@ -127,15 +152,15 @@ bool bogus_transport() {
 library fidl.test.transportattributes;
 
 [Transport = "Bogus"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
     EXPECT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "invalid value");
+    ASSERT_STR_STR(errors[0].c_str(), "invalid transport");
 
     END_TEST;
 }
@@ -147,8 +172,8 @@ bool channel_transport() {
 library fidl.test.transportattributes;
 
 [Transport = "Channel"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
@@ -166,14 +191,53 @@ bool socket_control_transport() {
 library fidl.test.transportattributes;
 
 [Transport = "SocketControl"]
-interface A {
-    1: MethodA();
+protocol A {
+    MethodA();
 };
 
 )FIDL");
     EXPECT_TRUE(library.Compile());
     ASSERT_EQ(library.errors().size(), 0);
     ASSERT_EQ(library.warnings().size(), 0);
+
+    END_TEST;
+}
+
+bool multiple_transports() {
+    BEGIN_TEST;
+
+    TestLibrary library("transport_attribuets.fidl", R"FIDL(
+library fidl.test.transportattributes;
+
+[Transport = "SocketControl, OvernetInternal"]
+protocol A {
+    MethodA();
+};
+
+)FIDL");
+    EXPECT_TRUE(library.Compile());
+    ASSERT_EQ(library.errors().size(), 0);
+    ASSERT_EQ(library.warnings().size(), 0);
+
+    END_TEST;
+}
+
+bool multiple_transports_with_bogus() {
+    BEGIN_TEST;
+
+    TestLibrary library("transport_attribuets.fidl", R"FIDL(
+library fidl.test.transportattributes;
+
+[Transport = "SocketControl,Bogus, OvernetInternal"]
+protocol A {
+    MethodA();
+};
+
+)FIDL");
+    EXPECT_FALSE(library.Compile());
+    auto errors = library.errors();
+    ASSERT_EQ(errors.size(), 1);
+    ASSERT_STR_STR(errors[0].c_str(), "invalid transport");
 
     END_TEST;
 }
@@ -213,9 +277,9 @@ table MyTable {
 };
 
 [Layout = "Simple"]
-interface MyInterface {
+protocol MyInterface {
     [Layout = "Simple"]
-    1: MyMethod();
+    MyMethod();
 };
 
 )FIDL");
@@ -228,7 +292,7 @@ interface MyInterface {
 }
 
 bool MustHaveThreeMembers(fidl::ErrorReporter* error_reporter,
-                          const fidl::raw::Attribute* attribute,
+                          const fidl::raw::Attribute& attribute,
                           const fidl::flat::Decl* decl) {
     switch (decl->kind) {
     case fidl::flat::Decl::Kind::kStruct: {
@@ -256,16 +320,17 @@ struct MyStruct {
 
 )FIDL");
     library.AddAttributeSchema("MustHaveThreeMembers", fidl::flat::AttributeSchema({
-        fidl::flat::AttributeSchema::Placement::kStructDecl,
-    }, {
-        "",
-    },
-    MustHaveThreeMembers));
+                                                                                       fidl::flat::AttributeSchema::Placement::kStructDecl,
+                                                                                   },
+                                                                                   {
+                                                                                       "",
+                                                                                   },
+                                                                                   MustHaveThreeMembers));
     EXPECT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
     ASSERT_STR_STR(errors[0].c_str(),
-        "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
+                   "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
 
     END_TEST;
 }
@@ -276,22 +341,23 @@ bool constraint_only_three_members_on_method() {
     TestLibrary library(R"FIDL(
 library fidl.test;
 
-interface MyInterface {
+protocol MyInterface {
     [MustHaveThreeMembers] MyMethod();
 };
 
 )FIDL");
     library.AddAttributeSchema("MustHaveThreeMembers", fidl::flat::AttributeSchema({
-        fidl::flat::AttributeSchema::Placement::kMethod,
-    }, {
-        "",
-    },
-    MustHaveThreeMembers));
+                                                                                       fidl::flat::AttributeSchema::Placement::kMethod,
+                                                                                   },
+                                                                                   {
+                                                                                       "",
+                                                                                   },
+                                                                                   MustHaveThreeMembers));
     EXPECT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
     ASSERT_STR_STR(errors[0].c_str(),
-        "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
+                   "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
 
     END_TEST;
 }
@@ -303,23 +369,24 @@ bool constraint_only_three_members_on_interface() {
 library fidl.test;
 
 [MustHaveThreeMembers]
-interface MyInterface {
+protocol MyInterface {
     MyMethod();
     MySecondMethod();
 };
 
 )FIDL");
     library.AddAttributeSchema("MustHaveThreeMembers", fidl::flat::AttributeSchema({
-        fidl::flat::AttributeSchema::Placement::kInterfaceDecl,
-    }, {
-        "",
-    },
-    MustHaveThreeMembers));
+                                                                                       fidl::flat::AttributeSchema::Placement::kInterfaceDecl,
+                                                                                   },
+                                                                                   {
+                                                                                       "",
+                                                                                   },
+                                                                                   MustHaveThreeMembers));
     EXPECT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 2); // 2 because there are two methods
     ASSERT_STR_STR(errors[0].c_str(),
-        "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
+                   "declaration did not satisfy constraint of attribute 'MustHaveThreeMembers' with value ''");
 
     END_TEST;
 }
@@ -340,7 +407,7 @@ table MyTable {
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
     ASSERT_STR_STR(errors[0].c_str(),
-        "too large: only 27 bytes allowed, but 40 bytes found");
+                   "too large: only 27 bytes allowed, but 40 bytes found");
 
     END_TEST;
 }
@@ -363,7 +430,7 @@ union MyUnion {
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
     ASSERT_STR_STR(errors[0].c_str(),
-        "too many handles: only 2 allowed, but 6 found");
+                   "too many handles: only 2 allowed, but 6 found");
 
     END_TEST;
 }
@@ -384,29 +451,32 @@ union MyUnion {
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
     ASSERT_STR_STR(errors[0].c_str(),
-        "placement of attribute");
+                   "placement of attribute");
     ASSERT_STR_STR(errors[0].c_str(),
-        "disallowed here");
+                   "disallowed here");
 
     END_TEST;
 }
 
 } // namespace
 
-BEGIN_TEST_CASE(attributes_tests);
-RUN_TEST(no_two_same_attribute_test);
-RUN_TEST(no_two_same_doc_attribute_test);
-RUN_TEST(no_two_same_attribute_on_library_test);
-RUN_TEST(warn_on_close_attribute_test);
-RUN_TEST(empty_transport);
-RUN_TEST(bogus_transport);
-RUN_TEST(channel_transport);
-RUN_TEST(socket_control_transport);
-RUN_TEST(incorrect_placement_layout);
-RUN_TEST(constraint_only_three_members_on_struct);
-RUN_TEST(constraint_only_three_members_on_method);
-RUN_TEST(constraint_only_three_members_on_interface);
-RUN_TEST(max_bytes);
-RUN_TEST(max_handles);
-RUN_TEST(selector_incorrect_placement);
-END_TEST_CASE(attributes_tests);
+BEGIN_TEST_CASE(attributes_tests)
+RUN_TEST(no_two_same_attribute_test)
+RUN_TEST(no_two_same_doc_attribute_test)
+RUN_TEST(no_two_same_attribute_on_library_test)
+RUN_TEST(warn_on_close_attribute_test)
+RUN_TEST(warnings_as_errors_test)
+RUN_TEST(empty_transport)
+RUN_TEST(bogus_transport)
+RUN_TEST(channel_transport)
+RUN_TEST(socket_control_transport)
+RUN_TEST(multiple_transports)
+RUN_TEST(multiple_transports_with_bogus)
+RUN_TEST(incorrect_placement_layout)
+RUN_TEST(constraint_only_three_members_on_struct)
+RUN_TEST(constraint_only_three_members_on_method)
+RUN_TEST(constraint_only_three_members_on_interface)
+RUN_TEST(max_bytes)
+RUN_TEST(max_handles)
+RUN_TEST(selector_incorrect_placement)
+END_TEST_CASE(attributes_tests)

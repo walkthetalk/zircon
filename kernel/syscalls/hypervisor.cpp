@@ -12,6 +12,7 @@
 #include <object/process_dispatcher.h>
 #include <object/resource.h>
 #include <object/vcpu_dispatcher.h>
+#include <object/vm_address_region_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
 
 #include <fbl/ref_ptr.h>
@@ -28,17 +29,18 @@ zx_status_t sys_guest_create(zx_handle_t resource, uint32_t options, user_out_ha
     if (status != ZX_OK)
         return status;
 
-    fbl::RefPtr<Dispatcher> guest_dispatcher, vmar_dispatcher;
+    KernelHandle<GuestDispatcher> new_guest_handle;
+    KernelHandle<VmAddressRegionDispatcher> new_vmar_handle;
     zx_rights_t guest_rights, vmar_rights;
     status =
-        GuestDispatcher::Create(&guest_dispatcher, &guest_rights, &vmar_dispatcher, &vmar_rights);
+        GuestDispatcher::Create(&new_guest_handle, &guest_rights, &new_vmar_handle, &vmar_rights);
     if (status != ZX_OK)
         return status;
 
-    status = guest_handle->make(ktl::move(guest_dispatcher), guest_rights);
+    status = guest_handle->make(ktl::move(new_guest_handle), guest_rights);
     if (status != ZX_OK)
         return status;
-    return vmar_handle->make(ktl::move(vmar_dispatcher), vmar_rights);
+    return vmar_handle->make(ktl::move(new_vmar_handle), vmar_rights);
 }
 
 // zx_status_t zx_guest_set_trap
@@ -73,13 +75,13 @@ zx_status_t sys_vcpu_create(zx_handle_t guest_handle, uint32_t options,
     if (status != ZX_OK)
         return status;
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<VcpuDispatcher> handle;
     zx_rights_t rights;
-    status = VcpuDispatcher::Create(guest, entry, &dispatcher, &rights);
+    status = VcpuDispatcher::Create(guest, entry, &handle, &rights);
     if (status != ZX_OK)
         return status;
 
-    return out->make(ktl::move(dispatcher), rights);
+    return out->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_vcpu_resume

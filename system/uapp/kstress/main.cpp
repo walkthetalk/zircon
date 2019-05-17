@@ -5,7 +5,9 @@
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
 #include <fuchsia/sysinfo/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/resource.h>
 #include <zircon/status.h>
@@ -135,6 +137,11 @@ int main(int argc, char** argv) {
     } else {
         printf("Running stress tests continually\n");
     }
+
+
+#ifdef DISABLE_VMSTRESS
+    printf("NOTE: vmstress is disabled because enable_fair_scheduler is not set.\n");
+#endif
 
     // initialize all the tests
     for (auto& test : StressTest::tests()) {

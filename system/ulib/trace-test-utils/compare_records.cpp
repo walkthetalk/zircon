@@ -41,11 +41,14 @@ bool CompareRecords(const fbl::Vector<trace::Record>& records,
         if (num_recs == max_num_records)
             break;
         const auto& record = records[i];
-        fbl::String str = record.ToString();
-        buf.Append(squelcher->Squelch(str.c_str()));
+        fbl::String from_str = record.ToString();
+        fbl::String to_str = squelcher->Squelch(from_str.c_str());
+
+        buf.Append(to_str);
         buf.Append('\n');
         ++num_recs;
     }
+
     if (strcmp(buf.c_str(), expected) != 0) {
         fprintf(stderr, "Records do not match expected contents:\n");
         fprintf(stderr, "Buffer:\n%s\n", buf.c_str());

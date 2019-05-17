@@ -5,8 +5,10 @@
 #include <zircon/compiler.h>
 
 #include "devhost.h"
+#include "scheduler_profile.h"
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <zircon/device/vfs.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -57,7 +59,7 @@ __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* paren
 
     {
         ApiAutoLock lock;
-        r = devhost_device_create(drv, parent_ref, args->name, args->ctx, args->ops, &dev);
+        r = devhost_device_create(drv, args->name, args->ctx, args->ops, &dev);
         if (r != ZX_OK) {
             return r;
         }
@@ -100,14 +102,21 @@ __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* paren
         }
     }
 
-    // This needs to be called outside the ApiAutoLock, as device_open_at will be called.
     if (dev && client_remote.is_valid()) {
-        devhost_device_connect(dev, std::move(client_remote));
-    }
+        // This needs to be called outside the ApiAutoLock, as device_open will be called
+        devhost_device_connect(dev, ZX_FS_RIGHT_READABLE | ZX_FS_RIGHT_WRITABLE,
+                               std::move(client_remote));
 
-    // Leak the reference that was written to |out|, it will be recovered in
-    // device_remove().
-    __UNUSED auto ptr = dev.leak_ref();
+        // Leak the reference that was written to |out|, it will be recovered in device_remove().
+        // For device instances we mimic the behavior of |open| by not leaking the reference,
+        // effectively passing owenership to the new connection.
+        if (!(args->flags & DEVICE_ADD_INSTANCE)) {
+            __UNUSED auto ptr = dev.leak_ref();
+        }
+    } else {
+        // Leak the reference that was written to |out|, it will be recovered in device_remove().
+        __UNUSED auto ptr = dev.leak_ref();
+    }
 
     return r;
 }
@@ -130,6 +139,11 @@ __EXPORT void device_make_visible(zx_device_t* dev) {
     ApiAutoLock lock;
     fbl::RefPtr<zx_device_t> dev_ref(dev);
     devhost_make_visible(dev_ref);
+}
+
+__EXPORT zx_status_t device_get_profile(zx_device_t* dev, uint32_t priority, const char* name,
+                                        zx_handle_t* out_profile) {
+    return devhost_get_scheduler_profile(priority, name, out_profile);
 }
 
 __EXPORT const char* device_get_name(zx_device_t* dev) {
@@ -177,17 +191,13 @@ __EXPORT zx_status_t device_write(zx_device_t* dev, const void* buf, size_t coun
     return dev->ops->write(dev->ctx, buf, count, off, actual);
 }
 
-__EXPORT zx_status_t device_ioctl(zx_device_t* dev, uint32_t op, const void* in_buf, size_t in_len,
-                                  void* out_buf, size_t out_len, size_t* out_actual) {
-    return dev->ops->ioctl(dev->ctx, op, in_buf, in_len, out_buf, out_len, out_actual);
-}
-
 // LibDriver Misc Interfaces
 
 namespace devmgr {
 extern zx_handle_t root_resource_handle;
 } // namespace devmgr
 
+// Please do not use get_root_resource() in new code. See ZX-1467.
 __EXPORT zx_handle_t get_root_resource() {
     return root_resource_handle;
 }
@@ -211,14 +221,13 @@ zx_status_t device_unbind(const fbl::RefPtr<zx_device_t>& dev) {
     return devhost_device_unbind(dev);
 }
 
-zx_status_t device_open_at(const fbl::RefPtr<zx_device_t>& dev, fbl::RefPtr<zx_device_t>* out,
-                           const char* path, uint32_t flags) {
+zx_status_t device_open(const fbl::RefPtr<zx_device_t>& dev, fbl::RefPtr<zx_device_t>* out,
+                        uint32_t flags) {
     ApiAutoLock lock;
-    return devhost_device_open_at(dev, out, path, flags);
+    return devhost_device_open(dev, out, flags);
 }
 
-// This function is intended to consume the reference produced by
-// device_open_at()
+// This function is intended to consume the reference produced by device_open()
 zx_status_t device_close(fbl::RefPtr<zx_device_t> dev, uint32_t flags) {
     ApiAutoLock lock;
     return devhost_device_close(std::move(dev), flags);
@@ -249,4 +258,14 @@ __EXPORT zx_status_t device_publish_metadata(zx_device_t* dev, const char* path,
     ApiAutoLock lock;
     auto dev_ref = fbl::WrapRefPtr(dev);
     return devhost_publish_metadata(dev_ref, path, type, data, length);
+}
+
+__EXPORT zx_status_t device_add_composite(
+        zx_device_t* dev, const char* name, const zx_device_prop_t* props, size_t props_count,
+        const device_component_t* components, size_t components_count,
+        uint32_t coresident_device_index) {
+    ApiAutoLock lock;
+    auto dev_ref = fbl::WrapRefPtr(dev);
+    return devhost_device_add_composite(dev_ref, name, props, props_count, components,
+                                        components_count, coresident_device_index);
 }

@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include <zircon/assert.h>
-#include <zircon/device/device.h>
 
 ParentDevice::ParentDevice(const TestConfig& config) : config_(config) {
     if (config_.path) {
@@ -25,7 +24,7 @@ ParentDevice::ParentDevice(const TestConfig& config) : config_(config) {
         } else {
             ram_nand_config.export_partition_map = false;
         }
-        if (fs_mgmt::RamNand::Create(&ram_nand_config, &ram_nand_) == ZX_OK) {
+        if (ramdevice_client::RamNand::Create(&ram_nand_config, &ram_nand_) == ZX_OK) {
             path_.Append(ram_nand_->path());
             config_.num_blocks = config.info.num_blocks;
         }

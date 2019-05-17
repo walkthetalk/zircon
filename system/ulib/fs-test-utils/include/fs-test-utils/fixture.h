@@ -12,9 +12,9 @@
 #include <fbl/string.h>
 #include <fbl/vector.h>
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
-#include <fvm/fvm.h>
+#include <fvm/format.h>
 #include <lib/zx/time.h>
+#include <ramdevice-client/ramdisk.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
@@ -35,7 +35,7 @@ namespace fs_test_utils {
 
 constexpr size_t kPathSize = PATH_MAX;
 
-constexpr size_t kFvmBlockSize = FVM_BLOCK_SIZE;
+constexpr size_t kFvmBlockSize = fvm::kBlockSize;
 
 // TODO(gevalentno): when ZX-2013 is resolved, make MemFs setup and teardown
 // part of the test fixture and remove RunWithMemFs.
@@ -162,6 +162,9 @@ public:
 
     // Checks the disk with fsck.
     zx_status_t Fsck() const;
+
+    // Format (or reformat) the device.
+    zx_status_t Format() const;
 
     // Sets up MemFs and Ramdisk, allocating resources for the tests.
     zx_status_t SetUpTestCase();

@@ -25,14 +25,13 @@ json_generator_tests_*.txt
 /infra/.recipe_deps
 /out*
 /prebuilt/downloads/
+/prebuilt/config.gni
 /prebuilt/config.mk
 /prebuilt/config.mk.bak
 /AnalysisResult/
 /public/banjo/
-/public/config/
 /public/fidl/
 /public/lib/
-/public/sysroot/
 /public/tool/
 .idea/
 CMakeLists.txt

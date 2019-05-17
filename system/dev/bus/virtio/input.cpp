@@ -23,139 +23,62 @@
 
 namespace virtio {
 
-// clang-format off
-
-const uint8_t kEventCodeMap[] = {
-    0,                                  // KEY_RESERVED (0)
-    41,                                 // KEY_ESC (1)
-    30,                                 // KEY_1 (2)
-    31,                                 // KEY_2 (3)
-    32,                                 // KEY_3 (4)
-    33,                                 // KEY_4 (5)
-    34,                                 // KEY_5 (6)
-    35,                                 // KEY_6 (7)
-    36,                                 // KEY_7 (8)
-    37,                                 // KEY_8 (9)
-    38,                                 // KEY_9 (10)
-    39,                                 // KEY_0 (11)
-    45,                                 // KEY_MINUS (12)
-    46,                                 // KEY_EQUAL (13)
-    42,                                 // KEY_BACKSPACE (14)
-    43,                                 // KEY_TAB (15)
-    20,                                 // KEY_Q (16)
-    26,                                 // KEY_W (17)
-    8,                                  // KEY_E (18)
-    21,                                 // KEY_R (19)
-    23,                                 // KEY_T (20)
-    28,                                 // KEY_Y (21)
-    24,                                 // KEY_U (22)
-    12,                                 // KEY_I (23)
-    18,                                 // KEY_O (24)
-    19,                                 // KEY_P (25)
-    47,                                 // KEY_LEFTBRACE (26)
-    48,                                 // KEY_RIGHTBRACE (27)
-    40,                                 // KEY_ENTER (28)
-    224,                                // KEY_LEFTCTRL (29)
-    4,                                  // KEY_A (30)
-    22,                                 // KEY_S (31)
-    7,                                  // KEY_D (32)
-    9,                                  // KEY_F (33)
-    10,                                 // KEY_G (34)
-    11,                                 // KEY_H (35)
-    13,                                 // KEY_J (36)
-    14,                                 // KEY_K (37)
-    15,                                 // KEY_L (38)
-    51,                                 // KEY_SEMICOLON (39)
-    52,                                 // KEY_APOSTROPHE (40)
-    53,                                 // KEY_GRAVE (41)
-    225,                                // KEY_LEFTSHIFT (42)
-    49,                                 // KEY_BACKSLASH (43)
-    29,                                 // KEY_Z (44)
-    27,                                 // KEY_X (45)
-    6,                                  // KEY_C (46)
-    25,                                 // KEY_V (47)
-    5,                                  // KEY_B (48)
-    17,                                 // KEY_N (49)
-    16,                                 // KEY_M (50)
-    54,                                 // KEY_COMMA (51)
-    55,                                 // KEY_DOT (52)
-    56,                                 // KEY_SLASH (53)
-    229,                                // KEY_RIGHTSHIFT (54)
-    85,                                 // KEY_KPASTERISK (55)
-    226,                                // KEY_LEFTALT (56)
-    44,                                 // KEY_SPACE (57)
-    57,                                 // KEY_CAPSLOCK (58)
-    58,                                 // KEY_F1 (59)
-    59,                                 // KEY_F2 (60)
-    60,                                 // KEY_F3 (61)
-    61,                                 // KEY_F4 (62)
-    62,                                 // KEY_F5 (63)
-    63,                                 // KEY_F6 (64)
-    64,                                 // KEY_F7 (65)
-    65,                                 // KEY_F8 (66)
-    66,                                 // KEY_F9 (67)
-    67,                                 // KEY_F10 (68)
-    83,                                 // KEY_NUMLOCK (69)
-    71,                                 // KEY_SCROLLLOCK (70)
-    95,                                 // KEY_KP7 (71)
-    96,                                 // KEY_KP8 (72)
-    97,                                 // KEY_KP9 (73)
-    86,                                 // KEY_KPMINUS (74)
-    92,                                 // KEY_KP4 (75)
-    93,                                 // KEY_KP5 (76)
-    94,                                 // KEY_KP6 (77)
-    87,                                 // KEY_KPPLUS (78)
-    89,                                 // KEY_KP1 (79)
-    90,                                 // KEY_KP2 (80)
-    91,                                 // KEY_KP3 (81)
-    98,                                 // KEY_KP0 (82)
-    99,                                 // KEY_KPDOT (83)
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Unsupported
-    228,                                // KEY_RIGHTCTRL (97)
-    0, 0,                               // Unsupported
-    230,                                // KEY_RIGHTALT (100)
-};
-
-static const uint8_t kbd_hid_report_desc[] = {
-    0x05, 0x01, // Usage Page (Generic Desktop Ctrls)
-    0x09, 0x06, // Usage (Keyboard)
-    0xA1, 0x01, // Collection (Application)
-    0x05, 0x07, //   Usage Page (Kbrd/Keypad)
-    0x19, 0xE0, //   Usage Minimum (0xE0)
-    0x29, 0xE7, //   Usage Maximum (0xE7)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x01, //   Logical Maximum (1)
-    0x75, 0x01, //   Report Size (1)
-    0x95, 0x08, //   Report Count (8)
-    0x81, 0x02, //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x08, //   Report Size (8)
-    0x81, 0x01, //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x95, 0x05, //   Report Count (5)
-    0x75, 0x01, //   Report Size (1)
-    0x05, 0x08, //   Usage Page (LEDs)
-    0x19, 0x01, //   Usage Minimum (Num Lock)
-    0x29, 0x05, //   Usage Maximum (Kana)
-    0x91, 0x02, //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,
-                //   Non-volatile)
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x03, //   Report Size (3)
-    0x91, 0x01, //   Output (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position,
-                //   Non-volatile)
-    0x95, 0x06, //   Report Count (6)
-    0x75, 0x08, //   Report Size (8)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x65, //   Logical Maximum (101)
-    0x05, 0x07, //   Usage Page (Kbrd/Keypad)
-    0x19, 0x00, //   Usage Minimum (0x00)
-    0x29, 0x65, //   Usage Maximum (0x65)
-    0x81, 0x00, //   Input (Data,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0xC0,       // End Collection
-};
-
-// clang-format on
-
 // DDK level ops
+static zx_status_t virtio_input_OpenClient(void* ctx, uint32_t id, zx_handle_t handle,
+                                           fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceOpenClient_reply(txn, ZX_ERR_NOT_SUPPORTED);
+}
+
+static zx_status_t virtio_input_ClrSetFeature(void* ctx, uint32_t clr, uint32_t set,
+                                              fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceClrSetFeature_reply(txn, ZX_ERR_NOT_SUPPORTED, 0);
+}
+
+static zx_status_t virtio_input_GetWindowSize(void* ctx, fidl_txn_t* txn) {
+    fuchsia_hardware_pty_WindowSize wsz = {
+        .width = 0,
+        .height = 0
+    };
+    return fuchsia_hardware_pty_DeviceGetWindowSize_reply(txn, ZX_ERR_NOT_SUPPORTED, &wsz);
+}
+
+static zx_status_t virtio_input_MakeActive(void* ctx, uint32_t client_pty_id, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceMakeActive_reply(txn, ZX_ERR_NOT_SUPPORTED);
+}
+
+static zx_status_t virtio_input_ReadEvents(void* ctx, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceReadEvents_reply(txn, ZX_ERR_NOT_SUPPORTED, 0);
+}
+
+static zx_status_t virtio_input_SetWindowSize(void* ctx,
+                                              const fuchsia_hardware_pty_WindowSize* size,
+                                              fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceSetWindowSize_reply(txn, ZX_ERR_NOT_SUPPORTED);
+}
+
+static fuchsia_hardware_pty_Device_ops_t fidl_ops = {
+    .OpenClient = virtio_input_OpenClient,
+    .ClrSetFeature = virtio_input_ClrSetFeature,
+    .GetWindowSize = virtio_input_GetWindowSize,
+    .MakeActive = virtio_input_MakeActive,
+    .ReadEvents = virtio_input_ReadEvents,
+    .SetWindowSize = virtio_input_SetWindowSize
+};
+
+static bool IsQemuTouchscreen(const virtio_input_config_t& config) {
+    if (config.u.ids.bustype == 0x06
+        && config.u.ids.vendor == 0x00
+        && config.u.ids.product == 0x00) {
+        if (config.u.ids.version == 0x01 || config.u.ids.version == 0x00) {
+            return true;
+        }
+    }
+    return false;
+}
+
+zx_status_t InputDevice::virtio_input_message(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_Device_dispatch(ctx, txn, msg, &fidl_ops);
+}
 
 void InputDevice::virtio_input_release(void* ctx) {
     virtio::InputDevice* inp = static_cast<virtio::InputDevice*>(ctx);
@@ -199,7 +122,7 @@ zx_status_t InputDevice::virtio_input_set_protocol(void* ctx, uint8_t protocol) 
     return ZX_OK;
 }
 
-zx_status_t InputDevice::virtio_input_start(void* ctx, const hidbus_ifc_t* ifc) {
+zx_status_t InputDevice::virtio_input_start(void* ctx, const hidbus_ifc_protocol_t* ifc) {
     virtio::InputDevice* inp = static_cast<virtio::InputDevice*>(ctx);
     return inp->Start(ifc);
 }
@@ -243,15 +166,24 @@ zx_status_t InputDevice::Init() {
     SelectConfig(VIRTIO_INPUT_CFG_EV_BITS, VIRTIO_INPUT_EV_ABS);
     uint8_t cfg_abs_size = config_.size;
 
-    // We only support one of pointer events or key events. In the advent that
-    // the device is trying to present both to us we shall preference the
-    // keyboard events as these are more useful to us.
-    if (cfg_key_size > 0) {
+    // At the moment we support keyboards and a specific touchscreen.
+    // Support for more devices should be added here.
+    SelectConfig(VIRTIO_INPUT_CFG_ID_DEVIDS, 0);
+    if (IsQemuTouchscreen(config_)) {
+        // QEMU MultiTouch Touchscreen
+        SelectConfig(VIRTIO_INPUT_CFG_ABS_INFO, VIRTIO_INPUT_EV_MT_POSITION_X);
+        virtio_input_absinfo_t x_info = config_.u.abs;
+        SelectConfig(VIRTIO_INPUT_CFG_ABS_INFO, VIRTIO_INPUT_EV_MT_POSITION_Y);
+        virtio_input_absinfo_t y_info = config_.u.abs;
+        hid_device_ = std::make_unique<HidTouch>(x_info, y_info);
+    } else if (cfg_key_size > 0) {
         // Keyboard
         dev_class_ = HID_DEVICE_CLASS_KBD;
+        hid_device_ = std::make_unique<HidKeyboard>();
     } else if (cfg_rel_size > 0 || cfg_abs_size > 0) {
-        // Pointer
+        // TODO: This is where a Mouse should be implemented.
         dev_class_ = HID_DEVICE_CLASS_POINTER;
+        return ZX_ERR_NOT_SUPPORTED;
     } else {
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -297,12 +229,10 @@ zx_status_t InputDevice::Init() {
         vring_.SubmitChain(id);
     }
 
-    // Prepare the HID report buffer
-    memset(&report_, 0, sizeof(report_));
-
     StartIrqThread();
     DriverStatusOk();
 
+    device_ops_.message = virtio_input_message;
     device_ops_.release = virtio_input_release;
 
     hidbus_ops_.query = virtio_input_query;
@@ -338,7 +268,7 @@ zx_status_t InputDevice::Init() {
     return ZX_OK;
 }
 
-zx_status_t InputDevice::Start(const hidbus_ifc_t* ifc) {
+zx_status_t InputDevice::Start(const hidbus_ifc_protocol_t* ifc) {
     fbl::AutoLock lock(&lock_);
     if (hidbus_ifc_.ops != nullptr) {
         return ZX_ERR_ALREADY_BOUND;
@@ -370,88 +300,18 @@ zx_status_t InputDevice::Query(uint32_t options, hid_info_t* info) {
 }
 
 zx_status_t InputDevice::GetDescriptor(uint8_t desc_type, void** data, size_t* len) {
-    if (data == nullptr || len == nullptr) {
-        return ZX_ERR_INVALID_ARGS;
-    }
-
-    if (desc_type != HID_DESCRIPTION_TYPE_REPORT) {
-        return ZX_ERR_NOT_FOUND;
-    }
-    const uint8_t* buf = nullptr;
-    size_t buflen = 0;
-
-    // TODO: Handle devices other than keyboards;
-    buf = static_cast<const uint8_t*>(kbd_hid_report_desc);
-    buflen = sizeof(kbd_hid_report_desc);
-
-    *data = malloc(buflen);
-    if (*data == nullptr) {
-        return ZX_ERR_NO_MEMORY;
-    }
-    *len = buflen;
-    memcpy(*data, buf, buflen);
-    return ZX_OK;
-}
-
-void InputDevice::AddKeypressToReport(uint16_t event_code) {
-    uint8_t hid_code = kEventCodeMap[event_code];
-    for (size_t i = 0; i != 6; ++i) {
-        if (report_.usage[i] == hid_code) {
-            // The key already exists in the report so we ignore it.
-            return;
-        }
-        if (report_.usage[i] == 0) {
-            report_.usage[i] = hid_code;
-            return;
-        }
-    }
-
-    // There's no free slot in the report.
-    // TODO: Record a rollover status.
-}
-
-void InputDevice::RemoveKeypressFromReport(uint16_t event_code) {
-    uint8_t hid_code = kEventCodeMap[event_code];
-    int id = -1;
-    for (int i = 0; i != 6; ++i) {
-        if (report_.usage[i] == hid_code) {
-            id = i;
-            break;
-        }
-    }
-
-    if (id == -1) {
-        // They key is not in the report so we ignore it.
-        return;
-    }
-
-    for (size_t i = id; i != 5; ++i) {
-        report_.usage[i] = report_.usage[i + 1];
-    }
-    report_.usage[5] = 0;
+    return hid_device_->GetDescriptor(desc_type, data, len);
 }
 
 void InputDevice::ReceiveEvent(virtio_input_event_t* event) {
-    // TODO: Support other event types (once we support more than a fake HID keyboard).
-    if (event->type == VIRTIO_INPUT_EV_KEY) {
-        if (event->code == 0) {
-            return;
-        }
-        if (event->code >= fbl::count_of(kEventCodeMap)) {
-            LTRACEF("unknown key\n");
-            return;
-        }
-        if (event->value == VIRTIO_INPUT_EV_KEY_PRESSED) {
-            AddKeypressToReport(event->code);
-        } else if (event->value == VIRTIO_INPUT_EV_KEY_RELEASED) {
-            RemoveKeypressFromReport(event->code);
-        }
-    } else if (event->type == VIRTIO_INPUT_EV_SYN) {
+    hid_device_->ReceiveEvent(event);
+
+    if (event->type == VIRTIO_INPUT_EV_SYN) {
         fbl::AutoLock lock(&lock_);
         if (hidbus_ifc_.ops) {
-            hidbus_ifc_io_queue(&hidbus_ifc_,
-                                reinterpret_cast<const uint8_t*>(&report_),
-                                sizeof(report_));
+            size_t size;
+            const uint8_t* report = hid_device_->GetReport(&size);
+            hidbus_ifc_io_queue(&hidbus_ifc_, report, size);
         }
     }
 }

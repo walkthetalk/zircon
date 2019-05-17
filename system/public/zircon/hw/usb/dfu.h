@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_HW_USB_DFU_H_
+#define SYSROOT_ZIRCON_HW_USB_DFU_H_
 
 // clang-format off
 
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // USB DFU Spec, Rev 1.1
 
@@ -76,4 +77,6 @@ typedef struct {
 #define USB_DFU_STATE_DFU_UPLOAD_IDLE         0x09
 #define USB_DFU_STATE_DFU_ERROR               0x0A
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_HW_USB_DFU_H_

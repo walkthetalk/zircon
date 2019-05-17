@@ -1,0 +1,23 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+source_set("object-info") {
+  testonly = true
+  sources = [
+    "basic-object-info-test.cpp",
+    "job-object-info-test.cpp",
+    "process-object-info-test.cpp",
+    "task-object-info-test.cpp",
+    "thread-object-info-test.cpp",
+    "vmar-object-info-test.cpp",
+  ]
+  deps = [
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fdio",
+    "$zx/system/ulib/mini-process",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zx",
+    "$zx/system/ulib/zxtest",
+  ]
+}

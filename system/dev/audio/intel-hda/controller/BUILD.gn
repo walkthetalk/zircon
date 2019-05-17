@@ -1,0 +1,61 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("$zx/public/gn/firmware.gni")
+
+driver("controller") {
+  sources = [
+    "binding.c",
+    "binding.h",
+    "codec-cmd-job.cpp",
+    "codec-cmd-job.h",
+    "debug-logging.h",
+    "intel-dsp-code-loader.cpp",
+    "intel-dsp-code-loader.h",
+    "intel-dsp-debug.cpp",
+    "intel-dsp-ipc.cpp",
+    "intel-dsp-ipc.h",
+    "intel-dsp-stream.cpp",
+    "intel-dsp-stream.h",
+    "intel-dsp-topology.cpp",
+    "intel-dsp-topology.h",
+    "intel-dsp.cpp",
+    "intel-dsp.h",
+    "intel-hda-codec.cpp",
+    "intel-hda-codec.h",
+    "intel-hda-controller-init.cpp",
+    "intel-hda-controller.cpp",
+    "intel-hda-controller.h",
+    "intel-hda-debug.cpp",
+    "intel-hda-irq.cpp",
+    "intel-hda-stream.cpp",
+    "intel-hda-stream.h",
+    "utils.cpp",
+    "utils.h",
+  ]
+  deps = [
+    "$zx/system/banjo/ddk.protocol.intelhda.codec",
+    "$zx/system/banjo/ddk.protocol.pci",
+    "$zx/system/fidl/fuchsia-hardware-intel-hda:c",
+    "$zx/system/ulib/audio-driver-proto",
+    "$zx/system/ulib/audio-proto-utils",
+    "$zx/system/ulib/ddk",
+    "$zx/system/ulib/dispatcher-pool",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fzl",
+    "$zx/system/ulib/intel-hda",
+    "$zx/system/ulib/sync",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zx",
+  ]
+  data_deps = [
+    ":firmware",
+  ]
+}
+
+firmware("firmware") {
+  sources = [
+    "$firmware_dir/intel-adsp-sst/dsp_fw_kbl_v3420.bin",
+  ]
+}

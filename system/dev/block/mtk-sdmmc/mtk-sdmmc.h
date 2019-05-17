@@ -10,7 +10,7 @@
 #include <ddk/phys-iter.h>
 #include <ddk/protocol/platform/device.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <ddktl/protocol/gpio.h>
 #include <ddktl/protocol/sdmmc.h>
 #include <fbl/auto_lock.h>
@@ -57,7 +57,7 @@ public:
 
     virtual ~MtkSdmmc() = default;
 
-    void DdkRelease() { delete this; }
+    void DdkRelease();
 
     zx_status_t Bind();
 
@@ -69,22 +69,23 @@ public:
     void SdmmcHwReset();
     zx_status_t SdmmcPerformTuning(uint32_t cmd_idx);
     zx_status_t SdmmcRequest(sdmmc_req_t* req);
+    zx_status_t SdmmcRegisterInBandInterrupt(const in_band_interrupt_protocol_t* interrupt_cb);
 
     // Visible for testing.
     MtkSdmmc(zx_device_t* parent, ddk::MmioBuffer mmio, zx::bti bti, const sdmmc_host_info_t& info,
              zx::interrupt irq, const ddk::GpioProtocolClient& reset_gpio,
-             const ddk::GpioProtocolClient& power_en_gpio, const pdev_device_info_t& dev_info,
+             const ddk::GpioProtocolClient& power_en_gpio,
              const board_mt8167::MtkSdmmcConfig& config)
         : DeviceType(parent), req_(nullptr), mmio_(std::move(mmio)), bti_(std::move(bti)),
           info_(info), irq_(std::move(irq)), cmd_status_(ZX_OK), reset_gpio_(reset_gpio),
-          power_en_gpio_(power_en_gpio), dev_info_(dev_info), config_(config) {}
+          power_en_gpio_(power_en_gpio), config_(config) {}
 
     // Visible for testing.
     zx_status_t Init();
 
     // Visible for testing.
 protected:
-    virtual zx_status_t WaitForInterrupt();
+    virtual zx_status_t WaitForInterrupt(zx::time* timestamp);
 
     int JoinIrqThread() {
         return thrd_join(irq_thread_, nullptr);
@@ -135,8 +136,8 @@ private:
     zx_status_t cmd_status_ TA_GUARDED(mutex_);
     const ddk::GpioProtocolClient reset_gpio_;
     const ddk::GpioProtocolClient power_en_gpio_;
-    const pdev_device_info_t dev_info_;
     const board_mt8167::MtkSdmmcConfig config_;
+    ddk::InBandInterruptProtocolClient interrupt_cb_;
 };
 
 // TuneWindow keeps track of the results of a series of tuning tests. It is expected that either

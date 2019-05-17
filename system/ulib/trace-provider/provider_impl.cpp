@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <fbl/algorithm.h>
+#include <fuchsia/tracelink/c/fidl.h>
 #include <lib/async/default.h>
 #include <lib/fidl/coding.h>
 #include <lib/zx/process.h>
@@ -20,7 +21,6 @@
 #include <utility>
 
 #include "session.h"
-#include "trace_provider.fidl.h"
 #include "utils.h"
 
 namespace trace {
@@ -95,8 +95,8 @@ bool TraceProviderImpl::Connection::ReadMessage() {
     zx_handle_t handles[2];
     uint32_t num_handles = 0u;
     zx_status_t status = channel_.read(
-        0u, buffer, sizeof(buffer), &num_bytes,
-        handles, static_cast<uint32_t>(fbl::count_of(handles)), &num_handles);
+        0u, buffer, handles, sizeof(buffer), static_cast<uint32_t>(fbl::count_of(handles)),
+        &num_bytes, &num_handles);
     if (status != ZX_OK) {
         fprintf(stderr, "TraceProvider: channel read failed: status=%d(%s)\n",
                 status, zx_status_get_string(status));
@@ -122,8 +122,7 @@ bool TraceProviderImpl::Connection::DecodeAndDispatch(
 
     auto hdr = reinterpret_cast<fidl_message_header_t*>(buffer);
     switch (hdr->ordinal) {
-    case fuchsia_tracelink_ProviderStartOrdinal:
-    case fuchsia_tracelink_ProviderStartGenOrdinal: {
+    case fuchsia_tracelink_ProviderStartOrdinal: {
         zx_status_t status = fidl_decode(&fuchsia_tracelink_ProviderStartRequestTable,
                                          buffer, num_bytes, handles, num_handles,
                                          nullptr);
@@ -157,8 +156,7 @@ bool TraceProviderImpl::Connection::DecodeAndDispatch(
                      std::move(categories));
         return true;
     }
-    case fuchsia_tracelink_ProviderStopOrdinal:
-    case fuchsia_tracelink_ProviderStopGenOrdinal: {
+    case fuchsia_tracelink_ProviderStopOrdinal: {
         zx_status_t status = fidl_decode(&fuchsia_tracelink_ProviderStopRequestTable,
                                          buffer, num_bytes, handles, num_handles,
                                          nullptr);

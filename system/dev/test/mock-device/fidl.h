@@ -20,9 +20,6 @@ zx_status_t GetProtocolHook(const zx::channel& c, const fuchsia_device_mock_Hook
                             fbl::Array<const fuchsia_device_mock_Action>* actions_out);
 zx_status_t OpenHook(const zx::channel& c, const fuchsia_device_mock_HookInvocation& record,
                      uint32_t flags, fbl::Array<const fuchsia_device_mock_Action>* actions_out);
-zx_status_t OpenAtHook(const zx::channel& c, const fuchsia_device_mock_HookInvocation& record,
-                       const fbl::StringPiece& path, uint32_t flags,
-                       fbl::Array<const fuchsia_device_mock_Action>* actions_out);
 zx_status_t CloseHook(const zx::channel& c, const fuchsia_device_mock_HookInvocation& record,
                       uint32_t flags, fbl::Array<const fuchsia_device_mock_Action>* actions_out);
 zx_status_t UnbindHook(const zx::channel& c, const fuchsia_device_mock_HookInvocation& record,
@@ -53,6 +50,11 @@ zx_status_t SendRemoveDeviceDone(const zx::channel& c, uint64_t action_id);
 
 zx_status_t SendAddDeviceDoneFromThread(const zx::channel& c, uint64_t action_id);
 zx_status_t SendRemoveDeviceDoneFromThread(const zx::channel& c, uint64_t action_id);
+
+// Returns ZX_ERR_STOP if channel has been closed
+// Returns ZX_OK and populates |actions_out| on success.
+zx_status_t WaitForPerformActions(const zx::channel& c,
+                                  fbl::Array<const fuchsia_device_mock_Action>* actions_out);
 
 } // namespace mock_device
 

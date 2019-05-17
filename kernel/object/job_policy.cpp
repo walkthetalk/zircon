@@ -8,6 +8,7 @@
 #include <err.h>
 #include <fbl/algorithm.h>
 #include <kernel/deadline.h>
+#include <lib/counters.h>
 #include <zircon/syscalls/policy.h>
 
 namespace {
@@ -18,10 +19,8 @@ constexpr pol_cookie_t kPolicyEmpty = 0u;
 
 // The encoding of the basic policy is done 4 bits per each item.
 //
-// - When the top bit is 1, the lower 3 bits track the action:
-//    0 : ZX_POL_ACTION_ALLOW or not (ZX_POL_ACTION_DENY)
-//    1 : ZX_POL_ACTION_EXCEPTION or not
-//    2 : ZX_POL_ACTION_KILL or not
+// - When the top bit is 1, the lower 3 bits contain the action
+//   (ZX_POL_ACTION_ALLOW, ZX_POL_ACTION_DENY, etc.)
 //
 // - When the top bit is 0 then its the default policy and other bits
 //   should be zero so that kPolicyEmpty == 0 meets the requirement of
@@ -48,16 +47,14 @@ union Encoding {
         uint64_t new_fifo        :  4;
         uint64_t new_timer       :  4;
         uint64_t new_process     :  4;
-        uint64_t unused_bits     : 15;
+        uint64_t new_profile     :  4;
+        uint64_t unused_bits     : 11;
         uint64_t cookie_mode     :  1;  // see kPolicyInCookie.
     };
 
     static uint32_t action(uint64_t item) { return item & kActionBits; }
     static bool is_default(uint64_t item) { return item == 0; }
 };
-
-constexpr uint32_t kPolicyActionValidBits =
-    ZX_POL_ACTION_ALLOW | ZX_POL_ACTION_DENY | ZX_POL_ACTION_EXCEPTION | ZX_POL_ACTION_KILL;
 
 // The packing of bits on a bitset (above) is defined by the standard as
 // implementation dependent so we must check that it is using the storage
@@ -76,6 +73,7 @@ const uint32_t kNewObjectPolicies[]{
     ZX_POL_NEW_FIFO,
     ZX_POL_NEW_TIMER,
     ZX_POL_NEW_PROCESS,
+    ZX_POL_NEW_PROFILE,
 };
 static_assert(
     fbl::count_of(kNewObjectPolicies) + 4 == ZX_POL_MAX,
@@ -106,7 +104,7 @@ zx_status_t AddPartial(uint32_t mode, pol_cookie_t existing_policy,
     Encoding existing = {existing_policy};
     Encoding result = {};
 
-    if (policy & ~kPolicyActionValidBits)
+    if (policy >= ZX_POL_ACTION_MAX)
         return ZX_ERR_NOT_SUPPORTED;
 
     switch (condition) {
@@ -145,6 +143,9 @@ zx_status_t AddPartial(uint32_t mode, pol_cookie_t existing_policy,
         break;
     case ZX_POL_NEW_PROCESS:
         POLMAN_SET_ENTRY(mode, existing.new_process, policy, result.new_process);
+        break;
+    case ZX_POL_NEW_PROFILE:
+        POLMAN_SET_ENTRY(mode, existing.new_profile, policy, result.new_profile);
         break;
     default:
         return ZX_ERR_NOT_SUPPORTED;
@@ -242,6 +243,7 @@ uint32_t JobPolicy::QueryBasicPolicy(uint32_t condition) const {
     case ZX_POL_NEW_FIFO: return GetEffectiveAction(existing.new_fifo);
     case ZX_POL_NEW_TIMER: return GetEffectiveAction(existing.new_timer);
     case ZX_POL_NEW_PROCESS: return GetEffectiveAction(existing.new_process);
+    case ZX_POL_NEW_PROFILE: return GetEffectiveAction(existing.new_profile);
     case ZX_POL_VMAR_WX: return GetEffectiveAction(existing.vmar_wx);
     default: return ZX_POL_ACTION_DENY;
     }
@@ -267,3 +269,92 @@ bool JobPolicy::operator==(const JobPolicy& rhs) const {
 bool JobPolicy::operator!=(const JobPolicy& rhs) const {
     return !operator==(rhs);
 }
+
+// Evaluates to the name of the kcounter for the given action and condition.
+//
+// E.g. COUNTER(deny, new_channel) -> policy_action_deny_new_channel_count
+#define COUNTER(action, condition) \
+    policy_##action##_##condition##_count
+
+// Defines a kcounter for the given action and condition.
+#define DEFINE_COUNTER(action, condition) \
+    KCOUNTER(COUNTER(action, condition), "policy." #action "." #condition)
+
+// Evaluates to the name of an array of pointers to Counter objects.
+//
+// See DEFINE_COUNTER_ARRAY for details.
+#define COUNTER_ARRAY(action) \
+    counters_##action
+
+// Defines kcounters for the given action and creates an array named |COUNTER_ARRAY(action)|.
+//
+// The array has length ZX_POL_MAX and contains pointers to the Counter objects. The array should be
+// indexed by condition. Note, some array elements may be null.
+//
+// Example:
+//
+//     DEFINE_COUNTER_ARRAY(deny);
+//     kcounter_add(*COUNTER_ARRAY(deny)[ZX_POL_NEW_CHANNEL], 1);
+//
+#define DEFINE_COUNTER_ARRAY(action)                                           \
+    DEFINE_COUNTER(action, bad_handle)                                         \
+    DEFINE_COUNTER(action, wrong_object)                                       \
+    DEFINE_COUNTER(action, vmar_wx)                                            \
+    DEFINE_COUNTER(action, new_vmo)                                            \
+    DEFINE_COUNTER(action, new_channel)                                        \
+    DEFINE_COUNTER(action, new_event)                                          \
+    DEFINE_COUNTER(action, new_eventpair)                                      \
+    DEFINE_COUNTER(action, new_port)                                           \
+    DEFINE_COUNTER(action, new_socket)                                         \
+    DEFINE_COUNTER(action, new_fifo)                                           \
+    DEFINE_COUNTER(action, new_timer)                                          \
+    DEFINE_COUNTER(action, new_process)                                        \
+    DEFINE_COUNTER(action, new_profile)                                        \
+    static constexpr const Counter* const COUNTER_ARRAY(action)[] = {          \
+        [ZX_POL_BAD_HANDLE] = &COUNTER(action, bad_handle),                    \
+        [ZX_POL_WRONG_OBJECT] = &COUNTER(action, wrong_object),                \
+        [ZX_POL_VMAR_WX] = &COUNTER(action, vmar_wx),                          \
+        [ZX_POL_NEW_ANY] = nullptr, /* ZX_POL_NEW_ANY is a pseudo condition */ \
+        [ZX_POL_NEW_VMO] = &COUNTER(action, new_vmo),                          \
+        [ZX_POL_NEW_CHANNEL] = &COUNTER(action, new_channel),                  \
+        [ZX_POL_NEW_EVENT] = &COUNTER(action, new_event),                      \
+        [ZX_POL_NEW_EVENTPAIR] = &COUNTER(action, new_eventpair),              \
+        [ZX_POL_NEW_PORT] = &COUNTER(action, new_port),                        \
+        [ZX_POL_NEW_SOCKET] = &COUNTER(action, new_socket),                    \
+        [ZX_POL_NEW_FIFO] = &COUNTER(action, new_fifo),                        \
+        [ZX_POL_NEW_TIMER] = &COUNTER(action, new_timer),                      \
+        [ZX_POL_NEW_PROCESS] = &COUNTER(action, new_process),                  \
+        [ZX_POL_NEW_PROFILE] = &COUNTER(action, new_profile),                  \
+    };                                                                         \
+    static_assert(fbl::count_of(COUNTER_ARRAY(action)) == ZX_POL_MAX);
+
+// Counts policy violations resulting in ZX_POL_ACTION_DENY or ZX_POL_ACTION_DENY_EXCEPTION.
+DEFINE_COUNTER_ARRAY(deny)
+// Counts policy violations resulting in ZX_POL_ACTION_KILL.
+DEFINE_COUNTER_ARRAY(kill)
+static_assert(ZX_POL_ACTION_MAX == 5, "add another instantiation of DEFINE_COUNTER_ARRAY");
+
+void JobPolicy::IncrementCounter(uint32_t action, uint32_t condition) {
+    DEBUG_ASSERT(action < ZX_POL_ACTION_MAX);
+    DEBUG_ASSERT(condition < ZX_POL_MAX);
+
+    const Counter* counter = nullptr;
+    switch (action) {
+    case ZX_POL_ACTION_DENY:
+    case ZX_POL_ACTION_DENY_EXCEPTION:
+        counter = COUNTER_ARRAY(deny)[condition];
+        break;
+    case ZX_POL_ACTION_KILL:
+        counter = COUNTER_ARRAY(kill)[condition];
+        break;
+    };
+    if (!counter) {
+        return;
+    }
+    kcounter_add(*counter, 1);
+}
+
+#undef COUNTER
+#undef DEFINE_COUNTER
+#undef COUNTER_ARRAY
+#undef DEFINE_COUNTER_ARRAY

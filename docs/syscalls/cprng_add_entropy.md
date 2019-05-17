@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-cprng_add_entropy - Add entropy to the kernel CPRNG
+Add entropy to the kernel CPRNG.
 
 ## SYNOPSIS
 
@@ -40,3 +40,11 @@ userspace pointer.
 ## BUGS
 
 This syscall should be very privileged.
+
+## SEE ALSO
+
+ - [`zx_cprng_draw()`]
+
+<!-- References updated by update-docs-from-abigen, do not edit. -->
+
+[`zx_cprng_draw()`]: cprng_draw.md

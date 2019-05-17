@@ -34,7 +34,7 @@
 
 #define DFSC_ALIGNMENT_FAULT 0b100001
 
-static void dump_iframe(const struct arm64_iframe_long* iframe) {
+static void dump_iframe(const arm64_iframe_t* iframe) {
     printf("iframe %p:\n", iframe);
     printf("x0  %#18" PRIx64 " x1  %#18" PRIx64 " x2  %#18" PRIx64 " x3  %#18" PRIx64 "\n", iframe->r[0], iframe->r[1], iframe->r[2], iframe->r[3]);
     printf("x4  %#18" PRIx64 " x5  %#18" PRIx64 " x6  %#18" PRIx64 " x7  %#18" PRIx64 "\n", iframe->r[4], iframe->r[5], iframe->r[6], iframe->r[7]);
@@ -48,18 +48,18 @@ static void dump_iframe(const struct arm64_iframe_long* iframe) {
     printf("spsr %#18" PRIx64 "\n", iframe->spsr);
 }
 
-KCOUNTER(exceptions_brkpt, "kernel.exceptions.breakpoint");
-KCOUNTER(exceptions_fpu, "kernel.exceptions.fpu");
-KCOUNTER(exceptions_page, "kernel.exceptions.page_fault");
-KCOUNTER(exceptions_irq, "kernel.exceptions.irq");
-KCOUNTER(exceptions_unhandled, "kernel.exceptions.unhandled");
-KCOUNTER(exceptions_user, "kernel.exceptions.user");
-KCOUNTER(exceptions_unknown, "kernel.exceptions.unknown");
+KCOUNTER(exceptions_brkpt, "exceptions.breakpoint")
+KCOUNTER(exceptions_hw_brkpt, "exceptions.hw_breakpoint")
+KCOUNTER(exceptions_fpu, "exceptions.fpu")
+KCOUNTER(exceptions_page, "exceptions.page_fault")
+KCOUNTER(exceptions_irq, "exceptions.irq")
+KCOUNTER(exceptions_unhandled, "exceptions.unhandled")
+KCOUNTER(exceptions_user, "exceptions.user")
+KCOUNTER(exceptions_unknown, "exceptions.unknown")
 
 static zx_status_t try_dispatch_user_data_fault_exception(
-    zx_excp_type_t type, struct arm64_iframe_long* iframe,
+    zx_excp_type_t type, arm64_iframe_t* iframe,
     uint32_t esr, uint64_t far) {
-    thread_t* thread = get_current_thread();
     arch_exception_context_t context = {};
     DEBUG_ASSERT(iframe != nullptr);
     context.frame = iframe;
@@ -67,20 +67,17 @@ static zx_status_t try_dispatch_user_data_fault_exception(
     context.far = far;
 
     arch_enable_ints();
-    DEBUG_ASSERT(thread->arch.suspended_general_regs == nullptr);
-    thread->arch.suspended_general_regs = iframe;
     zx_status_t status = dispatch_user_exception(type, &context);
-    thread->arch.suspended_general_regs = nullptr;
     arch_disable_ints();
     return status;
 }
 
 static zx_status_t try_dispatch_user_exception(
-    zx_excp_type_t type, struct arm64_iframe_long* iframe, uint32_t esr) {
+    zx_excp_type_t type, arm64_iframe_t* iframe, uint32_t esr) {
     return try_dispatch_user_data_fault_exception(type, iframe, esr, 0);
 }
 
-__NO_RETURN static void exception_die(struct arm64_iframe_long* iframe, uint32_t esr) {
+__NO_RETURN static void exception_die(arm64_iframe_t* iframe, uint32_t esr) {
     platform_panic_start();
 
     uint32_t ec = BITS_SHIFT(esr, 31, 26);
@@ -95,7 +92,7 @@ __NO_RETURN static void exception_die(struct arm64_iframe_long* iframe, uint32_t
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
 
-static void arm64_unknown_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_unknown_handler(arm64_iframe_t* iframe, uint exception_flags,
                                   uint32_t esr) {
     /* this is for a lot of reasons, but most of them are undefined instructions */
     if (unlikely((exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) == 0)) {
@@ -106,7 +103,7 @@ static void arm64_unknown_handler(struct arm64_iframe_long* iframe, uint excepti
     try_dispatch_user_exception(ZX_EXCP_UNDEFINED_INSTRUCTION, iframe, esr);
 }
 
-static void arm64_brk_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_brk_handler(arm64_iframe_t* iframe, uint exception_flags,
                               uint32_t esr) {
     if (unlikely((exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) == 0)) {
         /* trapped inside the kernel, this is bad */
@@ -116,7 +113,7 @@ static void arm64_brk_handler(struct arm64_iframe_long* iframe, uint exception_f
     try_dispatch_user_exception(ZX_EXCP_SW_BREAKPOINT, iframe, esr);
 }
 
-static void arm64_hw_breakpoint_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_hw_breakpoint_handler(arm64_iframe_t* iframe, uint exception_flags,
                                         uint32_t esr) {
     if (unlikely((exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) == 0)) {
         /* trapped inside the kernel, this is bad */
@@ -133,7 +130,7 @@ static void arm64_hw_breakpoint_handler(struct arm64_iframe_long* iframe, uint e
     try_dispatch_user_exception(ZX_EXCP_HW_BREAKPOINT, iframe, esr);
 }
 
-static void arm64_step_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_step_handler(arm64_iframe_t* iframe, uint exception_flags,
                                uint32_t esr) {
     if (unlikely((exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) == 0)) {
         /* trapped inside the kernel, this is bad */
@@ -144,7 +141,7 @@ static void arm64_step_handler(struct arm64_iframe_long* iframe, uint exception_
     try_dispatch_user_exception(ZX_EXCP_HW_BREAKPOINT, iframe, esr);
 }
 
-static void arm64_fpu_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_fpu_handler(arm64_iframe_t* iframe, uint exception_flags,
                               uint32_t esr) {
     if (unlikely((exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) == 0)) {
         /* we trapped a floating point instruction inside our own EL, this is bad */
@@ -155,7 +152,7 @@ static void arm64_fpu_handler(struct arm64_iframe_long* iframe, uint exception_f
     arm64_fpu_exception(iframe, exception_flags);
 }
 
-static void arm64_instruction_abort_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_instruction_abort_handler(arm64_iframe_t* iframe, uint exception_flags,
                                             uint32_t esr) {
     /* read the FAR register */
     uint64_t far = __arm_rsr64("far_el1");
@@ -195,7 +192,7 @@ static void arm64_instruction_abort_handler(struct arm64_iframe_long* iframe, ui
     exception_die(iframe, esr);
 }
 
-static void arm64_data_abort_handler(struct arm64_iframe_long* iframe, uint exception_flags,
+static void arm64_data_abort_handler(arm64_iframe_t* iframe, uint exception_flags,
                                      uint32_t esr) {
     /* read the FAR register */
     uint64_t far = __arm_rsr64("far_el1");
@@ -269,7 +266,7 @@ static inline void arm64_restore_percpu_pointer() {
 
 /* called from assembly */
 extern "C" void arm64_sync_exception(
-    struct arm64_iframe_long* iframe, uint exception_flags, uint32_t esr) {
+    arm64_iframe_t* iframe, uint exception_flags, uint32_t esr) {
     uint32_t ec = BITS_SHIFT(esr, 31, 26);
 
     if (exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) {
@@ -306,6 +303,7 @@ extern "C" void arm64_sync_exception(
         break;
     case 0b110000: /* HW breakpoint from a lower level */
     case 0b110001: /* HW breakpoint from same level */
+        kcounter_add(exceptions_hw_brkpt, 1);
         arm64_hw_breakpoint_handler(iframe, exception_flags, esr);
         break;
     case 0b110010: /* software step from lower level */
@@ -343,7 +341,7 @@ extern "C" void arm64_sync_exception(
 }
 
 /* called from assembly */
-extern "C" uint32_t arm64_irq(struct arm64_iframe_short* iframe, uint exception_flags) {
+extern "C" uint32_t arm64_irq(iframe_short_t* iframe, uint exception_flags) {
     if (exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL) {
         // if we came from a lower level, restore the per cpu pointer
         arm64_restore_percpu_pointer();
@@ -382,7 +380,7 @@ extern "C" uint32_t arm64_irq(struct arm64_iframe_short* iframe, uint exception_
 }
 
 /* called from assembly */
-extern "C" void arm64_finish_user_irq(uint32_t exit_flags, struct arm64_iframe_long* iframe) {
+extern "C" void arm64_finish_user_irq(uint32_t exit_flags, arm64_iframe_t* iframe) {
     // we came from a lower level, so restore the per cpu pointer
     arm64_restore_percpu_pointer();
 
@@ -400,7 +398,7 @@ extern "C" void arm64_finish_user_irq(uint32_t exit_flags, struct arm64_iframe_l
 }
 
 /* called from assembly */
-extern "C" void arm64_invalid_exception(struct arm64_iframe_long* iframe, unsigned int which) {
+extern "C" void arm64_invalid_exception(arm64_iframe_t* iframe, unsigned int which) {
     // restore the percpu pointer (x18) unconditionally
     arm64_restore_percpu_pointer();
 
@@ -411,7 +409,7 @@ extern "C" void arm64_invalid_exception(struct arm64_iframe_long* iframe, unsign
 }
 
 /* called from assembly */
-extern "C" void arm64_thread_process_pending_signals(struct arm64_iframe_long* iframe) {
+extern "C" void arm64_thread_process_pending_signals(arm64_iframe_t* iframe) {
     thread_t* thread = get_current_thread();
     DEBUG_ASSERT(iframe != nullptr);
     DEBUG_ASSERT(thread->arch.suspended_general_regs == nullptr);
@@ -470,8 +468,20 @@ void arch_fill_in_exception_context(const arch_exception_context_t* arch_context
 }
 
 zx_status_t arch_dispatch_user_policy_exception(void) {
-    struct arm64_iframe_long frame = {};
     arch_exception_context_t context = {};
-    context.frame = &frame;
     return dispatch_user_exception(ZX_EXCP_POLICY_ERROR, &context);
+}
+
+void arch_install_context_regs(thread_t* thread, const arch_exception_context_t* context) {
+    // TODO(ZX-563): |context->frame| will be nullptr for exceptions that
+    // don't (yet) provide the registers.
+    if (context->frame) {
+        DEBUG_ASSERT(thread->arch.suspended_general_regs == nullptr);
+        thread->arch.suspended_general_regs = context->frame;
+        thread->arch.debug_state.esr = context->esr;
+    }
+}
+
+void arch_remove_context_regs(thread_t* thread) {
+    thread->arch.suspended_general_regs = nullptr;
 }

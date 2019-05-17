@@ -6,7 +6,11 @@
 
 #include <assert.h>
 #include <atomic>
+#include <ddk/device.h>
+#include <ddk/driver.h>
 #include <errno.h>
+#include <fbl/auto_call.h>
+#include <fbl/auto_lock.h>
 #include <fcntl.h>
 #include <new>
 #include <stdio.h>
@@ -16,16 +20,12 @@
 #include <threads.h>
 #include <unistd.h>
 #include <utility>
-
-#include <ddk/device.h>
-#include <ddk/driver.h>
-
 #include <zircon/assert.h>
 #include <zircon/listnode.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 
-#include <fbl/auto_lock.h>
+#include "composite-device.h"
 
 namespace devmgr {
 
@@ -46,21 +46,23 @@ __LOCAL mtx_t devhost_api_lock = MTX_INIT;
 __LOCAL std::atomic<thrd_t> devhost_api_lock_owner(0);
 } // namespace internal
 
+static thread_local BindContext* g_bind_context;
 static thread_local CreationContext* g_creation_context;
 
-// The creation context is setup before the bind() or create() ops are
-// invoked to provide the ability to sanity check the required device_add()
-// operations these hooks should be making.
+// The bind and creation contexts is setup before the bind() or
+// create() ops are invoked to provide the ability to sanity check the
+// required device_add() operations these hooks should be making.
+void devhost_set_bind_context(BindContext* ctx) {
+    g_bind_context = ctx;
+}
+
 void devhost_set_creation_context(CreationContext* ctx) {
+    ZX_DEBUG_ASSERT(!ctx || ctx->rpc->is_valid());
     g_creation_context = ctx;
 }
 
 static zx_status_t default_open(void* ctx, zx_device_t** out, uint32_t flags) {
     return ZX_OK;
-}
-
-static zx_status_t default_open_at(void* ctx, zx_device_t** out, const char* path, uint32_t flags) {
-    return ZX_ERR_NOT_SUPPORTED;
 }
 
 static zx_status_t default_close(void* ctx, uint32_t flags) {
@@ -111,7 +113,6 @@ static zx_status_t default_message(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn) 
 zx_protocol_device_t device_default_ops = []() {
     zx_protocol_device_t ops = {};
     ops.open = default_open;
-    ops.open_at = default_open_at;
     ops.close = default_close;
     ops.unbind = default_unbind;
     ops.release = default_release;
@@ -135,9 +136,6 @@ static zx_protocol_device_t device_invalid_ops = []() {
     zx_protocol_device_t ops = {};
     ops.open =
         +[](void* ctx, zx_device_t**, uint32_t) -> zx_status_t { device_invalid_fatal(ctx); };
-    ops.open_at = +[](void* ctx, zx_device_t**, const char*, uint32_t) -> zx_status_t {
-        device_invalid_fatal(ctx);
-    };
     ops.close = +[](void* ctx, uint32_t) -> zx_status_t { device_invalid_fatal(ctx); };
     ops.unbind = +[](void* ctx) { device_invalid_fatal(ctx); };
     ops.release = +[](void* ctx) { device_invalid_fatal(ctx); };
@@ -163,7 +161,20 @@ static zx_protocol_device_t device_invalid_ops = []() {
 #define DEAD_DEVICE_MAX 7
 
 void devhost_device_destroy(zx_device_t* dev) REQ_DM_LOCK {
-    static fbl::DoublyLinkedList<zx_device*, zx_device::Node> dead_list;
+    // Wrap the deferred-deletion list in a struct, so we can give it a proper
+    // dtor.  Otherwise, this causes the binary to crash on exit due to an
+    // is_empty assert in fbl::DoublyLinkedList.  This was particularly a
+    // problem for unit tests.
+    struct DeadList {
+        ~DeadList() {
+            while (!devices.is_empty()) {
+                delete devices.pop_front();
+            }
+        }
+        fbl::DoublyLinkedList<zx_device*, zx_device::Node> devices;
+    };
+
+    static DeadList dead_list;
     static unsigned dead_count = 0;
 
     // ensure any ops will be fatal
@@ -188,10 +199,10 @@ void devhost_device_destroy(zx_device_t* dev) REQ_DM_LOCK {
     // Defer destruction to help catch use-after-free and also
     // so the compiler can't (easily) optimize away the poisoning
     // we do above.
-    dead_list.push_back(dev);
+    dead_list.devices.push_back(dev);
 
     if (dead_count == DEAD_DEVICE_MAX) {
-        zx_device_t* to_delete = dead_list.pop_front();
+        zx_device_t* to_delete = dead_list.devices.pop_front();
         delete to_delete;
     } else {
         dead_count++;
@@ -264,8 +275,8 @@ static void enum_lock_release() REQ_DM_LOCK {
     }
 }
 
-zx_status_t devhost_device_create(zx_driver_t* drv, const fbl::RefPtr<zx_device_t>& parent,
-                                  const char* name, void* ctx, zx_protocol_device_t* ops,
+zx_status_t devhost_device_create(zx_driver_t* drv, const char* name, void* ctx,
+                                  const zx_protocol_device_t* ops,
                                   fbl::RefPtr<zx_device_t>* out) REQ_DM_LOCK {
 
     if (!drv) {
@@ -306,11 +317,6 @@ zx_status_t devhost_device_create(zx_driver_t* drv, const fbl::RefPtr<zx_device_
     return ZX_OK;
 }
 
-#define DEFAULT_IF_NULL(ops, method)                                                               \
-    if (ops->method == nullptr) {                                                                  \
-        ops->method = default_##method;                                                            \
-    }
-
 static zx_status_t device_validate(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_LOCK {
     if (dev == nullptr) {
         printf("INVAL: nullptr!\n");
@@ -338,22 +344,6 @@ static zx_status_t device_validate(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_L
         dev->protocol_id = ZX_PROTOCOL_MISC;
     }
 
-    // install default methods if needed
-    zx_protocol_device_t* ops = dev->ops;
-    DEFAULT_IF_NULL(ops, open);
-    DEFAULT_IF_NULL(ops, open_at);
-    DEFAULT_IF_NULL(ops, close);
-    DEFAULT_IF_NULL(ops, unbind);
-    DEFAULT_IF_NULL(ops, release);
-    DEFAULT_IF_NULL(ops, read);
-    DEFAULT_IF_NULL(ops, write);
-    DEFAULT_IF_NULL(ops, get_size);
-    DEFAULT_IF_NULL(ops, ioctl);
-    DEFAULT_IF_NULL(ops, suspend);
-    DEFAULT_IF_NULL(ops, resume);
-    DEFAULT_IF_NULL(ops, rxrpc);
-    DEFAULT_IF_NULL(ops, message);
-
     return ZX_OK;
 }
 
@@ -361,41 +351,41 @@ zx_status_t devhost_device_add(const fbl::RefPtr<zx_device_t>& dev,
                                const fbl::RefPtr<zx_device_t>& parent,
                                const zx_device_prop_t* props, uint32_t prop_count,
                                const char* proxy_args, zx::channel client_remote) REQ_DM_LOCK {
-    auto fail = [&dev](zx_status_t status) {
+    auto mark_dead = fbl::MakeAutoCall([&dev]() {
         if (dev) {
             dev->flags |= DEV_FLAG_DEAD | DEV_FLAG_VERY_DEAD;
         }
-        return status;
-    };
+    });
 
     zx_status_t status;
     if ((status = device_validate(dev)) < 0) {
-        return fail(status);
+        return status;
     }
     if (parent == nullptr) {
         printf("device_add: cannot add %p(%s) to nullptr parent\n", dev.get(), dev->name);
-        return fail(ZX_ERR_NOT_SUPPORTED);
+        return ZX_ERR_NOT_SUPPORTED;
     }
     if (parent->flags & DEV_FLAG_DEAD) {
         printf("device add: %p: is dead, cannot add child %p\n", parent.get(), dev.get());
-        return fail(ZX_ERR_BAD_STATE);
+        return ZX_ERR_BAD_STATE;
     }
 
-    CreationContext* ctx = nullptr;
+    BindContext* bind_ctx = nullptr;
+    CreationContext* creation_ctx = nullptr;
 
-    // if creation ctx (thread local) is set, we are in a thread
-    // that is handling a bind() or create() callback and if that
-    // ctx's parent matches the one provided to add we need to do
+    // If the bind or creation ctx (thread locals) are set, we are in
+    // a thread that is handling a bind() or create() callback and if
+    // that ctx's parent matches the one provided to add we need to do
     // some additional checking...
+    if ((g_bind_context != nullptr) && (g_bind_context->parent == parent)) {
+        bind_ctx = g_bind_context;
+    }
     if ((g_creation_context != nullptr) && (g_creation_context->parent == parent)) {
-        ctx = g_creation_context;
-        // If the RPC channel exists, this is for create rather than bind.
-        if (ctx->rpc->is_valid()) {
-            // create() must create only one child
-            if (ctx->child != nullptr) {
-                printf("devhost: driver attempted to create multiple proxy devices!\n");
-                return ZX_ERR_BAD_STATE;
-            }
+        creation_ctx = g_creation_context;
+        // create() must create only one child
+        if (creation_ctx->child != nullptr) {
+            printf("devhost: driver attempted to create multiple proxy devices!\n");
+            return ZX_ERR_BAD_STATE;
         }
     }
 
@@ -408,21 +398,22 @@ zx_status_t devhost_device_add(const fbl::RefPtr<zx_device_t>& dev,
     if (!dev->event.is_valid() &&
         ((status = zx::eventpair::create(0, &dev->event, &dev->local_event)) < 0)) {
         printf("device add: %p(%s): cannot create event: %d\n", dev.get(), dev->name, status);
-        return fail(status);
+        return status;
     }
 
     dev->flags |= DEV_FLAG_BUSY;
 
     // proxy devices are created through this handshake process
-    if (ctx && (ctx->rpc->is_valid())) {
+    if (creation_ctx) {
         if (dev->flags & DEV_FLAG_INVISIBLE) {
             printf("devhost: driver attempted to create invisible device in create()\n");
             return ZX_ERR_INVALID_ARGS;
         }
         dev->flags |= DEV_FLAG_ADDED;
         dev->flags &= (~DEV_FLAG_BUSY);
-        dev->rpc = zx::unowned_channel(ctx->rpc);
-        ctx->child = dev;
+        dev->rpc = zx::unowned_channel(creation_ctx->rpc);
+        creation_ctx->child = dev;
+        mark_dead.cancel();
         return ZX_OK;
     }
 
@@ -449,10 +440,11 @@ zx_status_t devhost_device_add(const fbl::RefPtr<zx_device_t>& dev,
     dev->flags |= DEV_FLAG_ADDED;
     dev->flags &= (~DEV_FLAG_BUSY);
 
-    // record this device in the creation context if there is one
-    if (ctx && (ctx->child == nullptr)) {
-        ctx->child = dev;
+    // record this device in the bind context if there is one
+    if (bind_ctx && (bind_ctx->child == nullptr)) {
+        bind_ctx->child = dev;
     }
+    mark_dead.cancel();
     return ZX_OK;
 }
 
@@ -491,6 +483,15 @@ static void devhost_unbind_children(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_
             }
         }
     }
+
+    fbl::RefPtr<CompositeDevice> composite = dev->take_composite();
+    if (composite) {
+        fbl::RefPtr<zx_device_t> child = composite->Detach();
+        if (child && !(child->flags & DEV_FLAG_DEAD)) {
+            devhost_device_unbind(std::move(child));
+        }
+    }
+
     enum_lock_release();
 }
 
@@ -540,9 +541,8 @@ zx_status_t devhost_device_unbind(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_LO
     return ZX_OK;
 }
 
-zx_status_t devhost_device_open_at(const fbl::RefPtr<zx_device_t>& dev,
-                                   fbl::RefPtr<zx_device_t>* out, const char* path,
-                                   uint32_t flags) REQ_DM_LOCK {
+zx_status_t devhost_device_open(const fbl::RefPtr<zx_device_t>& dev, fbl::RefPtr<zx_device_t>* out,
+                                uint32_t flags) REQ_DM_LOCK {
     if (dev->flags & DEV_FLAG_DEAD) {
         printf("device open: %p(%s) is dead!\n", dev.get(), dev->name);
         return ZX_ERR_BAD_STATE;
@@ -552,11 +552,7 @@ zx_status_t devhost_device_open_at(const fbl::RefPtr<zx_device_t>& dev,
     zx_device_t* opened_dev = nullptr;
     {
         ApiAutoRelock relock;
-        if (path) {
-            r = dev->OpenAtOp(&opened_dev, path, flags);
-        } else {
-            r = dev->OpenOp(&opened_dev, flags);
-        }
+        r = dev->OpenOp(&opened_dev, flags);
     }
     if (r < 0) {
         new_ref.reset();
@@ -580,46 +576,24 @@ zx_status_t devhost_device_close(fbl::RefPtr<zx_device_t> dev, uint32_t flags) R
     return dev->CloseOp(flags);
 }
 
-static zx_status_t devhost_device_suspend_locked(const fbl::RefPtr<zx_device>& dev,
-                                                 uint32_t flags) REQ_DM_LOCK {
-    // first suspend children (so we suspend from leaf up)
-    zx_status_t st;
-    for (auto& child : dev->children) {
-        if (!(child.flags & DEV_FLAG_DEAD)) {
-            // Try to get a reference to the child.   This will fail if the last
-            // reference to it went away and fbl_recycle() is going to blocked
-            // waiting for the DM lock
-            auto child_ref =
-                fbl::MakeRefPtrUpgradeFromRaw(&child, &::devmgr::internal::devhost_api_lock);
-            if (child_ref) {
-                st = devhost_device_suspend(std::move(child_ref), flags);
-                if (st != ZX_OK) {
-                    return st;
-                }
-            }
-        }
-    }
-
-    // then invoke our suspend hook
-    {
-        ApiAutoRelock relock;
-        st = dev->ops->suspend(dev->ctx, flags);
-    }
-
-    // default_suspend() returns ZX_ERR_NOT_SUPPORTED
-    if ((st != ZX_OK) && (st != ZX_ERR_NOT_SUPPORTED)) {
-        return st;
-    } else {
-        return ZX_OK;
-    }
-}
-
 zx_status_t devhost_device_suspend(const fbl::RefPtr<zx_device>& dev, uint32_t flags) REQ_DM_LOCK {
     // TODO this should eventually be two-pass using SUSPENDING/SUSPENDED flags
     enum_lock_acquire();
-    zx_status_t r = devhost_device_suspend_locked(dev, flags);
+
+    zx_status_t status = ZX_ERR_NOT_SUPPORTED;
+    // then invoke our suspend hook
+    if (dev->ops->suspend) {
+        ApiAutoRelock relock;
+        status = dev->ops->suspend(dev->ctx, flags);
+    }
+
     enum_lock_release();
-    return r;
+
+    // default_suspend() returns ZX_ERR_NOT_SUPPORTED
+    if ((status != ZX_OK) && (status != ZX_ERR_NOT_SUPPORTED)) {
+        return status;
+    }
+    return ZX_OK;
 }
 
 } // namespace devmgr

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cpuid.h>
+#include <kernel/cpu.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -17,6 +18,7 @@
 #include <zircon/types.h>
 
 #include <arch/x86/general_regs.h>
+#include <arch/x86/iframe.h>
 #include <arch/x86/registers.h>
 #include <arch/x86/x86intrin.h>
 #include <syscalls/syscalls.h>
@@ -24,18 +26,6 @@
 __BEGIN_CDECLS
 
 #define X86_8BYTE_MASK 0xFFFFFFFF
-
-struct x86_64_iframe {
-    uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax;    // pushed by common handler
-    uint64_t r8, r9, r10, r11, r12, r13, r14, r15; // pushed by common handler
-    uint64_t vector;                               // pushed by stub
-    uint64_t err_code;                             // pushed by interrupt or stub
-    uint64_t ip, cs, flags;                        // pushed by interrupt
-    uint64_t user_sp, user_ss;                     // pushed by interrupt
-};
-
-typedef struct x86_64_iframe x86_iframe_t;
-typedef struct x86_64_iframe iframe_t;
 
 void x86_exception_handler(x86_iframe_t* frame);
 void platform_irq(x86_iframe_t* frame);
@@ -55,8 +45,7 @@ struct x86_64_context_switch_frame {
 };
 
 void x86_64_context_switch(vaddr_t* oldsp, vaddr_t newsp);
-void x86_uspace_entry(uintptr_t arg1, uintptr_t arg2, uintptr_t sp,
-                      uintptr_t pc, uint64_t rflags) __NO_RETURN;
+void x86_uspace_entry(const x86_iframe_t* iframe) __NO_RETURN;
 
 void x86_syscall(void);
 
@@ -338,12 +327,22 @@ static inline uint32_t read_msr32(uint32_t msr_id) {
 
 zx_status_t read_msr_safe(uint32_t msr_id, uint64_t* val);
 
+// Read msr |msr_id| on CPU |cpu| and return the 64-bit value.
+uint64_t read_msr_on_cpu(cpu_num_t cpu, uint32_t msr_id);
+
 static inline void write_msr(uint32_t msr_id, uint64_t msr_write_val) {
     __asm__ __volatile__(
         "wrmsr \n\t"
         :
         : "c"(msr_id), "a"(msr_write_val & 0xffffffff), "d"(msr_write_val >> 32));
 }
+
+// Write value |val| into MSR |msr_id|. Returns ZX_OK if the write was successful or
+// a non-Ok status if the write failed because we received a #GP fault.
+zx_status_t write_msr_safe(uint32_t msr_id, uint64_t val);
+
+// Write value |val| into MSR |msr_id| on cpu |cpu|.
+void write_msr_on_cpu(cpu_num_t cpu, uint32_t msr_id, uint64_t val);
 
 static inline bool x86_is_paging_enabled(void) {
     if (x86_get_cr0() & X86_CR0_PG)

@@ -235,9 +235,9 @@ zx_status_t Mt8167GpioDevice::Bind() {
         return status;
     }
 
-    status = pdev_map_interrupt(&pdev, 0, int_.reset_and_get_address());
+    status = pdev_get_interrupt(&pdev, 0, 0, int_.reset_and_get_address());
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s pdev_map_interrupt failed %d\n", __FUNCTION__, status);
+        zxlogf(ERROR, "%s pdev_get_interrupt failed %d\n", __FUNCTION__, status);
         return status;
     }
 
@@ -290,9 +290,7 @@ zx_status_t Mt8167GpioDevice::Init() {
         .ops = &gpio_impl_protocol_ops_,
         .ctx = this,
     };
-    const platform_proxy_cb_t kCallback = {nullptr, nullptr};
-    status = pbus_register_protocol(&pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_proto, sizeof(gpio_proto),
-                                    &kCallback);
+    status = pbus_register_protocol(&pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_proto, sizeof(gpio_proto));
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s pbus_register_protocol failed %d\n", __FUNCTION__, status);
         ShutDown();

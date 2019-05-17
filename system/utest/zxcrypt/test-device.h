@@ -14,20 +14,23 @@
 #include <fbl/macros.h>
 #include <fbl/mutex.h>
 #include <fbl/unique_fd.h>
-#include <fs-management/ramdisk.h>
-#include <fvm/fvm.h>
+#include <fvm/format.h>
+#include <lib/fzl/fdio.h>
+#include <lib/zx/channel.h>
 #include <lib/zx/vmo.h>
+#include <ramdevice-client/ramdisk.h>
 #include <zircon/compiler.h>
 #include <zircon/status.h>
 #include <zircon/types.h>
+#include <zxcrypt/fdio-volume.h>
 
-#include "crypto/utils.h"
+#include "crypto/test/utils.h"
 
 #define DEFINE_EACH_DEVICE(Test)                                                                   \
     bool Test##Raw(Volume::Version version) { return Test(version, false /* not FVM */); }         \
-    DEFINE_EACH(Test##Raw);                                                                        \
+    DEFINE_EACH(Test##Raw)                                                                        \
     bool Test##Fvm(Volume::Version version) { return Test(version, true /* FVM */); }              \
-    DEFINE_EACH(Test##Fvm);
+    DEFINE_EACH(Test##Fvm)
 
 #define RUN_EACH_DEVICE(Test)                                                                      \
     RUN_EACH(Test##Raw)                                                                            \
@@ -40,7 +43,7 @@ namespace testing {
 const uint32_t kBlockCount = 64;
 const uint32_t kBlockSize = 512;
 const size_t kDeviceSize = kBlockCount * kBlockSize;
-const uint32_t kSliceCount = kDeviceSize / FVM_BLOCK_SIZE;
+const uint32_t kSliceCount = kDeviceSize / fvm::kBlockSize;
 
 // |zxcrypt::testing::Utils| is a collection of functions designed to make the zxcrypt
 // unit test setup and tear down easier.
@@ -58,12 +61,27 @@ public:
     // Returns a duplicated file descriptor representing the zxcrypt volume's underlying device;
     // that is, the ramdisk or FVM partition.
     fbl::unique_fd parent() const {
-        return fbl::unique_fd(dup(fvm_part_ ? fvm_part_.get() :
-                                              ramdisk_get_block_fd(ramdisk_)));
+        if (fvm_part_) {
+            return fvm_part_.duplicate();
+        } else {
+            return fbl::unique_fd(dup(ramdisk_get_block_fd(ramdisk_)));
+        }
     }
 
     // Returns a duplicated file descriptor representing t the zxcrypt volume.
-    fbl::unique_fd zxcrypt() const { return fbl::unique_fd(dup(zxcrypt_.get())); }
+    fbl::unique_fd zxcrypt() const {
+        return zxcrypt_.duplicate();
+    }
+
+    // Returns a connection to the parent device.
+    const zx::unowned_channel parent_channel() const {
+        return zx::unowned_channel(parent_caller_.borrow_channel());
+    }
+
+    // Returns a connection to the zxcrypt device.
+    const zx::unowned_channel zxcrypt_channel() const {
+        return zx::unowned_channel(zxcrypt_caller_.borrow_channel());
+    }
 
     // Returns the block size of the zxcrypt device.
     size_t block_size() const { return block_size_; }
@@ -123,7 +141,7 @@ public:
 
     // Allocates a new block device of at least |device_size| bytes grouped into blocks of
     // |block_size| bytes each.  If |fvm| is true, it will be formatted as an FVM partition with the
-    // appropriates number of slices of |FVM_BLOCK_SIZE| each.  A file descriptor for the block
+    // appropriates number of slices of |fvm::kBlockSize| each.  A file descriptor for the block
     // device is returned via |out_fd|.
     bool Create(size_t device_size, size_t block_size, bool fvm);
 
@@ -167,7 +185,7 @@ private:
 
     // Creates a ramdisk of with enough blocks of |block_size| bytes to hold both FVM metadata and
     // an FVM partition of at least |device_size| bytes.  It formats the ramdisk to be an FVM
-    // device, and allocates a partition with a single slice of size FVM_BLOCK_SIZE.
+    // device, and allocates a partition with a single slice of size fvm::kBlockSize.
     bool CreateFvmPart(size_t device_size, size_t block_size);
 
     // Connects the block client to the block server.
@@ -184,12 +202,16 @@ private:
 
     // The pathname of the FVM partition.
     char fvm_part_path_[PATH_MAX];
+    // A channel-exposing wrapper around the parent device.
+    fzl::UnownedFdioCaller parent_caller_;
+    // A channel-exposing wrapper around the zxcrypt device.
+    fzl::UnownedFdioCaller zxcrypt_caller_;
     // File descriptor for the (optional) underlying FVM partition.
     fbl::unique_fd fvm_part_;
     // File descriptor for the zxcrypt volume.
     fbl::unique_fd zxcrypt_;
     // The zxcrypt volume
-    fbl::unique_ptr<Volume> volume_;
+    fbl::unique_ptr<FdioVolume> volume_;
     // The cached block count.
     size_t block_count_;
     // The cached block size.

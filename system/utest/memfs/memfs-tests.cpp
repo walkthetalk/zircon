@@ -14,7 +14,9 @@
 #include <fbl/unique_ptr.h>
 #include <fbl/unique_fd.h>
 #include <fbl/vector.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/async-loop/cpp/loop.h>
 #include <lib/memfs/memfs.h>
 #include <unittest/unittest.h>
@@ -50,9 +52,8 @@ bool TestMemfsBasic() {
     memfs_filesystem_t* vfs;
     zx_handle_t root;
     ASSERT_EQ(memfs_create_filesystem(loop.dispatcher(), &vfs, &root), ZX_OK);
-    uint32_t type = PA_FDIO_REMOTE;
     int fd;
-    ASSERT_EQ(fdio_create_fd(&root, &type, 1, &fd), ZX_OK);
+    ASSERT_EQ(fdio_fd_create(root, &fd), ZX_OK);
 
     // Access files within the filesystem.
     DIR* d = fdopendir(fd);
@@ -100,9 +101,8 @@ bool TestMemfsLimitPages() {
         ASSERT_EQ(memfs_create_filesystem_with_page_limit(loop.dispatcher(),
                                                           static_cast<size_t>(page_limit),
                                                           &vfs, &root), ZX_OK);
-        uint32_t type = PA_FDIO_REMOTE;
-        int raw_root_fd;
-        ASSERT_EQ(fdio_create_fd(&root, &type, 1, &raw_root_fd), ZX_OK);
+        int raw_root_fd = -1;
+        ASSERT_EQ(fdio_fd_create(root, &raw_root_fd), ZX_OK);
         fbl::unique_fd root_fd(raw_root_fd);
 
         // Access files within the filesystem.
@@ -215,6 +215,71 @@ bool TestMemfsInstall() {
 bool TestMemfsCloseDuringAccess() {
     BEGIN_TEST;
 
+    for (int i = 0; i < 100; i++) {
+        async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
+        ASSERT_EQ(loop.StartThread(), ZX_OK);
+
+        // Create a memfs filesystem, acquire a file descriptor
+        memfs_filesystem_t* vfs;
+        zx_handle_t root;
+        ASSERT_EQ(memfs_create_filesystem(loop.dispatcher(), &vfs, &root), ZX_OK);
+        int fd = -1;
+        ASSERT_EQ(fdio_fd_create(root, &fd), ZX_OK);
+
+        // Access files within the filesystem.
+        DIR* d = fdopendir(fd);
+        ASSERT_NONNULL(d);
+        thrd_t worker;
+
+        struct thread_args {
+            DIR* d;
+            sync_completion_t spinning{};
+        } args{
+            .d = d,
+        };
+
+        ASSERT_EQ(thrd_create(&worker, [](void* arg) {
+            thread_args* args = reinterpret_cast<thread_args*>(arg);
+            DIR* d = args->d;
+            int fd = openat(dirfd(d), "foo", O_CREAT | O_RDWR);
+            while (true) {
+                if (close(fd)) {
+                    return errno == EPIPE ? 0 : -1;
+                }
+
+                if ((fd = openat(dirfd(d), "foo", O_RDWR)) < 0) {
+                    return errno == EPIPE ? 0 : -1;
+                }
+                sync_completion_signal(&args->spinning);
+            }
+        }, &args), thrd_success);
+
+        ASSERT_EQ(sync_completion_wait(&args.spinning, ZX_SEC(3)), ZX_OK);
+
+        sync_completion_t unmounted;
+        memfs_free_filesystem(vfs, &unmounted);
+        ASSERT_EQ(sync_completion_wait(&unmounted, ZX_SEC(3)), ZX_OK);
+
+        int result;
+        ASSERT_EQ(thrd_join(worker, &result), thrd_success);
+        ASSERT_EQ(result, 0);
+
+        // Now that the filesystem has terminated, we should be
+        // unable to access it.
+        ASSERT_LT(openat(dirfd(d), "foo", O_CREAT | O_RDWR), 0);
+        ASSERT_EQ(errno, EPIPE, "Expected connection to remote server to be closed");
+
+        // Since the filesystem has terminated, this will
+        // only close the client side of the connection.
+        ASSERT_EQ(closedir(d), 0);
+    }
+
+    END_TEST;
+}
+
+bool TestMemfsOverflow() {
+    BEGIN_TEST;
+
     async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
     ASSERT_EQ(loop.StartThread(), ZX_OK);
 
@@ -222,57 +287,29 @@ bool TestMemfsCloseDuringAccess() {
     memfs_filesystem_t* vfs;
     zx_handle_t root;
     ASSERT_EQ(memfs_create_filesystem(loop.dispatcher(), &vfs, &root), ZX_OK);
-    uint32_t type = PA_FDIO_REMOTE;
-    int fd;
-    ASSERT_EQ(fdio_create_fd(&root, &type, 1, &fd), ZX_OK);
+    int root_fd;
+    ASSERT_EQ(fdio_fd_create(root, &root_fd), ZX_OK);
 
     // Access files within the filesystem.
-    DIR* d = fdopendir(fd);
+    DIR* d = fdopendir(root_fd);
     ASSERT_NONNULL(d);
-    thrd_t worker;
 
-    struct thread_args {
-        DIR* d;
-        sync_completion_t spinning{};
-    } args {
-        .d = d,
-    };
+    // Issue writes to the file in an order that previously would have triggered
+    // an overflow in the memfs write path.
+    //
+    // Values provided mimic the bug reported by syzkaller (ZX-3791).
+    uint8_t buf[4096];
+    memset(buf, 'a', sizeof(buf));
+    fbl::unique_fd fd(openat(dirfd(d), "file", O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd);
+    ASSERT_EQ(pwrite(fd.get(), buf, 199, 0), 199);
+    ASSERT_EQ(pwrite(fd.get(), buf, 226, 0xfffffffffffff801), -1);
+    ASSERT_EQ(errno, EFBIG);
 
-    ASSERT_EQ(thrd_create(&worker, [](void* arg) {
-        thread_args* args = reinterpret_cast<thread_args*>(arg);
-        DIR* d = args->d;
-        int fd = openat(dirfd(d), "foo", O_CREAT | O_RDWR);
-        while (true) {
-            if (close(fd)) {
-                return errno == EPIPE ? 0 : -1;
-            }
-
-            if ((fd = openat(dirfd(d), "foo", O_RDWR)) < 0) {
-                return errno == EPIPE ? 0 : -1;
-            }
-            sync_completion_signal(&args->spinning);
-        }
-    }, &args), thrd_success);
-
-    ASSERT_EQ(sync_completion_wait(&args.spinning, ZX_SEC(3)), ZX_OK);
-
+    ASSERT_EQ(closedir(d), 0);
     sync_completion_t unmounted;
     memfs_free_filesystem(vfs, &unmounted);
     ASSERT_EQ(sync_completion_wait(&unmounted, ZX_SEC(3)), ZX_OK);
-
-    int result;
-    ASSERT_EQ(thrd_join(worker, &result), thrd_success);
-    ASSERT_EQ(result, 0);
-
-    // Now that the filesystem has terminated, we should be
-    // unable to access it.
-    ASSERT_LT(openat(dirfd(d), "foo", O_CREAT | O_RDWR), 0);
-    ASSERT_EQ(errno, EPIPE, "Expected connection to remote server to be closed");
-
-    // Since the filesystem has terminated, this will
-    // only close the client side of the connection.
-    ASSERT_EQ(closedir(d), 0);
-
     END_TEST;
 }
 
@@ -284,4 +321,5 @@ RUN_TEST(TestMemfsBasic)
 RUN_TEST(TestMemfsLimitPages)
 RUN_TEST(TestMemfsInstall)
 RUN_TEST(TestMemfsCloseDuringAccess)
+RUN_TEST(TestMemfsOverflow)
 END_TEST_CASE(memfs_tests)

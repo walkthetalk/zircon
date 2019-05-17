@@ -13,13 +13,14 @@
 #include <fbl/string_printf.h>
 #include <fbl/unique_fd.h>
 #include <fs-management/fvm.h>
-#include <fs-management/ramdisk.h>
 #include <fs-test-utils/fixture.h>
+#include <fuchsia/device/c/fidl.h>
 #include <lib/async-loop/cpp/loop.h>
+#include <lib/fdio/unsafe.h>
 #include <lib/memfs/memfs.h>
 #include <lib/sync/completion.h>
+#include <ramdevice-client/ramdisk.h>
 #include <zircon/assert.h>
-#include <zircon/device/device.h>
 #include <zircon/device/vfs.h>
 #include <zircon/errors.h>
 
@@ -70,7 +71,7 @@ zx_status_t MountMemFs(async::Loop* loop) {
 zx_status_t MakeRamdisk(const FixtureOptions& options, ramdisk_client_t** out_ramdisk) {
     ZX_DEBUG_ASSERT(options.use_ramdisk);
     if (options.use_ramdisk) {
-        zx_status_t result = create_ramdisk(options.ramdisk_block_size,
+        zx_status_t result = ramdisk_create(options.ramdisk_block_size,
                                             options.ramdisk_block_count, out_ramdisk);
         if (result != ZX_OK) {
             LOG_ERROR(result,
@@ -94,29 +95,6 @@ zx_status_t RemoveRamdisk(const FixtureOptions& options, ramdisk_client_t* ramdi
     return ZX_OK;
 }
 
-zx_status_t FormatDevice(const FixtureOptions& options, const fbl::String& block_device_path) {
-    // Format device.
-    mkfs_options_t mkfs_options = default_mkfs_options;
-    zx_status_t result = mkfs(block_device_path.c_str(), options.fs_type,
-                              launch_stdio_sync, &mkfs_options);
-    if (result != ZX_OK) {
-        LOG_ERROR(result, "Failed to format block device.\nblock_device_path:%s\n",
-                  block_device_path.c_str());
-        return result;
-    }
-
-    // Verify format.
-    fsck_options_t fsck_options = default_fsck_options;
-    result = fsck(block_device_path.c_str(), options.fs_type, &fsck_options, launch_stdio_sync);
-    if (result != ZX_OK) {
-        LOG_ERROR(result, "Block device format has errors.\nblock_device_path:%s\n",
-                  block_device_path.c_str());
-        return result;
-    }
-
-    return ZX_OK;
-}
-
 zx_status_t MakeFvm(const fbl::String& block_device_path, uint64_t fvm_slice_size,
                     fbl::String* partition_path, bool* fvm_mounted) {
     zx_status_t result = ZX_OK;
@@ -135,7 +113,18 @@ zx_status_t MakeFvm(const fbl::String& block_device_path, uint64_t fvm_slice_siz
     *fvm_mounted = true;
     fbl::String fvm_device_path = fbl::StringPrintf("%s/fvm", block_device_path.c_str());
     // Bind FVM Driver.
-    result = ToStatus(ioctl_device_bind(fd.get(), kFvmDriverLibPath, strlen(kFvmDriverLibPath)));
+    fdio_t* io = fdio_unsafe_fd_to_io(fd.get());
+    if (io == NULL) {
+        return ZX_ERR_INTERNAL;
+    }
+    zx_status_t call_status;
+    result = fuchsia_device_ControllerBind(fdio_unsafe_borrow_channel(io),
+                                           kFvmDriverLibPath, strlen(kFvmDriverLibPath),
+                                           &call_status);
+    fdio_unsafe_release(io);
+    if (result == ZX_OK) {
+        result = call_status;
+    }
     if (result != ZX_OK) {
         LOG_ERROR(result, "Failed to bind fvm driver to block device.\nblock_device:%s\n",
                   block_device_path.c_str());
@@ -226,7 +215,7 @@ Fixture::~Fixture() {
     // Sanity check, teardown any resources if these two were not called yet.
     TearDown();
     TearDownTestCase();
-};
+}
 
 zx_status_t Fixture::Mount() {
     fbl::unique_fd fd(open(GetFsBlockDevice().c_str(), O_RDWR));
@@ -301,6 +290,30 @@ zx_status_t Fixture::Umount() {
     return ZX_OK;
 }
 
+zx_status_t Fixture::Format() const {
+    // Format device.
+    mkfs_options_t mkfs_options = default_mkfs_options;
+    fbl::String block_device_path = GetFsBlockDevice();
+    zx_status_t result = mkfs(block_device_path.c_str(), options_.fs_type,
+                              launch_stdio_sync, &mkfs_options);
+    if (result != ZX_OK) {
+        LOG_ERROR(result, "Failed to format block device.\nblock_device_path:%s\n",
+                  block_device_path.c_str());
+        return result;
+    }
+
+    // Verify format.
+    fsck_options_t fsck_options = default_fsck_options;
+    result = fsck(block_device_path.c_str(), options_.fs_type, &fsck_options, launch_stdio_sync);
+    if (result != ZX_OK) {
+        LOG_ERROR(result, "Block device format has errors.\nblock_device_path:%s\n",
+                  block_device_path.c_str());
+        return result;
+    }
+
+    return ZX_OK;
+}
+
 zx_status_t Fixture::SetUpTestCase() {
     LOG_INFO("Using random seed: %u\n", options_.seed);
     seed_ = options_.seed;
@@ -339,7 +352,7 @@ zx_status_t Fixture::SetUp() {
     fs_path_ = fbl::StringPrintf(kFsPath, kMemFsPath);
     zx_status_t result;
     if (options_.fs_format) {
-        result = FormatDevice(options_, GetFsBlockDevice());
+        result = Format();
         if (result != ZX_OK) {
             return result;
         }
@@ -369,7 +382,7 @@ zx_status_t Fixture::TearDown() {
     // If real device not in FVM, clean it.
     if (!block_device_path_.empty() && !options_.use_fvm &&
         fs_state_ == ResourceState::kAllocated) {
-        result = FormatDevice(options_, block_device_path_);
+        result = Format();
         if (result != ZX_OK) {
             return result;
         }

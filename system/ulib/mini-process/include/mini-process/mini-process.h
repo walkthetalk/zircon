@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <zircon/types.h>
@@ -19,21 +20,32 @@ __BEGIN_CDECLS
 // The process creates an event and sends it back on |handle|.
 // The return value upon success is ZX_OK.
 #define MINIP_CMD_CREATE_EVENT               (1 << 1)
+// The process creates a profile sends it back on |handle|.
+// Because mini-process does not have a handle to the root job, this will always fail.
+#define MINIP_CMD_CREATE_PROFILE             (1 << 2)
 // The process creates a channel and sends one end back on |handle|.
 // The return value upon success is ZX_OK.
-#define MINIP_CMD_CREATE_CHANNEL             (1 << 2)
+#define MINIP_CMD_CREATE_CHANNEL             (1 << 3)
 // The following two commands cause the process to call a syscall with an
 // invalid handle value.  The return value is the result of that syscall.
-#define MINIP_CMD_USE_BAD_HANDLE_CLOSED      (1 << 3)
-#define MINIP_CMD_USE_BAD_HANDLE_TRANSFERRED (1 << 4)
+#define MINIP_CMD_USE_BAD_HANDLE_CLOSED      (1 << 4)
+#define MINIP_CMD_USE_BAD_HANDLE_TRANSFERRED (1 << 5)
 // The process will execute __builtin_trap() which causes a fatal exception.
 // The return value upon success is ZX_ERR_PEER_CLOSED.
-#define MINIP_CMD_BUILTIN_TRAP               (1 << 5)
+#define MINIP_CMD_BUILTIN_TRAP               (1 << 6)
 // The process just calls zx_process_exit() immediately without replying.
 // The return value upon success is ZX_ERR_PEER_CLOSED.
-#define MINIP_CMD_EXIT_NORMAL                (1 << 6)
+#define MINIP_CMD_EXIT_NORMAL                (1 << 7)
 // The process calls zx_object_info( ZX_INFO_HANDLE_VALID) on a closed handle.
-#define MINIP_CMD_VALIDATE_CLOSED_HANDLE     (1 << 7)
+#define MINIP_CMD_VALIDATE_CLOSED_HANDLE     (1 << 8)
+// The process creates a pager vmo and sends it back on |handle|.
+#define MINIP_CMD_CREATE_PAGER_VMO           (1 << 9)
+// The process attempts to create a contiguous vmo and send it back on |handle|.
+// This will always fail because we don't supply a bti handle.
+#define MINIP_CMD_CREATE_VMO_CONTIGUOUS      (1 << 10)
+// The process attempts to create a physical vmo and send it back on |handle|.
+// This will always fail because we don't supply a mmio resource.
+#define MINIP_CMD_CREATE_VMO_PHYSICAL        (1 << 11)
 
 // Create and run a minimal process with one thread that blocks forever.
 // Does not require a host binary.
@@ -49,6 +61,18 @@ zx_status_t start_mini_process_etc(zx_handle_t process, zx_handle_t thread,
                                    zx_handle_t vmar,
                                    zx_handle_t transferred_handle,
                                    zx_handle_t* cntrl_channel);
+
+// Loads the vDSO into a process.  |base| and |entry| can be NULL.  This is not
+// thread-safe.  It steals the startup handle, so it's not compatible with also
+// using launchpad (which also needs to steal the startup handle).
+zx_status_t mini_process_load_vdso(zx_handle_t process, zx_handle_t vmar,
+                                   uintptr_t* base, uintptr_t* entry);
+
+// Set up a stack VMO mapped into a process.  If |with_code| is true, this
+// will include the mini-process code stub.  Otherwise, the stack will not
+// be executable.
+zx_status_t mini_process_load_stack(zx_handle_t vmar, bool with_code,
+                                    uintptr_t* stack_base, uintptr_t *sp);
 
 // Starts a no-VDSO infinite-loop thread.
 zx_status_t start_mini_process_thread(zx_handle_t thread, zx_handle_t vmar);

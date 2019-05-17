@@ -333,6 +333,14 @@ enum class Consumer : uint32_t {
     kGenericGUIAppControls      = 0x200
 };
 
+// These are the values that Digitizer::kTouchscreenInputMode can
+// take and their respective meanings.
+enum class TouchScreenInputMode : uint32_t {
+    kMouse                          = 0x00,
+    kSingleInput                    = 0x01,
+    kMultipleInput                  = 0x02,
+};
+
 enum class Digitizer : uint32_t {
     kUndefined                      = 0x00,
 
@@ -349,8 +357,11 @@ enum class Digitizer : uint32_t {
     kArmature                       = 0x0b,
     kMultiplePointDigitizer         = 0x0c,
     kFreeSpaceWand                  = 0x0d,
+    kTouchScreenConfiguration       = 0x0E,
 
+    kStylus                         = 0x20,
     kFinger                         = 0x22,
+    kTouchScreenDeviceSettings      = 0x23,
 
     kTipPressure                    = 0x30,
     kBarrelPressure                 = 0x31,
@@ -380,6 +391,7 @@ enum class Digitizer : uint32_t {
     kHeight                         = 0x49,
 
     kContactID                      = 0x51,
+    kTouchScreenInputMode           = 0x52,
     kContactCount                   = 0x54,
     kScanTime                       = 0x56,
 };
@@ -388,6 +400,22 @@ enum class Sensor : uint32_t {
     kUndefined                      = 0x00,
 
     kAmbientLight                   = 0x41,
+    kAccelerometer3D                = 0x73,
+    kGyrometer3D                    = 0x76,
+    kMagnetometer                   = 0xC2,
+
+    kAccelerationAxisX              = 0x453,
+    kAccelerationAxisY              = 0x454,
+    kAccelerationAxisZ              = 0x455,
+    kDistanceAxisX                  = 0x47A,
+    kDistanceAxisY                  = 0x47B,
+    kDistanceAxisZ                  = 0x47C,
+    kTiltAxisX                      = 0x47F,
+    kTiltAxisY                      = 0x480,
+    kTiltAxisZ                      = 0x481,
+    kMagneticFluxAxisX              = 0x485,
+    kMagneticFluxAxisY              = 0x486,
+    kMagneticFluxAxisZ              = 0x487,
     kLightIlluminance               = 0x4D1,
     kLightColorTemperature          = 0x4D2,
     kLightChromaticity              = 0x4D3,

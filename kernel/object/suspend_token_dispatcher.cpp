@@ -10,10 +10,14 @@
 
 #include <fbl/alloc_checker.h>
 #include <fbl/unique_ptr.h>
+#include <lib/counters.h>
 #include <kernel/auto_lock.h>
 #include <object/process_dispatcher.h>
 #include <object/thread_dispatcher.h>
 #include <zircon/rights.h>
+
+KCOUNTER(dispatcher_suspend_token_create_count, "dispatcher.suspend_token.create")
+KCOUNTER(dispatcher_suspend_token_destroy_count, "dispatcher.suspend_token.destroy")
 
 namespace {
 
@@ -54,28 +58,35 @@ void ResumeTask(fbl::RefPtr<Dispatcher> task) {
 } // namespace
 
 zx_status_t SuspendTokenDispatcher::Create(fbl::RefPtr<Dispatcher> task,
-                                           fbl::RefPtr<SuspendTokenDispatcher>* dispatcher,
+                                           KernelHandle<SuspendTokenDispatcher>* handle,
                                            zx_rights_t* rights) {
     fbl::AllocChecker ac;
-    ktl::unique_ptr<SuspendTokenDispatcher> disp(new (&ac) SuspendTokenDispatcher(task));
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) SuspendTokenDispatcher()));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    zx_status_t status = SuspendTask(ktl::move(task));
+    zx_status_t status = SuspendTask(task);
     if (status != ZX_OK)
         return status;
 
+    // Save the task after suspending so that on_zero_handles() resumes it.
+    new_handle.dispatcher()->task_ = ktl::move(task);
+
     *rights = default_rights();
-    *dispatcher = fbl::AdoptRef(disp.release());
+    *handle = ktl::move(new_handle);
     return ZX_OK;
 }
 
-SuspendTokenDispatcher::SuspendTokenDispatcher(fbl::RefPtr<Dispatcher> task)
-    : task_(ktl::move(task)) {}
+SuspendTokenDispatcher::SuspendTokenDispatcher() {
+    kcounter_add(dispatcher_suspend_token_create_count, 1);
+}
 
-SuspendTokenDispatcher::~SuspendTokenDispatcher() {}
+SuspendTokenDispatcher::~SuspendTokenDispatcher() {
+    kcounter_add(dispatcher_suspend_token_destroy_count, 1);
+}
 
 void SuspendTokenDispatcher::on_zero_handles() {
     // This is only called once and we're done with |task_| afterwards so we can move it out.
-    ResumeTask(ktl::move(task_));
+    if (task_)
+        ResumeTask(ktl::move(task_));
 }

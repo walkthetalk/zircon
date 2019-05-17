@@ -65,20 +65,20 @@ static void dump_fault_frame(x86_iframe_t* frame) {
     }
 }
 
-KCOUNTER(exceptions_debug, "kernel.exceptions.debug");
-KCOUNTER(exceptions_nmi, "kernel.exceptions.nmi");
-KCOUNTER(exceptions_brkpt, "kernel.exceptions.breakpoint");
-KCOUNTER(exceptions_invop, "kernel.exceptions.inv_opcode");
-KCOUNTER(exceptions_dev_na, "kernel.exceptions.dev_na");
-KCOUNTER(exceptions_dfault, "kernel.exceptions.double_fault");
-KCOUNTER(exceptions_fpu, "kernel.exceptions.fpu");
-KCOUNTER(exceptions_simd, "kernel.exceptions.simd");
-KCOUNTER(exceptions_gpf, "kernel.exceptions.gpf");
-KCOUNTER(exceptions_page, "kernel.exceptions.page_fault");
-KCOUNTER(exceptions_apic_err, "kernel.exceptions.apic_error");
-KCOUNTER(exceptions_irq, "kernel.exceptions.irq");
-KCOUNTER(exceptions_unhandled, "kernel.exceptions.unhandled");
-KCOUNTER(exceptions_user, "kernel.exceptions.user");
+KCOUNTER(exceptions_debug, "exceptions.debug")
+KCOUNTER(exceptions_nmi, "exceptions.nmi")
+KCOUNTER(exceptions_brkpt, "exceptions.breakpoint")
+KCOUNTER(exceptions_invop, "exceptions.inv_opcode")
+KCOUNTER(exceptions_dev_na, "exceptions.dev_na")
+KCOUNTER(exceptions_dfault, "exceptions.double_fault")
+KCOUNTER(exceptions_fpu, "exceptions.fpu")
+KCOUNTER(exceptions_simd, "exceptions.simd")
+KCOUNTER(exceptions_gpf, "exceptions.gpf")
+KCOUNTER(exceptions_page, "exceptions.page_fault")
+KCOUNTER(exceptions_apic_err, "exceptions.apic_error")
+KCOUNTER(exceptions_irq, "exceptions.irq")
+KCOUNTER(exceptions_unhandled, "exceptions.unhandled")
+KCOUNTER(exceptions_user, "exceptions.user")
 
 __NO_RETURN static void exception_die(x86_iframe_t* frame, const char* msg) {
     platform_panic_start();
@@ -100,23 +100,13 @@ __NO_RETURN static void exception_die(x86_iframe_t* frame, const char* msg) {
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
 
-static zx_status_t call_dispatch_user_exception(uint kind,
-                                                struct arch_exception_context* context,
-                                                x86_iframe_t* frame) {
-    thread_t* thread = get_current_thread();
-    x86_set_suspended_general_regs(&thread->arch, X86_GENERAL_REGS_IFRAME, frame);
-    zx_status_t status = dispatch_user_exception(kind, context);
-    x86_reset_suspended_general_regs(&thread->arch);
-    return status;
-}
-
-static bool try_dispatch_user_exception(x86_iframe_t* frame, uint kind) {
+static bool try_dispatch_user_exception(x86_iframe_t* frame, uint exception_type) {
     if (is_from_user(frame)) {
         struct arch_exception_context context = {false, frame, 0};
         thread_preempt_reenable_no_resched();
         arch_set_blocking_disallowed(false);
         arch_enable_ints();
-        zx_status_t erc = call_dispatch_user_exception(kind, &context, frame);
+        zx_status_t erc = dispatch_user_exception(exception_type, &context);
         arch_disable_ints();
         arch_set_blocking_disallowed(true);
         thread_preempt_disable();
@@ -319,8 +309,7 @@ static zx_status_t x86_pfe_handler(x86_iframe_t* frame) {
     if (is_from_user(frame)) {
         kcounter_add(exceptions_user, 1);
         struct arch_exception_context context = {true, frame, va};
-        return call_dispatch_user_exception(ZX_EXCP_FATAL_PAGE_FAULT,
-                                            &context, frame);
+        return dispatch_user_exception(ZX_EXCP_FATAL_PAGE_FAULT, &context);
     }
 
     /* fall through to fatal path */
@@ -466,9 +455,12 @@ void x86_exception_handler(x86_iframe_t* frame) {
     bool from_user = is_from_user(frame);
 
     // deliver the interrupt
-    ktrace_tiny(TAG_IRQ_ENTER, ((uint32_t)frame->vector << 8) | arch_curr_cpu_num());
+    const auto entry_vector = frame->vector;
+    ktrace_tiny(TAG_IRQ_ENTER, (static_cast<uint32_t>(entry_vector) << 8) | arch_curr_cpu_num());
 
     handle_exception_types(frame);
+
+    ktrace_tiny(TAG_IRQ_EXIT, (static_cast<uint32_t>(entry_vector) << 8) | arch_curr_cpu_num());
 
     bool do_preempt = int_handler_finish(&state);
 
@@ -482,8 +474,6 @@ void x86_exception_handler(x86_iframe_t* frame) {
 
     if (do_preempt)
         thread_preempt();
-
-    ktrace_tiny(TAG_IRQ_EXIT, ((uint)frame->vector << 8) | arch_curr_cpu_num());
 
     DEBUG_ASSERT_MSG(arch_ints_disabled(),
                      "ints disabled on way out of exception, vector %" PRIu64 " IP %#" PRIx64 "\n",
@@ -518,14 +508,28 @@ void arch_fill_in_exception_context(const arch_exception_context_t* arch_context
                                     zx_exception_report_t* report) {
     zx_exception_context_t* zx_context = &report->context;
 
-    zx_context->arch.u.x86_64.vector = arch_context->frame->vector;
-    zx_context->arch.u.x86_64.err_code = arch_context->frame->err_code;
+    // TODO(ZX-563): |frame| will be nullptr for synthetic exceptions that
+    // don't provide general register values yet.
+    if (arch_context->frame) {
+        zx_context->arch.u.x86_64.vector = arch_context->frame->vector;
+        zx_context->arch.u.x86_64.err_code = arch_context->frame->err_code;
+    }
     zx_context->arch.u.x86_64.cr2 = arch_context->cr2;
 }
 
 zx_status_t arch_dispatch_user_policy_exception(void) {
-    x86_iframe_t frame = {};
     arch_exception_context_t context = {};
-    context.frame = &frame;
     return dispatch_user_exception(ZX_EXCP_POLICY_ERROR, &context);
+}
+
+void arch_install_context_regs(thread_t* thread, const arch_exception_context_t* context) {
+    // TODO(ZX-563): |context->frame| will be nullptr for exceptions that
+    // don't (yet) provide the registers.
+    if (context->frame) {
+        x86_set_suspended_general_regs(&thread->arch, X86_GENERAL_REGS_IFRAME, context->frame);
+    }
+}
+
+void arch_remove_context_regs(thread_t* thread) {
+    x86_reset_suspended_general_regs(&thread->arch);
 }

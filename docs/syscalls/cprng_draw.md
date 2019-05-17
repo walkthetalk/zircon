@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-cprng_draw - Draw from the kernel's CPRNG
+Draw from the kernel's CPRNG.
 
 ## SYNOPSIS
 
@@ -37,3 +37,11 @@ a valid userspace pointer.
 
 There are no other error conditions.  If its arguments are valid,
 `zx_cprng_draw()` will succeed.
+
+## SEE ALSO
+
+ - [`zx_cprng_add_entropy()`]
+
+<!-- References updated by update-docs-from-abigen, do not edit. -->
+
+[`zx_cprng_add_entropy()`]: cprng_add_entropy.md

@@ -5,11 +5,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <threads.h>
+#include <utility>
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <zircon/device/pty.h>
+#include <fbl/auto_lock.h>
+#include <fuchsia/device/c/fidl.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
+#include <lib/zx/channel.h>
 #include <zircon/errors.h>
 
 #include "pty-core.h"
@@ -37,7 +41,7 @@ struct pty_client {
     list_node_t node;
 };
 
-static zx_status_t pty_openat(pty_server_t* ps, zx_device_t** out, uint32_t id, uint32_t flags);
+static zx_status_t pty_open_client(pty_server_t* ps, uint32_t id, zx::channel channel);
 
 // pty client device operations
 
@@ -66,6 +70,21 @@ static zx_status_t pty_client_read(void* ctx, void* buf, size_t count, zx_off_t 
     }
 }
 
+static zx_status_t pty_client_write_chunk_locked(pty_client_t* pc, pty_server_t* ps,
+                                                 const void* buf, size_t count,
+                                                 size_t* actual) {
+    size_t length;
+
+    zx_status_t status = ps->recv(ps, buf, count, &length);
+    if (status == ZX_OK) {
+        *actual = length;
+    } else if (status == ZX_ERR_SHOULD_WAIT) {
+        device_state_clr(pc->zxdev, DEV_STATE_WRITABLE);
+    }
+
+    return status;
+}
+
 static zx_status_t pty_client_write(void* ctx, const void* buf, size_t count, zx_off_t off,
                                     size_t* actual) {
     auto pc = static_cast<pty_client_t*>(ctx);
@@ -74,25 +93,83 @@ static zx_status_t pty_client_write(void* ctx, const void* buf, size_t count, zx
 
     zx_status_t status;
 
-    mtx_lock(&ps->lock);
-    if (pc->flags & PTY_CLI_ACTIVE) {
-        size_t length;
-        status = ps->recv(ps, buf, count, &length);
-        if (status == ZX_OK) {
-            *actual = length;
-        } else if (status == ZX_ERR_SHOULD_WAIT) {
-            device_state_clr(pc->zxdev, DEV_STATE_WRITABLE);
-        }
-    } else {
-        status = (pc->flags & PTY_CLI_PEER_CLOSED) ? ZX_ERR_PEER_CLOSED : ZX_ERR_SHOULD_WAIT;
+    if (count == 0) {
+        *actual = 0;
+        return ZX_OK;
     }
-    mtx_unlock(&ps->lock);
 
-    return status;
+    fbl::AutoLock lock(&ps->lock);
+
+    if (!(pc->flags & PTY_CLI_ACTIVE)) {
+        return (pc->flags & PTY_CLI_PEER_CLOSED) ? ZX_ERR_PEER_CLOSED : ZX_ERR_SHOULD_WAIT;
+    }
+
+    if (pc->flags & fuchsia_hardware_pty_FEATURE_RAW) {
+        return pty_client_write_chunk_locked(pc, ps, buf, count, actual);
+    }
+
+    // newline translation time
+    auto chunk_start = static_cast<const char*>(buf);
+    auto chunk_end = chunk_start;
+    size_t chunk_length;
+    size_t chunk_actual;
+    size_t sent = 0;
+
+    auto partial_result = [&sent, actual](zx_status_t status) {
+        if (sent) {
+            *actual = sent;
+            return ZX_OK;
+        }
+        return status;
+    };
+
+    for (size_t i = 0; i < count; i++) {
+        // just iterate until there's a linefeed character
+        if (*chunk_end != '\n') {
+            chunk_end++;
+            continue;
+        }
+
+        // send up to (but not including) the linefeed
+        chunk_length = chunk_end - chunk_start;
+        status = pty_client_write_chunk_locked(pc, ps, chunk_start, chunk_length, &chunk_actual);
+        if (status != ZX_OK) {
+            return partial_result(status);
+        }
+
+        sent += chunk_actual;
+        if (chunk_actual != chunk_length) {
+            return partial_result(status);
+        }
+
+        // send the line ending
+        status = pty_client_write_chunk_locked(pc, ps, "\r\n", 2, &chunk_actual);
+        if (status != ZX_OK) {
+            return partial_result(status);
+        }
+
+        // this case means only the \r of the \r\n was sent; report to the caller
+        // as if it didn't work at all
+        if (chunk_actual != 2) {
+            return partial_result(status);
+        }
+
+        // don't increment for the \r
+        sent++;
+
+        chunk_start = chunk_end + 1;
+        chunk_end = chunk_start;
+    }
+
+    // finish up the buffer if necessary
+    chunk_length = chunk_end - chunk_start;
+    status = pty_client_write_chunk_locked(pc, ps, chunk_start, chunk_length, &chunk_actual);
+    if (status == ZX_OK) {
+        sent += chunk_actual;
+    }
+
+    return partial_result(status);
 }
-
-// mask of invalid features
-#define PTY_FEATURE_BAD (~PTY_FEATURE_RAW)
 
 static void pty_make_active_locked(pty_server_t* ps, pty_client_t* pc) {
     zxlogf(TRACE, "PTY Client %p (id=%u) becomes active\n", pc, pc->id);
@@ -128,87 +205,6 @@ static void pty_adjust_signals_locked(pty_client_t* pc) {
     device_state_clr_set(pc->zxdev, clr, set);
 }
 
-static zx_status_t pty_client_ioctl(void* ctx, uint32_t op, const void* in_buf, size_t in_len,
-                                    void* out_buf, size_t out_len, size_t* out_actual) {
-    auto pc = static_cast<pty_client_t*>(ctx);
-    auto ps = static_cast<pty_server_t*>(pc->srv);
-
-    switch (op) {
-    case IOCTL_PTY_CLR_SET_FEATURE: {
-        zxlogf(TRACE, "PTY Client %p (id=%u) ioctl: clear and/or set feature\n", pc, pc->id);
-        auto cs = static_cast<const pty_clr_set_t*>(in_buf);
-        if ((in_len != sizeof(pty_clr_set_t)) || (cs->clr & PTY_FEATURE_BAD) ||
-            (cs->set & PTY_FEATURE_BAD)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        mtx_lock(&ps->lock);
-        pc->flags = (pc->flags & (~cs->clr)) | cs->set;
-        mtx_unlock(&ps->lock);
-        return ZX_OK;
-    }
-    case IOCTL_PTY_GET_WINDOW_SIZE: {
-        zxlogf(TRACE, "PTY Client %p (id=%u) ioctl: get window size\n", pc, pc->id);
-        auto wsz = static_cast<pty_window_size_t*>(out_buf);
-        if (out_len != sizeof(pty_window_size_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        mtx_lock(&ps->lock);
-        wsz->width = ps->width;
-        wsz->height = ps->height;
-        mtx_unlock(&ps->lock);
-        *out_actual = sizeof(pty_window_size_t);
-        return ZX_OK;
-    }
-    case IOCTL_PTY_MAKE_ACTIVE: {
-        zxlogf(TRACE, "PTY Client %p (id=%u) ioctl: make active\n", pc, pc->id);
-        if (in_len != sizeof(uint32_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        if (!(pc->flags & PTY_CLI_CONTROL)) {
-            return ZX_ERR_ACCESS_DENIED;
-        }
-        uint32_t id = *((uint32_t*)in_buf);
-        mtx_lock(&ps->lock);
-        pty_client_t* c;
-        list_for_every_entry (&ps->clients, c, pty_client_t, node) {
-            if (c->id == id) {
-                pty_make_active_locked(ps, c);
-                mtx_unlock(&ps->lock);
-                return ZX_OK;
-            }
-        }
-        mtx_unlock(&ps->lock);
-        return ZX_ERR_NOT_FOUND;
-    }
-    case IOCTL_PTY_READ_EVENTS: {
-        zxlogf(TRACE, "PTY Client %p (id=%u) ioctl: read events\n", pc, pc->id);
-        if (!(pc->flags & PTY_CLI_CONTROL)) {
-            return ZX_ERR_ACCESS_DENIED;
-        }
-        if (out_len != sizeof(uint32_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        mtx_lock(&ps->lock);
-        auto events = static_cast<uint32_t*>(out_buf);
-        *events = ps->events;
-        ps->events = 0;
-        if (ps->active == NULL) {
-            *events |= PTY_EVENT_HANGUP;
-        }
-        device_state_clr(pc->zxdev, PTY_SIGNAL_EVENT);
-        mtx_unlock(&ps->lock);
-        *out_actual = sizeof(uint32_t);
-        return ZX_OK;
-    }
-    default:
-        if (ps->ioctl != NULL) {
-            return ps->ioctl(ps, op, in_buf, in_len, out_buf, out_len, out_actual);
-        } else {
-            return ZX_ERR_NOT_SUPPORTED;
-        }
-    }
-}
-
 static void pty_client_release(void* ctx) {
     auto pc = static_cast<pty_client_t*>(ctx);
     auto ps = static_cast<pty_server_t*>(pc->srv);
@@ -227,7 +223,8 @@ static void pty_client_release(void* ctx) {
     if (ps->active == pc) {
         // signal controlling client as well, if there is one
         if (ps->control) {
-            device_state_set(ps->control->zxdev, PTY_SIGNAL_EVENT | DEV_STATE_HANGUP);
+            device_state_set(ps->control->zxdev,
+                             fuchsia_hardware_pty_SIGNAL_EVENT | DEV_STATE_HANGUP);
         }
         ps->active = NULL;
     }
@@ -249,10 +246,11 @@ static void pty_client_release(void* ctx) {
     free(pc);
 }
 
-zx_status_t pty_client_openat(void* ctx, zx_device_t** out, const char* path, uint32_t flags) {
+zx_status_t pty_client_fidl_OpenClient(void* ctx, uint32_t id, zx_handle_t handle,
+                                       fidl_txn_t* txn) {
     auto pc = static_cast<pty_client_t*>(ctx);
     auto ps = static_cast<pty_server_t*>(pc->srv);
-    uint32_t id = static_cast<uint32_t>(strtoul(path, NULL, 0));
+    zx::channel channel(handle);
     zxlogf(TRACE, "PTY Client %p (id=%u) openat %u\n", pc, pc->id, id);
     // only controlling clients may create additional clients
     if (!(pc->flags & PTY_CLI_CONTROL)) {
@@ -262,27 +260,127 @@ zx_status_t pty_client_openat(void* ctx, zx_device_t** out, const char* path, ui
     if (id == 0) {
         return ZX_ERR_INVALID_ARGS;
     }
-    return pty_openat(ps, out, id, flags);
+    zx_status_t status = pty_open_client(ps, id, std::move(channel));
+    return fuchsia_hardware_pty_DeviceOpenClient_reply(txn, status);
+}
+
+#define fuchsia_hardware_pty_FEATURE_BAD (~fuchsia_hardware_pty_FEATURE_RAW)
+
+zx_status_t pty_client_ClrSetFeature(void* ctx, uint32_t clr, uint32_t set, fidl_txn_t* txn) {
+    auto pc = static_cast<pty_client_t*>(ctx);
+    auto ps = static_cast<pty_server_t*>(pc->srv);
+    zx_status_t status = ZX_OK;
+
+    zxlogf(TRACE, "PTY Client %p (id=%u) message: clear and/or set feature\n", pc, pc->id);
+    if ((clr & fuchsia_hardware_pty_FEATURE_BAD) ||
+        (set & fuchsia_hardware_pty_FEATURE_BAD)) {
+        status = ZX_ERR_NOT_SUPPORTED;
+    } else {
+        fbl::AutoLock(&ps->lock);
+        pc->flags = (pc->flags & ~clr) | set;
+    }
+    return fuchsia_hardware_pty_DeviceClrSetFeature_reply(txn, status, pc->flags);
+}
+
+zx_status_t pty_client_GetWindowSize(void* ctx, fidl_txn_t* txn) {
+    auto pc = static_cast<pty_client_t*>(ctx);
+    auto ps = static_cast<pty_server_t*>(pc->srv);
+
+    zxlogf(TRACE, "PTY Client %p (id=%u) message: get window size\n", pc, pc->id);
+    mtx_lock(&ps->lock);
+    fuchsia_hardware_pty_WindowSize wsz;
+    wsz.width = ps->width;
+    wsz.height = ps->height;
+    mtx_unlock(&ps->lock);
+
+    return fuchsia_hardware_pty_DeviceGetWindowSize_reply(txn, ZX_OK, &wsz);
+}
+
+zx_status_t pty_client_MakeActive(void* ctx, uint32_t client_pty_id, fidl_txn_t* txn) {
+    auto pc = static_cast<pty_client_t*>(ctx);
+    auto ps = static_cast<pty_server_t*>(pc->srv);
+
+    zxlogf(TRACE, "PTY Client %p (id=%u) message: make active\n", pc, pc->id);
+
+    if (!(pc->flags & PTY_CLI_CONTROL)) {
+        return fuchsia_hardware_pty_DeviceMakeActive_reply(txn, ZX_ERR_ACCESS_DENIED);
+    }
+    mtx_lock(&ps->lock);
+    pty_client_t* c;
+    list_for_every_entry (&ps->clients, c, pty_client_t, node) {
+        if (c->id == client_pty_id) {
+            pty_make_active_locked(ps, c);
+            mtx_unlock(&ps->lock);
+            return fuchsia_hardware_pty_DeviceMakeActive_reply(txn, ZX_OK);
+        }
+    }
+    mtx_unlock(&ps->lock);
+    return fuchsia_hardware_pty_DeviceMakeActive_reply(txn, ZX_ERR_NOT_FOUND);
+}
+
+zx_status_t pty_client_ReadEvents(void* ctx, fidl_txn_t* txn) {
+    auto pc = static_cast<pty_client_t*>(ctx);
+    auto ps = static_cast<pty_server_t*>(pc->srv);
+    uint32_t events = 0;
+
+    zxlogf(TRACE, "PTY Client %p (id=%u) message: read events\n", pc, pc->id);
+    if (!(pc->flags & PTY_CLI_CONTROL)) {
+        return fuchsia_hardware_pty_DeviceReadEvents_reply(txn, ZX_ERR_ACCESS_DENIED, events);
+    }
+    mtx_lock(&ps->lock);
+    events = ps->events;
+    ps->events = 0;
+    if (ps->active == NULL) {
+        events |= fuchsia_hardware_pty_EVENT_HANGUP;
+    }
+    device_state_clr(pc->zxdev, fuchsia_hardware_pty_SIGNAL_EVENT);
+    mtx_unlock(&ps->lock);
+    return fuchsia_hardware_pty_DeviceReadEvents_reply(txn, ZX_OK, events);
+}
+
+zx_status_t pty_client_SetWindowSize(void* ctx, const fuchsia_hardware_pty_WindowSize* size,
+                                     fidl_txn_t* txn) {
+    auto pc = static_cast<pty_client_t*>(ctx);
+    auto ps = static_cast<pty_server_t*>(pc->srv);
+
+    if (ps->set_window_size != NULL) {
+        return ps->set_window_size(ps, size, txn);
+    } else {
+        return fuchsia_hardware_pty_DeviceSetWindowSize_reply(txn, ZX_ERR_NOT_SUPPORTED);
+    }
+}
+
+static fuchsia_hardware_pty_Device_ops_t fidl_ops = {
+    .OpenClient = pty_client_fidl_OpenClient,
+    .ClrSetFeature = pty_client_ClrSetFeature,
+    .GetWindowSize = pty_client_GetWindowSize,
+    .MakeActive = pty_client_MakeActive,
+    .ReadEvents = pty_client_ReadEvents,
+    .SetWindowSize = pty_client_SetWindowSize
+};
+
+zx_status_t pty_client_message(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_Device_dispatch(ctx, txn, msg, &fidl_ops);
 }
 
 zx_protocol_device_t pc_ops = []() {
     zx_protocol_device_t ops = {};
     ops.version = DEVICE_OPS_VERSION;
     // ops.open = default, allow cloning
-    ops.open_at = pty_client_openat;
     ops.release = pty_client_release;
     ops.read = pty_client_read;
     ops.write = pty_client_write;
-    ops.ioctl = pty_client_ioctl;
+    ops.message = pty_client_message;
     return ops;
 }();
 
-// used by both client and server ptys to create new client ptys
-
-static zx_status_t pty_openat(pty_server_t* ps, zx_device_t** out, uint32_t id, uint32_t flags) {
+static zx_status_t pty_open_client(pty_server_t* ps, uint32_t id, zx::channel channel) {
     auto pc = static_cast<pty_client_t*>(calloc(1, sizeof(pty_client_t)));
     if (!pc) {
         return ZX_ERR_NO_MEMORY;
+    }
+    if (!channel) {
+        return ZX_ERR_INVALID_ARGS;
     }
 
     pc->id = id;
@@ -316,6 +414,7 @@ static zx_status_t pty_openat(pty_server_t* ps, zx_device_t** out, uint32_t id, 
     args.ctx = pc;
     args.ops = &pc_ops;
     args.flags = DEVICE_ADD_INSTANCE;
+    args.client_remote = channel.release();
 
     status = device_add(ps->zxdev, &args, &pc->zxdev);
     if (status < 0) {
@@ -343,7 +442,6 @@ static zx_status_t pty_openat(pty_server_t* ps, zx_device_t** out, uint32_t id, 
     pty_adjust_signals_locked(pc);
     mtx_unlock(&ps->lock);
 
-    *out = pc->zxdev;
     return ZX_OK;
 }
 
@@ -375,7 +473,7 @@ zx_status_t pty_server_send(pty_server_t* ps, const void* data, size_t len, bool
             unsigned evt = 0;
             while (n < len) {
                 if (*ch++ == CTRL_C) {
-                    evt = PTY_EVENT_INTERRUPT;
+                    evt = fuchsia_hardware_pty_EVENT_INTERRUPT;
                     break;
                 }
                 n++;
@@ -387,7 +485,8 @@ zx_status_t pty_server_send(pty_server_t* ps, const void* data, size_t len, bool
                 ps->events |= evt;
                 zxlogf(TRACE, "PTY Client %p event %x\n", ps, evt);
                 if (ps->control) {
-                    device_state_set(ps->control->zxdev, PTY_SIGNAL_EVENT);
+                    static_assert(fuchsia_hardware_pty_SIGNAL_EVENT == DEV_STATE_OOB);
+                    device_state_set(ps->control->zxdev, fuchsia_hardware_pty_SIGNAL_EVENT);
                 }
             }
             *actual = r;
@@ -416,11 +515,13 @@ void pty_server_set_window_size(pty_server_t* ps, uint32_t w, uint32_t h) {
     mtx_unlock(&ps->lock);
 }
 
-zx_status_t pty_server_openat(void* ctx, zx_device_t** out, const char* path, uint32_t flags) {
+zx_status_t pty_server_fidl_OpenClient(void* ctx, uint32_t id, zx_handle_t handle,
+                                       fidl_txn_t* txn) {
     auto ps = static_cast<pty_server_t*>(ctx);
-    uint32_t id = static_cast<uint32_t>(strtoul(path, NULL, 0));
-    zxlogf(TRACE, "PTY Server %p openat %u\n", ps, id);
-    return pty_openat(ps, out, id, flags);
+    zx::channel channel(handle);
+    zxlogf(TRACE, "PTY Server %p OpenClient %u\n", ps, id);
+    zx_status_t status = pty_open_client(ps, id, std::move(channel));
+    return fuchsia_hardware_pty_DeviceOpenClient_reply(txn, status);
 }
 
 void pty_server_release(void* ctx) {

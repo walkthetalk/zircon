@@ -46,6 +46,8 @@ const fuchsia_sysmem_BufferCollection_ops_t BufferCollection::kOps = {
     fidl::Binder<BufferCollection>::BindMember<
         &BufferCollection::WaitForBuffersAllocated>,
     fidl::Binder<BufferCollection>::BindMember<
+        &BufferCollection::CheckBuffersAllocated>,
+    fidl::Binder<BufferCollection>::BindMember<
         &BufferCollection::CloseSingleBuffer>,
     fidl::Binder<BufferCollection>::BindMember<
         &BufferCollection::AllocateSingleBuffer>,
@@ -57,7 +59,13 @@ const fuchsia_sysmem_BufferCollection_ops_t BufferCollection::kOps = {
 };
 
 BufferCollection::~BufferCollection() {
-    // nothing else to do here
+    // Close() the SimpleBinding<> before deleting the list of pending Txn(s),
+    // so that ~Txn doesn't complain about being deleted without being
+    // completed.
+    //
+    // Don't run the error handler; if any error handler remains it'll just get
+    // deleted here.
+    (void)binding_.Close();
 }
 
 zx_status_t BufferCollection::SetEventSink(
@@ -67,7 +75,7 @@ zx_status_t BufferCollection::SetEventSink(
     if (is_done_) {
         FailAsync(
             ZX_ERR_BAD_STATE,
-            "BufferCollectionToken::CloseSingleBuffer() when already is_done_");
+            "BufferCollectionToken::SetEventSink() when already is_done_");
         // We're failing async - no need to try to fail sync.
         return ZX_OK;
     }
@@ -77,7 +85,7 @@ zx_status_t BufferCollection::SetEventSink(
                           "with a non-zero handle.");
         return status;
     }
-    if (set_constraints_seen_) {
+    if (is_set_constraints_seen_) {
         zx_status_t status = ZX_ERR_INVALID_ARGS;
         // It's not required to use SetEventSink(), but if it's used, it must be
         // before SetConstraints().
@@ -119,16 +127,16 @@ zx_status_t BufferCollection::SetConstraints(
     if (is_done_) {
         FailAsync(
             ZX_ERR_BAD_STATE,
-            "BufferCollectionToken::CloseSingleBuffer() when already is_done_");
+            "BufferCollectionToken::SetConstraints() when already is_done_");
         // We're failing async - no need to try to fail sync.
         return ZX_OK;
     }
-    if (set_constraints_seen_) {
+    if (is_set_constraints_seen_) {
         FailAsync(ZX_ERR_NOT_SUPPORTED,
                   "For now, 2nd SetConstraints() causes failure.");
         return ZX_ERR_NOT_SUPPORTED;
     }
-    set_constraints_seen_ = true;
+    is_set_constraints_seen_ = true;
 
     if (!has_constraints) {
         // We don't need any of the handles/info in constraints_param, so close
@@ -154,7 +162,7 @@ zx_status_t BufferCollection::WaitForBuffersAllocated(fidl_txn_t* txn_param) {
     if (is_done_) {
         FailAsync(
             ZX_ERR_BAD_STATE,
-            "BufferCollectionToken::CloseSingleBuffer() when already is_done_");
+            "BufferCollectionToken::WaitForBuffersAllocated() when already is_done_");
         // We're failing async - no need to try to fail sync.
         return ZX_OK;
     }
@@ -166,6 +174,25 @@ zx_status_t BufferCollection::WaitForBuffersAllocated(fidl_txn_t* txn_param) {
     // done, in which case this immediately completes txn.
     MaybeCompleteWaitForBuffersAllocated();
     return ZX_OK;
+}
+
+zx_status_t BufferCollection::CheckBuffersAllocated(fidl_txn_t* txn) {
+    BindingType::Txn::RecognizeTxn(txn);
+    if (is_done_) {
+        FailAsync(ZX_ERR_BAD_STATE,
+                  "BufferCollectionToken::CheckBuffersAllocated() when "
+                  "already is_done_");
+        // We're failing async - no need to try to fail sync.
+        return ZX_OK;
+    }
+    LogicalBufferCollection::AllocationResult allocation_result =
+        parent()->allocation_result();
+    if (allocation_result.status == ZX_OK &&
+        !allocation_result.buffer_collection_info) {
+        return fuchsia_sysmem_BufferCollectionCheckBuffersAllocated_reply(txn, ZX_ERR_UNAVAILABLE);
+    }
+    // Buffer collection has either been allocated or failed.
+    return fuchsia_sysmem_BufferCollectionCheckBuffersAllocated_reply(txn, allocation_result.status);
 }
 
 zx_status_t BufferCollection::CloseSingleBuffer(uint64_t buffer_index) {
@@ -271,17 +298,23 @@ void BufferCollection::OnBuffersAllocated() {
         events_.get(), allocation_result.status, to_send.release());
 }
 
-bool BufferCollection::set_constraints_seen() {
-    return set_constraints_seen_;
+bool BufferCollection::is_set_constraints_seen() {
+    return is_set_constraints_seen_;
 }
 
 const fuchsia_sysmem_BufferCollectionConstraints*
 BufferCollection::constraints() {
-    ZX_DEBUG_ASSERT(set_constraints_seen());
+    ZX_DEBUG_ASSERT(is_set_constraints_seen());
     if (!constraints_) {
         return nullptr;
     }
     return constraints_.get();
+}
+
+BufferCollection::Constraints
+BufferCollection::TakeConstraints() {
+    ZX_DEBUG_ASSERT(is_set_constraints_seen());
+    return std::move(constraints_);
 }
 
 LogicalBufferCollection* BufferCollection::parent() {
@@ -303,15 +336,13 @@ BufferCollection::BufferCollection(fbl::RefPtr<LogicalBufferCollection> parent)
 
 // This method is only meant to be called from GetClientVmoRights().
 uint32_t BufferCollection::GetUsageBasedRightsAttenuation() {
-    ZX_DEBUG_ASSERT(set_constraints_seen_);
-    if (!constraints_) {
-        // If there are no constraints from this participant, it means this
-        // participant doesn't intend to do any "usage" at all aside from
-        // referring to buffers by their index in communication with other
-        // participants, so this participant doesn't need any VMO handles at
-        // all.  We track that by setting the rights mask to 0.
-        return 0;
-    }
+    ZX_DEBUG_ASSERT(is_set_constraints_seen_);
+    // If there are no constraints from this participant, it means this
+    // participant doesn't intend to do any "usage" at all aside from referring
+    // to buffers by their index in communication with other participants, so
+    // this participant doesn't need any VMO handles at all.  So this method
+    // never should be called if that's the case.
+    ZX_DEBUG_ASSERT(constraints_);
 
     // We assume that read and map are both needed by all participants.  Only
     // ZX_RIGHT_WRITE is controlled by usage.
@@ -426,6 +457,11 @@ BufferCollection::BufferCollectionInfoClone(
     //
     // struct copy
     *clone.get() = temp;
+
+    if (!constraints_) {
+        // No VMO handles should be copied in this case.
+        return clone;
+    }
 
     // We duplicate the handles in buffer_collection_info into to_send, so that
     // if we fail mid-way we'll still remember to close the non-sent duplicates.

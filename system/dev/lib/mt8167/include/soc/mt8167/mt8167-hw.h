@@ -37,6 +37,8 @@
 
 #define MT8167_USB0_BASE                                    0x11100000
 #define MT8167_USB0_LENGTH                                  0x1000
+#define MT8167_USB1_BASE                                    0x11190000
+#define MT8167_USB1_LENGTH                                  0x1000
 
 #define MT8167_USBPHY_BASE                                  0x11110800
 #define MT8167_USBPHY_LENGTH                                0x800
@@ -44,14 +46,14 @@
 #define MT8167_MSDC0_BASE                                   0x11120000
 #define MT8167_MSDC0_SIZE                                   0x22c
 
+#define MT8167_MSDC1_BASE                                   0x11130000
+#define MT8167_MSDC1_SIZE                                   0x22c
+
 #define MT8167_AUDIO_BASE                                   0x11140000
 #define MT8167_AUDIO_SIZE                                   0x1000
 
 #define MT8167_MSDC2_BASE                                   0x11170000
 #define MT8167_MSDC2_SIZE                                   0x22c
-
-#define MT8167_MSDC2_GPIO_BASE                              0x10005e40
-#define MT8167_MSDC2_GPIO_SIZE                              0x20
 
 #define MT8167_MFG_BASE                                     0x13000000
 #define MT8167_MFG_SIZE                                     0x80000
@@ -71,6 +73,9 @@
 #define MT8167_PMIC_WRAP_BASE                               0x1000f000
 #define MT8167_PMIC_WRAP_SIZE                               0x1000
 
+#define MT8167_INFRACFG_BASE                                0x10001000
+#define MT8167_INFRACFG_SIZE                                0x1000
+
 // Display Subsystem
 #define MT8167_MSYS_CFG_BASE                                0x14000000
 #define MT8167_MSYS_CFG_SIZE                                0x1000
@@ -78,18 +83,26 @@
 #define MT8167_DISP_OVL_SIZE                                0x1000
 #define MT8167_DISP_RDMA_BASE                               0x14009000
 #define MT8167_DISP_RDMA_SIZE                               0x1000
-#define MT8167_DISP_COLOR_BASE                              0x1400C400
-#define MT8167_DISP_COLOR_SIZE                              0x900
+#define MT8167_DISP_COLOR_BASE                              0x1400C000
+#define MT8167_DISP_COLOR_SIZE                              0x1000
+#define MT8167_DISP_CCORR_BASE                              0x1400D000
+#define MT8167_DISP_CCORR_SIZE                              0x1000
+#define MT8167_DISP_AAL_BASE                                0x1400E000
+#define MT8167_DISP_AAL_SIZE                                0x1000
+#define MT8167_DISP_GAMMA_BASE                              0x1400F000
+#define MT8167_DISP_GAMMA_SIZE                              0x1000
 #define MT8167_DITHER_BASE                                  0x14010000
-#define MT8167_DITHER_SIZE                                  0x200
+#define MT8167_DITHER_SIZE                                  0x1000
 #define MT8167_DISP_DSI_BASE                                0x14012000
-#define MT8167_DISP_DSI_SIZE                                0x200
+#define MT8167_DISP_DSI_SIZE                                0x1000
 #define MT8167_DISP_MUTEX_BASE                              0x14015000
-#define MT8167_DISP_MUTEX_SIZE                              0x210
+#define MT8167_DISP_MUTEX_SIZE                              0x1000
+#define MT8167_DISP_SMI_LARB0_BASE                          0x14016000
+#define MT8167_DISP_SMI_LARB0_SIZE                          0x1000
 #define MT8167_MIPI_TX_BASE                                 0x14018000
-#define MT8167_MIPI_TX_SIZE                                 0x100
-#define MT8167_LVDS_BASE                                    0x1401A200
-#define MT8167_LVDS_SIZE                                    0x100
+#define MT8167_MIPI_TX_SIZE                                 0x1000
+#define MT8167_LVDS_BASE                                    0x1401A000
+#define MT8167_LVDS_SIZE                                    0x1000
 
 // SOC Interrupt polarity registers start
 #define MT8167_SOC_INT_POL                                  0x620
@@ -100,6 +113,7 @@
 #define MT8167_IRQ_PWM                                      108
 #define MT8167_IRQ_PTP_THERM                                109
 #define MT8167_IRQ_MSDC0                                    110
+#define MT8167_IRQ_MSDC1                                    111
 #define MT8167_IRQ_I2C0                                     112
 #define MT8167_IRQ_I2C1                                     113
 #define MT8167_IRQ_I2C2                                     114
@@ -117,6 +131,7 @@
 #define MT8167_IRQ_RGX                                      217
 #define MT8167_IRQ_WDT                                      230
 #define MT8167_IRQ_I2C3                                     241
+#define MT8167_IRQ_USB_MCU_P1                               242
 #define MT8167_IRQ_UART2                                    243
 
 #define MT8167_I2C_CNT                                      3
@@ -125,6 +140,7 @@
 #define MT8167_GPIO_MT7668_PMU_EN                           2
 #define MT8167_GPIO_TOUCH_INT                               8
 #define MT8167_GPIO_TOUCH_RST                               9
+#define MT8167_GPIO_LCD_RST                                 66
 #define MT8167_GPIO_MSDC0_RST                               114
 
 #define MT8167_CLEO_GPIO_HUB_PWR_EN                         13

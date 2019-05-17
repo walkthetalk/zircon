@@ -26,7 +26,7 @@ will evolve to provide finer-grained partitioning.
 Here's a (slightly trimmed for clarity) dump of the tree of devices in
 Zircon running on Qemu x86-64:
 
-```
+```sh
 $ dm dump
 [root]
    <root> pid=1509
@@ -89,11 +89,13 @@ examples of these.  Protocols are usually in-process interactions between
 devices in the same devhost, but in cases of driver isolation, they may take
 place via RPC to a "higher" devhost (via proxy).
 
-Devices may implement Interfaces, which are RPC protocols that clients (services,
-applications, etc) use.  The base device interface supports POSIX style
-open/close/read/write IO.  Currently, Interfaces are supported via the ioctl
-operation in the base device interface.  In the future, Fuchsia's interface definition
-language and bindings (FIDL) will be supported.
+Devices may implement Interfaces, which are
+[FIDL](../../../docs/development/languages/fidl/README.md) RPC protocols
+that clients (services, applications, etc) use.  The base device interface
+supports POSIX style open/close/read/write IO.  Interfaces are supported via
+the `message()` operation in the base device interface.  For legacy reasons,
+an `ioctl()` operation is currently present, but it is deprecated and in the
+process of being removed.
 
 In many cases a Protocol is used to allow drivers to be simpler by taking advantage
 of a common implementation of an Interface.  For example, the "block" driver implements
@@ -123,7 +125,7 @@ is a description of what device a driver can bind to.  The Binding Program is
 defined using macros in [`ddk/binding.h`](../../system/ulib/ddk/include/ddk/binding.h)
 
 An example Binding Program from the Intel Ethernet driver:
-```
+```c
 ZIRCON_DRIVER_BEGIN(intel_ethernet, intel_ethernet_driver_ops, "zircon", "0.1", 9)
     BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PCI),
     BI_ABORT_IF(NE, BIND_PCI_VID, 0x8086),
@@ -246,7 +248,7 @@ Now, we unplug this USB WLAN device.
 * Since the parent device is being removed, the WLAN PHY's `unbind()` is called.
   In this `unbind()`, it would remove the interface it created via `device_add()`:
 
-```
+```c
     wlan_phy_unbind(void* ctx) {
         // Stop interrupt or anything to prevent incoming requests.
         ...
@@ -257,7 +259,7 @@ Now, we unplug this USB WLAN device.
 
 * When wlan_phy is removed, unbind() will be called on all of its children (wlan_mac_0, wlan_mac_1).
 
-```
+```c
     wlan_mac_unbind(void* ctx) {
         // Stop accepting new requests, and notify clients that this device is offline (often just
         // by returning an ZX_ERR_IO_NOT_PRESENT to any requests that happen after unbind).
@@ -272,7 +274,7 @@ Now, we unplug this USB WLAN device.
 
 * WLAN MAC 0 and 1's `release()` are called.
 
-```
+```c
     wlan_mac_release(void* ctx) {
         // Release sources allocated at creation.
         ...
@@ -283,10 +285,10 @@ Now, we unplug this USB WLAN device.
 ```
 
 * The wlan_phy has no open connections, but still has child devices (wlan_mac_0 and wlan_mac_1).
-  Once they have both been `release()`'d, its refcount finally reaches zero and its release()
+  Once they have both been released, its refcount finally reaches zero and its release()
   method is invoked.
 
-```
+```c
     wlan_phy_release(void* ctx) {
         // Release sources allocated at creation.
         ...

@@ -16,8 +16,8 @@ namespace fs {
 PseudoDir::PseudoDir() = default;
 
 PseudoDir::~PseudoDir() {
-  entries_by_name_.clear_unsafe();
-  entries_by_id_.clear();
+    entries_by_name_.clear_unsafe();
+    entries_by_id_.clear();
 }
 
 zx_status_t PseudoDir::Open(uint32_t flags, fbl::RefPtr<Vnode>* out_redirect) {
@@ -27,6 +27,7 @@ zx_status_t PseudoDir::Open(uint32_t flags, fbl::RefPtr<Vnode>* out_redirect) {
 zx_status_t PseudoDir::Getattr(vnattr_t* attr) {
     memset(attr, 0, sizeof(vnattr_t));
     attr->mode = V_TYPE_DIR | V_IRUSR;
+    attr->inode = fuchsia_io_INO_UNKNOWN;
     attr->nlink = 1;
     return ZX_OK;
 }
@@ -75,7 +76,7 @@ zx_status_t PseudoDir::Readdir(vdircookie_t* cookie, void* data, size_t len, siz
             continue;
         }
         if (df.Next(it->name().ToStringPiece(),
-                         VTYPE_TO_DTYPE(attr.mode), attr.inode) != ZX_OK) {
+                    VTYPE_TO_DTYPE(attr.mode), attr.inode) != ZX_OK) {
             *out_actual = df.BytesFilled();
             return ZX_OK;
         }
@@ -83,6 +84,11 @@ zx_status_t PseudoDir::Readdir(vdircookie_t* cookie, void* data, size_t len, siz
     }
 
     *out_actual = df.BytesFilled();
+    return ZX_OK;
+}
+
+zx_status_t PseudoDir::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
+    info->tag = fuchsia_io_NodeInfoTag_directory;
     return ZX_OK;
 }
 
@@ -100,7 +106,7 @@ zx_status_t PseudoDir::AddEntry(fbl::String name, fbl::RefPtr<fs::Vnode> vn) {
     }
 
     Notify(name.ToStringPiece(), fuchsia_io_WATCH_EVENT_ADDED);
-    auto entry = fbl::make_unique<Entry>(next_node_id_++,
+    auto entry = std::make_unique<Entry>(next_node_id_++,
                                          std::move(name), std::move(vn));
     entries_by_name_.insert(entry.get());
     entries_by_id_.insert(std::move(entry));
@@ -112,6 +118,20 @@ zx_status_t PseudoDir::RemoveEntry(fbl::StringPiece name) {
 
     auto it = entries_by_name_.find(name);
     if (it != entries_by_name_.end()) {
+        entries_by_name_.erase(it);
+        entries_by_id_.erase(it->id());
+        Notify(name, fuchsia_io_WATCH_EVENT_REMOVED);
+        return ZX_OK;
+    }
+
+    return ZX_ERR_NOT_FOUND;
+}
+
+zx_status_t PseudoDir::RemoveEntry(fbl::StringPiece name, fs::Vnode* vn) {
+    fbl::AutoLock lock(&mutex_);
+
+    auto it = entries_by_name_.find(name);
+    if (it != entries_by_name_.end() && it->node().get() == vn) {
         entries_by_name_.erase(it);
         entries_by_id_.erase(it->id());
         Notify(name, fuchsia_io_WATCH_EVENT_REMOVED);

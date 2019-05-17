@@ -26,12 +26,13 @@ public:
 
     // USB device controller protocol implementation.
     void UsbDciRequestQueue(usb_request_t* usb_request, const usb_request_complete_t* complete_cb);
-    zx_status_t UsbDciSetInterface(const usb_dci_interface_t* interface);
+    zx_status_t UsbDciSetInterface(const usb_dci_interface_protocol_t* interface);
     zx_status_t UsbDciConfigEp(const usb_endpoint_descriptor_t* ep_desc,
                                const usb_ss_ep_comp_descriptor_t* ss_comp_desc);
     zx_status_t UsbDciDisableEp(uint8_t ep_address);
     zx_status_t UsbDciEpSetStall(uint8_t ep_address);
     zx_status_t UsbDciEpClearStall(uint8_t ep_address);
+    zx_status_t UsbDciCancelAll(uint8_t endpoint);
     size_t UsbDciGetRequestSize();
 
 private:

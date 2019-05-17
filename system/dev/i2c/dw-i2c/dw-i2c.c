@@ -8,7 +8,6 @@
 #include <ddk/mmio-buffer.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/i2cimpl.h>
-#include <ddk/protocol/platform/bus.h>
 #include <ddk/protocol/platform/device.h>
 #include <ddk/protocol/platform-device-lib.h>
 #include <hw/reg.h>
@@ -36,7 +35,6 @@ typedef struct {
 
 typedef struct {
     pdev_protocol_t pdev;
-    i2c_impl_protocol_t i2c;
     zx_device_t* zxdev;
     i2c_dw_dev_t* i2c_devs;
     size_t i2c_dev_count;
@@ -392,7 +390,7 @@ static zx_status_t i2c_dw_init(i2c_dw_t* i2c, uint32_t index) {
         goto init_fail;
     }
 
-    status = pdev_map_interrupt(&i2c->pdev, index, &device->irq_handle);
+    status = pdev_get_interrupt(&i2c->pdev, index, 0, &device->irq_handle);
     if (status != ZX_OK) {
         goto init_fail;
     }
@@ -453,12 +451,6 @@ static zx_status_t dw_i2c_bind(void* ctx, zx_device_t* parent) {
         goto fail;
     }
 
-    pbus_protocol_t pbus;
-    if ((status = device_get_protocol(parent, ZX_PROTOCOL_PBUS, &pbus)) != ZX_OK) {
-        zxlogf(ERROR, "dw_i2c_bind: ZX_PROTOCOL_PBUS not available\n");
-        goto fail;
-    }
-
     pdev_device_info_t info;
     status = pdev_get_device_info(&i2c->pdev, &info);
     if (status != ZX_OK) {
@@ -493,7 +485,8 @@ static zx_status_t dw_i2c_bind(void* ctx, zx_device_t* parent) {
         .name = "dw-i2c",
         .ctx = i2c,
         .ops = &i2c_device_proto,
-        .flags = DEVICE_ADD_NON_BINDABLE,
+        .proto_id = ZX_PROTOCOL_I2C_IMPL,
+        .proto_ops = &i2c_ops,
     };
 
     status = device_add(parent, &args, &i2c->zxdev);
@@ -501,11 +494,6 @@ static zx_status_t dw_i2c_bind(void* ctx, zx_device_t* parent) {
         zxlogf(ERROR, "dw_i2c_bind: device_add failed\n");
         goto fail;
     }
-
-    i2c->i2c.ops = &i2c_ops;
-    i2c->i2c.ctx = i2c;
-    const platform_proxy_cb_t kCallback = {NULL, NULL};
-    pbus_register_protocol(&pbus, ZX_PROTOCOL_I2C_IMPL, &i2c->i2c, sizeof(i2c->i2c), &kCallback);
 
     return ZX_OK;
 

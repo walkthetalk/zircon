@@ -27,20 +27,20 @@
 zx_status_t sys_port_create(uint32_t options, user_out_handle* out) {
     LTRACEF("options %u\n", options);
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t result = up->QueryBasicPolicy(ZX_POL_NEW_PORT);
+    zx_status_t result = up->EnforceBasicPolicy(ZX_POL_NEW_PORT);
     if (result != ZX_OK)
         return result;
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<PortDispatcher> handle;
     zx_rights_t rights;
 
-    result = PortDispatcher::Create(options, &dispatcher, &rights);
+    result = PortDispatcher::Create(options, &handle, &rights);
     if (result != ZX_OK)
         return result;
 
-    uint32_t koid = (uint32_t)dispatcher->get_koid();
+    uint32_t koid = (uint32_t)handle.dispatcher()->get_koid();
 
-    result = out->make(ktl::move(dispatcher), rights);
+    result = out->make(ktl::move(handle), rights);
 
     ktrace(TAG_PORT_CREATE, koid, 0, 0, 0);
     return result;
@@ -106,7 +106,7 @@ zx_status_t sys_port_cancel(zx_handle_t handle, zx_handle_t source, uint64_t key
         return status;
 
     {
-        Guard<fbl::Mutex> guard{up->handle_table_lock()};
+        Guard<BrwLockPi, BrwLockPi::Reader> guard{up->handle_table_lock()};
         Handle* watched = up->GetHandleLocked(source);
         if (!watched)
             return ZX_ERR_BAD_HANDLE;

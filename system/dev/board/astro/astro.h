@@ -58,9 +58,6 @@ zx_status_t aml_usb_init(aml_bus_t* bus);
 // astro-display.c
 zx_status_t aml_display_init(aml_bus_t* bus);
 
-// astro-backlight.c
-zx_status_t astro_backlight_init(aml_bus_t* bus);
-
 // These should match the mmio table defined in astro-i2c.c
 enum {
     ASTRO_I2C_A0_0,
@@ -84,8 +81,12 @@ enum {
 #define GPIO_HW_ID2             (S905D2_GPIOZ(3))
 
 /* Astro I2C Devices */
-#define I2C_BACKLIGHT_ADDR    (0x2C)
-#define I2C_AMBIENTLIGHT_ADDR (0x39)
+#define I2C_BACKLIGHT_ADDR          (0x2C)
+#define I2C_FOCALTECH_TOUCH_ADDR    (0x38)
+#define I2C_AMBIENTLIGHT_ADDR       (0x39)
+#define I2C_AUDIO_CODEC_ADDR        (0x48)
+#define I2C_GOODIX_TOUCH_ADDR       (0x5d)
+
 // astro-touch.c
 zx_status_t astro_touch_init(aml_bus_t* bus);
 // aml-raw_nand.c

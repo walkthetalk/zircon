@@ -14,13 +14,18 @@
 #include <fbl/auto_call.h>
 #include <fbl/unique_fd.h>
 #include <fbl/unique_ptr.h>
+#include <fbl/vector.h>
 #include <fs/client.h>
+#include <fuchsia/hardware/block/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/fdio/limits.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fdio/vfs.h>
 #include <lib/fzl/fdio.h>
 #include <lib/zx/channel.h>
+#include <pretty/hexdump.h>
 #include <zircon/compiler.h>
 #include <zircon/device/block.h>
 #include <zircon/device/vfs.h>
@@ -65,51 +70,43 @@ public:
     ~Mounter() {}
 
     // Mounts the given device.
-    zx_status_t Mount(unique_fd device, disk_format_t format, const mount_options_t& options,
+    zx_status_t Mount(zx::channel device, disk_format_t format, const mount_options_t& options,
                       LaunchCallback cb);
 
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(Mounter);
 
 private:
-    zx_status_t PrepareHandles(unique_fd device);
+    zx_status_t PrepareHandles(zx::channel device);
     zx_status_t MakeDirAndMount(const mount_options_t& options);
     zx_status_t LaunchAndMount(LaunchCallback cb, const mount_options_t& options, const char** argv,
                                int argc);
-    zx_status_t MountNativeFs(const char* binary, unique_fd device, const mount_options_t& options,
-                              LaunchCallback cb);
-    zx_status_t MountFat(unique_fd device, const mount_options_t& options, LaunchCallback cb);
+    zx_status_t MountNativeFs(const char* binary, zx::channel device,
+                              const mount_options_t& options, LaunchCallback cb);
+    zx_status_t MountFat(zx::channel device, const mount_options_t& options, LaunchCallback cb);
 
     zx_handle_t root_ = ZX_HANDLE_INVALID;
     const char* path_;
     int fd_;
     uint32_t flags_ = 0; // Currently not used.
     size_t num_handles_ = 0;
-    zx_handle_t handles_[FDIO_MAX_HANDLES * 2];
-    uint32_t ids_[FDIO_MAX_HANDLES * 2];
+    zx_handle_t handles_[2];
+    uint32_t ids_[2];
 };
 
 // Initializes 'handles_' and 'ids_' with the root handle and block device handle.
-zx_status_t Mounter::PrepareHandles(unique_fd device) {
-    zx_handle_t mountee_handle;
-    zx_status_t status = zx_channel_create(0, &mountee_handle, &root_);
+zx_status_t Mounter::PrepareHandles(zx::channel block_device) {
+    zx::channel root_server, root_client;
+    zx_status_t status = zx::channel::create(0, &root_server, &root_client);
     if (status != ZX_OK) {
         return status;
     }
-    handles_[0] = mountee_handle;
-    ids_[0] = PA_USER0;
-    num_handles_ = 1;
+    handles_[0] = root_server.release();
+    ids_[0] = FS_HANDLE_ROOT_ID;
+    handles_[1] = block_device.release();
+    ids_[1] = FS_HANDLE_BLOCK_DEVICE_ID;
+    num_handles_ = 2;
 
-    int device_fd = device.release();
-    status = fdio_transfer_fd(device_fd, FS_FD_BLOCKDEVICE, &handles_[1], &ids_[1]);
-    if (status < 0) {
-        // Note that fdio_transfer_fd returns > 0 on success :(.
-        fprintf(stderr, "Failed to access device handle\n");
-        zx_handle_close(mountee_handle);
-        zx_handle_close(root_);
-        device.reset(device_fd);
-        return status != 0 ? status : ZX_ERR_BAD_STATE;
-    }
-    num_handles_ += status;
+    root_ = root_client.release();
     return ZX_OK;
 }
 
@@ -181,7 +178,7 @@ zx_status_t Mounter::LaunchAndMount(LaunchCallback cb, const mount_options_t& op
     return MountFs(fd_, root_);
 }
 
-zx_status_t Mounter::MountNativeFs(const char* binary, unique_fd device,
+zx_status_t Mounter::MountNativeFs(const char* binary, zx::channel device,
                                    const mount_options_t& options, LaunchCallback cb) {
     zx_status_t status = PrepareHandles(std::move(device));
     if (status != ZX_OK) {
@@ -197,49 +194,40 @@ zx_status_t Mounter::MountNativeFs(const char* binary, unique_fd device,
     // 3. (optional) verbose
     // 4. (optional) metrics
     // 5. command
-    const char* argv[5] = {binary};
-    int argc = 1;
+    fbl::Vector<const char*> argv;
+    argv.push_back(binary);
     if (options.readonly) {
-        argv[argc++] = "--readonly";
+        argv.push_back("--readonly");
     }
     if (options.verbose_mount) {
-        argv[argc++] = "--verbose";
+        argv.push_back("--verbose");
     }
     if (options.collect_metrics) {
-        argv[argc++] = "--metrics";
+        argv.push_back("--metrics");
     }
     if (options.enable_journal) {
-        argv[argc++] = "--journal";
+        argv.push_back("--journal");
     }
-    argv[argc++] = "mount";
-    return LaunchAndMount(cb, options, argv, argc);
+    argv.push_back("mount");
+    argv.push_back(nullptr);
+    return LaunchAndMount(cb, options, argv.get(), static_cast<int>(argv.size() - 1));
 }
 
-zx_status_t Mounter::MountFat(unique_fd device, const mount_options_t& options, LaunchCallback cb) {
+zx_status_t Mounter::MountFat(zx::channel device, const mount_options_t& options,
+                              LaunchCallback cb) {
     zx_status_t status = PrepareHandles(std::move(device));
     if (status != ZX_OK) {
         return status;
     }
 
-    char readonly_arg[64];
-    snprintf(readonly_arg, sizeof(readonly_arg), "-readonly=%s",
-             options.readonly ? "true" : "false");
-    char blockfd_arg[64];
-    snprintf(blockfd_arg, sizeof(blockfd_arg), "-blockFD=%d", FS_FD_BLOCKDEVICE);
-
     if (options.verbose_mount) {
-        printf("fs_mount: Launching ThinFS\n");
+        printf("fs_mount: FAT not presently supported\n");
     }
-    const char* argv[] = {
-        "/system/bin/thinfs",
-        readonly_arg,
-        blockfd_arg,
-        "mount",
-    };
-    return LaunchAndMount(cb, options, argv, fbl::count_of(argv));
+
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t Mounter::Mount(unique_fd device, disk_format_t format, const mount_options_t& options,
+zx_status_t Mounter::Mount(zx::channel device, disk_format_t format, const mount_options_t& options,
                            LaunchCallback cb) {
     switch (format) {
     case DISK_FORMAT_MINFS:
@@ -274,17 +262,26 @@ const fsck_options_t default_fsck_options = {
     .never_modify = false,
     .always_modify = false,
     .force = false,
+    .apply_journal = false,
 };
 
-disk_format_t detect_disk_format(int fd) {
+enum DiskFormatLogVerbosity {
+    Silent,
+    Verbose,
+};
+
+disk_format_t detect_disk_format_impl(int fd, DiskFormatLogVerbosity verbosity) {
     if (lseek(fd, 0, SEEK_SET) != 0) {
         fprintf(stderr, "detect_disk_format: Cannot seek to start of device.\n");
         return DISK_FORMAT_UNKNOWN;
     }
 
-    block_info_t info;
-    ssize_t r;
-    if ((r = ioctl_block_get_info(fd, &info)) < 0) {
+    fuchsia_hardware_block_BlockInfo info;
+    fzl::UnownedFdioCaller caller(fd);
+    zx_status_t status;
+    zx_status_t io_status = fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(), &status,
+                                                                &info);
+    if (io_status != ZX_OK || status != ZX_OK) {
         fprintf(stderr, "detect_disk_format: Could not acquire block device info\n");
         return DISK_FORMAT_UNKNOWN;
     }
@@ -329,13 +326,41 @@ disk_format_t detect_disk_format(int fd) {
         }
         return DISK_FORMAT_MBR;
     }
+
+    if (verbosity == DiskFormatLogVerbosity::Verbose) {
+        // Log a hexdump of the bytes we looked at and didn't find any magic in.
+        fprintf(stderr, "detect_disk_format: did not recognize format.  Looked at:\n");
+        // fvm, zxcrypt, minfs, and blobfs have their magic bytes at the start
+        // of the block.
+        hexdump_very_ex(data, 16, 0, hexdump_stdio_printf, stderr);
+        // MBR is two bytes at offset 0x1fe, but print 16 just for consistency
+        hexdump_very_ex(data + 0x1f0, 16, 0x1f0, hexdump_stdio_printf, stderr);
+        // GPT magic is stored 512 bytes in, so it can coexist with MBR.
+        hexdump_very_ex(data + 0x200, 16, 0x200, hexdump_stdio_printf, stderr);
+    }
+
     return DISK_FORMAT_UNKNOWN;
+}
+
+disk_format_t detect_disk_format(int fd) {
+    return detect_disk_format_impl(fd, DiskFormatLogVerbosity::Silent);
+}
+
+disk_format_t detect_disk_format_log_unknown(int fd) {
+    return detect_disk_format_impl(fd, DiskFormatLogVerbosity::Verbose);
 }
 
 zx_status_t fmount(int device_fd, int mount_fd, disk_format_t df, const mount_options_t* options,
                    LaunchCallback cb) {
     Mounter mounter(mount_fd);
-    return mounter.Mount(unique_fd(device_fd), df, *options, cb);
+
+    zx::channel block_device;
+    zx_status_t status = fdio_get_service_handle(device_fd, block_device.reset_and_get_address());
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return mounter.Mount(std::move(block_device), df, *options, cb);
 }
 
 zx_status_t mount(int device_fd, const char* mount_path, disk_format_t df,
@@ -350,7 +375,13 @@ zx_status_t mount(int device_fd, const char* mount_path, disk_format_t df,
     }
 
     Mounter mounter(mount_path);
-    return mounter.Mount(unique_fd(device_fd), df, *options, cb);
+
+    zx::channel block_device;
+    zx_status_t status = fdio_get_service_handle(device_fd, block_device.reset_and_get_address());
+    if (status != ZX_OK) {
+        return status;
+    }
+    return mounter.Mount(std::move(block_device), df, *options, cb);
 }
 
 zx_status_t fumount(int mount_fd) {

@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_ASYNC_CPP_TRAP_H_
+#define LIB_ASYNC_CPP_TRAP_H_
 
-#include <fbl/function.h>
 #include <lib/async/trap.h>
+#include <lib/fit/function.h>
 #include <lib/zx/guest.h>
 
 #include <utility>
@@ -73,7 +74,7 @@ public:
     //
     // The |status| is |ZX_OK| if the bell was received and |bell| contains the
     // information from the packet, otherwise |bell| is null.
-    using Handler = fbl::Function<void(async_dispatcher_t* dispatcher, async::GuestBellTrap* trap,
+    using Handler = fit::function<void(async_dispatcher_t* dispatcher, async::GuestBellTrap* trap,
                                        zx_status_t status, const zx_packet_guest_bell_t* bell)>;
 
     explicit GuestBellTrap(Handler handler = nullptr);
@@ -118,3 +119,5 @@ private:
 };
 
 } // namespace async
+
+#endif  // LIB_ASYNC_CPP_TRAP_H_

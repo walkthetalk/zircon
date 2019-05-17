@@ -33,7 +33,7 @@ zx_status_t arch_get_general_regs(struct thread* thread, zx_thread_state_general
     if (thread->arch.suspended_general_regs == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
 
-    struct arm64_iframe_long* in = thread->arch.suspended_general_regs;
+    arm64_iframe_t* in = thread->arch.suspended_general_regs;
     DEBUG_ASSERT(in);
 
     static_assert(sizeof(in->r) == sizeof(out->r), "");
@@ -42,6 +42,9 @@ zx_status_t arch_get_general_regs(struct thread* thread, zx_thread_state_general
     out->sp = in->usp;
     out->pc = in->elr;
     out->cpsr = in->spsr & kUserVisibleFlags;
+
+    struct arm64_context_switch_frame* frame = arm64_get_context_switch_frame(thread);
+    out->tpidr = frame->tpidr_el0;
 
     return ZX_OK;
 }
@@ -54,7 +57,7 @@ zx_status_t arch_set_general_regs(struct thread* thread, const zx_thread_state_g
     if (thread->arch.suspended_general_regs == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
 
-    struct arm64_iframe_long* out = thread->arch.suspended_general_regs;
+    arm64_iframe_t* out = thread->arch.suspended_general_regs;
     DEBUG_ASSERT(out);
 
     static_assert(sizeof(out->r) == sizeof(in->r), "");
@@ -63,6 +66,9 @@ zx_status_t arch_set_general_regs(struct thread* thread, const zx_thread_state_g
     out->usp = in->sp;
     out->elr = in->pc;
     out->spsr = (out->spsr & ~kUserVisibleFlags) | (in->cpsr & kUserVisibleFlags);
+
+    struct arm64_context_switch_frame* frame = arm64_get_context_switch_frame(thread);
+    frame->tpidr_el0 = in->tpidr;
 
     return ZX_OK;
 }
@@ -74,7 +80,7 @@ zx_status_t arch_get_single_step(struct thread* thread, bool* single_step) {
     // ZX-563 (registers aren't available in synthetic exceptions)
     if (thread->arch.suspended_general_regs == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
-    struct arm64_iframe_long* regs = thread->arch.suspended_general_regs;
+    arm64_iframe_t* regs = thread->arch.suspended_general_regs;
 
     const bool mdscr_ss_enable = !!(regs->mdscr & kMdscrSSMask);
     const bool spsr_ss_enable = !!(regs->spsr & kSSMaskSPSR);
@@ -90,7 +96,7 @@ zx_status_t arch_set_single_step(struct thread* thread, bool single_step) {
     // ZX-563 (registers aren't available in synthetic exceptions)
     if (thread->arch.suspended_general_regs == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
-    struct arm64_iframe_long* regs = thread->arch.suspended_general_regs;
+    arm64_iframe_t* regs = thread->arch.suspended_general_regs;
     if (single_step) {
         regs->mdscr |= kMdscrSSMask;
         regs->spsr |= kSSMaskSPSR;
@@ -153,6 +159,7 @@ zx_status_t arch_get_debug_regs(struct thread* thread, zx_thread_state_debug_reg
         out->hw_bps[i].dbgbcr = thread->arch.debug_state.hw_bps[i].dbgbcr;
         out->hw_bps[i].dbgbvr = thread->arch.debug_state.hw_bps[i].dbgbvr;
     }
+    out->esr = thread->arch.debug_state.esr;
 
     return ZX_OK;
 }
@@ -167,11 +174,21 @@ zx_status_t arch_set_debug_regs(struct thread* thread, const zx_thread_state_deb
         state.hw_bps[i].dbgbvr = in->hw_bps[i].dbgbvr;
     }
 
-    if (!arm64_validate_debug_state(&state)) {
+    uint32_t active_breakpoints = 0;
+    if (!arm64_validate_debug_state(&state, &active_breakpoints)) {
         return ZX_ERR_INVALID_ARGS;
     }
 
     Guard<spin_lock_t, IrqSave> thread_lock_guard{ThreadLock::Get()};
+    // If the suspended registers are not there, we cannot save the MDSCR values for this thread,
+    // meaning that the debug HW state will be cleared almost immediatelly.
+    // This should always be there.
+    // ZX-563 (registers aren't available in synthetic exceptions)
+    if (!thread->arch.suspended_general_regs) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    arm64_set_debug_state_for_thread(thread, active_breakpoints > 0);
     thread->arch.track_debug_state = true;
     thread->arch.debug_state = state;
 
@@ -208,5 +225,4 @@ uint8_t arch_get_hw_breakpoint_count() {
 
 uint8_t arch_get_hw_watchpoint_count() {
   return arm64_hw_watchpoint_count();
-
 }

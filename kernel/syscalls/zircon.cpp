@@ -16,6 +16,7 @@
 #include <explicit-memory/bytes.h>
 #include <kernel/auto_lock.h>
 #include <kernel/thread.h>
+#include <ktl/atomic.h>
 #include <lib/crypto/global_prng.h>
 #include <lib/user_copy/user_ptr.h>
 #include <object/event_dispatcher.h>
@@ -27,7 +28,6 @@
 #include <object/thread_dispatcher.h>
 
 #include <fbl/alloc_checker.h>
-#include <fbl/atomic.h>
 #include <fbl/ref_ptr.h>
 
 #include <zircon/syscalls/log.h>
@@ -65,7 +65,7 @@ zx_status_t sys_nanosleep(zx_time_t deadline) {
 //
 // NOTE(abdulla): This is used by pvclock. If logic here is changed, please
 // update pvclock too.
-fbl::atomic<int64_t> utc_offset;
+ktl::atomic<int64_t> utc_offset;
 
 zx_time_t sys_clock_get(zx_clock_t clock_id) {
     switch (clock_id) {
@@ -132,16 +132,16 @@ zx_status_t sys_event_create(uint32_t options, user_out_handle* event_out) {
         return ZX_ERR_INVALID_ARGS;
 
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_EVENT);
+    zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_EVENT);
     if (res != ZX_OK)
         return res;
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<EventDispatcher> handle;
     zx_rights_t rights;
 
-    zx_status_t result = EventDispatcher::Create(options, &dispatcher, &rights);
+    zx_status_t result = EventDispatcher::Create(options, &handle, &rights);
     if (result == ZX_OK)
-        result = event_out->make(ktl::move(dispatcher), rights);
+        result = event_out->make(ktl::move(handle), rights);
     return result;
 }
 
@@ -153,18 +153,18 @@ zx_status_t sys_eventpair_create(uint32_t options,
         return ZX_ERR_NOT_SUPPORTED;
 
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_EVENTPAIR);
+    zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_EVENTPAIR);
     if (res != ZX_OK)
         return res;
 
-    fbl::RefPtr<Dispatcher> epd0, epd1;
+    KernelHandle<EventPairDispatcher> handle0, handle1;
     zx_rights_t rights;
-    zx_status_t result = EventPairDispatcher::Create(&epd0, &epd1, &rights);
+    zx_status_t result = EventPairDispatcher::Create(&handle0, &handle1, &rights);
 
     if (result == ZX_OK)
-        result = out0->make(ktl::move(epd0), rights);
+        result = out0->make(ktl::move(handle0), rights);
     if (result == ZX_OK)
-        result = out1->make(ktl::move(epd1), rights);
+        result = out1->make(ktl::move(handle1), rights);
 
     return result;
 }
@@ -183,9 +183,9 @@ zx_status_t sys_debuglog_create(zx_handle_t rsrc, uint32_t options,
     }
 
     // create a Log dispatcher
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<LogDispatcher> handle;
     zx_rights_t rights;
-    zx_status_t result = LogDispatcher::Create(options, &dispatcher, &rights);
+    zx_status_t result = LogDispatcher::Create(options, &handle, &rights);
     if (result != ZX_OK)
         return result;
 
@@ -196,7 +196,7 @@ zx_status_t sys_debuglog_create(zx_handle_t rsrc, uint32_t options,
     }
 
     // create a handle and attach the dispatcher to it
-    return out->make(ktl::move(dispatcher), rights);
+    return out->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_debuglog_write
@@ -204,8 +204,7 @@ zx_status_t sys_debuglog_write(zx_handle_t log_handle, uint32_t options,
                                user_in_ptr<const void> ptr, size_t len) {
     LTRACEF("log handle %x, opt %x, ptr 0x%p, len %zu\n", log_handle, options, ptr.get(), len);
 
-    if (len > DLOG_MAX_DATA)
-        return ZX_ERR_OUT_OF_RANGE;
+    len = len > DLOG_MAX_DATA ? DLOG_MAX_DATA : len;
 
     if (options & (~ZX_LOG_FLAGS_MASK))
         return ZX_ERR_INVALID_ARGS;

@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_DEVICE_H_
+#define DDK_DEVICE_H_
 
 #include <zircon/compiler.h>
-#include <zircon/device/device.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 #include <zircon/listnode.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 typedef struct zx_device zx_device_t;
 typedef struct zx_driver zx_driver_t;
@@ -82,23 +82,12 @@ typedef struct zx_protocol_device {
     //
     zx_status_t (*open)(void* ctx, zx_device_t** dev_out, uint32_t flags);
 
-    //@ ## open_at
-    // DEPRECATED: See ZX-3277.
-    // The open_at hook is called in the event that the open path to the device
-    // contains segments after the device name itself.  For example, if a device
-    // exists as `/dev/misc/foo` and an attempt is made to `open("/dev/misc/foo/bar",...)`,
-    // the open_at hook would be invoked with a *path* of `"bar"`.
-    //
-    // The default open_at implementation returns **ZX_ERR_NOT_SUPPORTED**
-    //
-    zx_status_t (*open_at)(void* ctx, zx_device_t** dev_out, const char* path, uint32_t flags);
-
     //@ ## close
-    // The close hook is called when a connection to a device is closed.  These
-    // calls will balance the calls to open or open_at.
+    // The close hook is called when a connection to a device is closed. These
+    // calls will balance the calls to open.
     //
-    // **Note:** If open or open_at return a **device instance**, the balancing close
-    // hook that is called is the close hook on the **instance**, not the parent.
+    // **Note:** If open returns a **device instance**, the balancing close hook
+    // that is called is the close hook on the **instance**, not the parent.
     //
     // The default close implementation returns **ZX_OK**.
     zx_status_t (*close)(void* ctx, uint32_t flags);
@@ -106,7 +95,7 @@ typedef struct zx_protocol_device {
     //@ ## unbind
     // The unbind hook is called when the parent of this device is being removed (due
     // to hot unplug, fatal error, etc).  At the point unbind is called, it is not
-    // possible for further open or open_at calls to occur, but io operations, etc
+    // possible for further open calls to occur, but io operations, etc
     // may continue until those client connections are closed.
     //
     // The driver should avoid further method calls to its parent device or any
@@ -253,10 +242,6 @@ zx_status_t device_write(zx_device_t* dev, const void* buf, size_t count,
 
 zx_off_t device_get_size(zx_device_t* dev);
 
-zx_status_t device_ioctl(zx_device_t* dev, uint32_t op,
-                         const void* in_buf, size_t in_len,
-                         void* out_buf, size_t out_len, size_t* out_actual);
-
 // Device Metadata Support
 
 // retrieves metadata for a specific device
@@ -279,14 +264,16 @@ zx_status_t device_add_metadata(zx_device_t* dev, uint32_t type, const void* dat
 zx_status_t device_publish_metadata(zx_device_t* dev, const char* path, uint32_t type,
                                     const void* data, size_t length);
 
-// Device State Change Functions
+// Device State Change Functions.  These match up with the signals defined in
+// the fuchsia.device.Controller interface.
+//
 //@ #### Device State Bits
 //{
-#define DEV_STATE_READABLE DEVICE_SIGNAL_READABLE
-#define DEV_STATE_WRITABLE DEVICE_SIGNAL_WRITABLE
-#define DEV_STATE_ERROR DEVICE_SIGNAL_ERROR
-#define DEV_STATE_HANGUP DEVICE_SIGNAL_HANGUP
-#define DEV_STATE_OOB DEVICE_SIGNAL_OOB
+#define DEV_STATE_READABLE ZX_USER_SIGNAL_0
+#define DEV_STATE_WRITABLE ZX_USER_SIGNAL_2
+#define DEV_STATE_ERROR    ZX_USER_SIGNAL_3
+#define DEV_STATE_HANGUP   ZX_USER_SIGNAL_4
+#define DEV_STATE_OOB      ZX_USER_SIGNAL_1
 //}
 
 void device_state_clr_set(zx_device_t* dev, zx_signals_t clearflag, zx_signals_t setflag);
@@ -299,4 +286,6 @@ static inline void device_state_clr(zx_device_t* dev, zx_signals_t stateflag) {
     device_state_clr_set(dev, stateflag, 0);
 }
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // DDK_DEVICE_H_

@@ -9,6 +9,7 @@
 #include <ddktl/protocol/usb/bus.h>
 #include <ddktl/protocol/usb/dci.h>
 #include <ddktl/protocol/usb/hci.h>
+#include <fbl/condition_variable.h>
 #include <fbl/mutex.h>
 #include <fbl/unique_ptr.h>
 #include <lib/sync/completion.h>
@@ -41,23 +42,24 @@ public:
 
     // USB device controller protocol implementation.
     void UsbDciRequestQueue(usb_request_t* usb_request, const usb_request_complete_t* complete_cb);
-    zx_status_t UsbDciSetInterface(const usb_dci_interface_t* interface);
+    zx_status_t UsbDciSetInterface(const usb_dci_interface_protocol_t* interface);
     zx_status_t UsbDciConfigEp(const usb_endpoint_descriptor_t* ep_desc,
                                const usb_ss_ep_comp_descriptor_t* ss_comp_desc);
     zx_status_t UsbDciDisableEp(uint8_t ep_address);
     zx_status_t UsbDciEpSetStall(uint8_t ep_address);
     zx_status_t UsbDciEpClearStall(uint8_t ep_address);
+    zx_status_t UsbDciCancelAll(uint8_t endpoint);
     size_t UsbDciGetRequestSize();
 
     // USB host controller protocol implementation.
     void UsbHciRequestQueue(usb_request_t* usb_request, const usb_request_complete_t* complete_cb);
-    void UsbHciSetBusInterface(const usb_bus_interface_t* bus_intf);
+    void UsbHciSetBusInterface(const usb_bus_interface_protocol_t* bus_intf);
     size_t UsbHciGetMaxDeviceCount();
     zx_status_t UsbHciEnableEndpoint(uint32_t device_id, const usb_endpoint_descriptor_t* ep_desc,
                                      const usb_ss_ep_comp_descriptor_t* ss_com_desc, bool enable);
     uint64_t UsbHciGetCurrentFrame();
     zx_status_t UsbHciConfigureHub(uint32_t device_id, usb_speed_t speed,
-                                   const usb_hub_descriptor_t* desc);
+                                   const usb_hub_descriptor_t* desc, bool multi_tt);
     zx_status_t UsbHciHubDeviceAdded(uint32_t device_id, uint32_t port, usb_speed_t speed);
     zx_status_t UsbHciHubDeviceRemoved(uint32_t device_id, uint32_t port);
     zx_status_t UsbHciHubDeviceReset(uint32_t device_id, uint32_t port);
@@ -94,7 +96,7 @@ private:
     zx_status_t CreateDevice();
     zx_status_t CreateHost();
     void SetConnected(bool connected);
-    int Thread();
+    int DeviceThread();
     void HandleControl(Request req);
     zx_status_t SetStall(uint8_t ep_address, bool stall);
 
@@ -104,20 +106,25 @@ private:
     fbl::unique_ptr<UsbVirtualHost> host_;
 
     // Callbacks to the USB peripheral driver.
-    ddk::UsbDciInterfaceClient dci_intf_;
+    ddk::UsbDciInterfaceProtocolClient dci_intf_;
     // Callbacks to the USB bus driver.
-    ddk::UsbBusInterfaceClient bus_intf_;
+    ddk::UsbBusInterfaceProtocolClient bus_intf_;
 
     usb_virtual_ep_t eps_[USB_MAX_EPS];
 
-    thrd_t thread_;
+    thrd_t device_thread_;
+    // Host-side lock
     fbl::Mutex lock_;
-    sync_completion_t thread_signal_;
+    fbl::ConditionVariable thread_signal_ __TA_GUARDED(lock_);
 
+    // Device-side lock
+    fbl::Mutex device_lock_ __TA_ACQUIRED_AFTER(lock_);
+    fbl::ConditionVariable device_signal_ __TA_GUARDED(device_lock_);
+    fbl::Mutex connection_lock_ __TA_ACQUIRED_BEFORE(device_lock_);
     // True when the virtual bus is connected.
-    bool connected_ __TA_GUARDED(lock_) = false;
+    bool connected_ __TA_GUARDED(connection_lock_) = false;
     // Used to shut down our thread when this driver is unbinding.
-    bool unbinding_ __TA_GUARDED(lock_) = false;
+    bool unbinding_ __TA_GUARDED(device_lock_) = false;
 };
 
 } // namespace usb_virtual_bus

@@ -45,8 +45,6 @@ const char* ThreadStateToString(ThreadState state) {
 }
 
 const char* ObjectTypeToString(zx_obj_type_t type) {
-    static_assert(ZX_OBJ_TYPE_LAST == 29, "need to update switch below");
-
     switch (type) {
     case ZX_OBJ_TYPE_PROCESS:
         return "process";
@@ -96,6 +94,8 @@ const char* ObjectTypeToString(zx_obj_type_t type) {
         return "suspend-token";
     case ZX_OBJ_TYPE_PAGER:
         return "pager";
+    case ZX_OBJ_TYPE_EXCEPTION:
+        return "exception";
     default:
         return "???";
     }
@@ -127,6 +127,7 @@ void ArgumentValue::Destroy() {
         string_.~String();
         break;
     case ArgumentType::kNull:
+    case ArgumentType::kBool:
     case ArgumentType::kInt32:
     case ArgumentType::kUint32:
     case ArgumentType::kInt64:
@@ -144,17 +145,20 @@ void ArgumentValue::MoveFrom(ArgumentValue&& other) {
     switch (type_) {
     case ArgumentType::kNull:
         break;
+    case ArgumentType::kBool:
+        bool_ = other.bool_;
+        break;
     case ArgumentType::kInt32:
         int32_ = other.int32_;
         break;
     case ArgumentType::kUint32:
-        int32_ = other.uint32_;
+        uint32_ = other.uint32_;
         break;
     case ArgumentType::kInt64:
         int64_ = other.int64_;
         break;
     case ArgumentType::kUint64:
-        int64_ = other.uint64_;
+        uint64_ = other.uint64_;
         break;
     case ArgumentType::kDouble:
         double_ = other.double_;
@@ -176,6 +180,8 @@ fbl::String ArgumentValue::ToString() const {
     switch (type_) {
     case ArgumentType::kNull:
         return "null";
+    case ArgumentType::kBool:
+        return fbl::StringPrintf("bool(%s)", bool_ ? "true" : "false");
     case ArgumentType::kInt32:
         return fbl::StringPrintf("int32(%" PRId32 ")", int32_);
     case ArgumentType::kUint32:
@@ -200,6 +206,32 @@ fbl::String Argument::ToString() const {
     return fbl::StringPrintf("%s: %s", name_.c_str(), value_.ToString().c_str());
 }
 
+void TraceInfoContent::Destroy() {
+    switch (type_) {
+    case TraceInfoType::kMagicNumber:
+        magic_number_info_.~MagicNumberInfo();
+        break;
+    }
+}
+
+void TraceInfoContent::MoveFrom(TraceInfoContent&& other) {
+    type_ = other.type_;
+    switch (type_) {
+    case TraceInfoType::kMagicNumber:
+        new (&magic_number_info_) MagicNumberInfo(std::move(other.magic_number_info_));
+        break;
+    }
+}
+
+fbl::String TraceInfoContent::ToString() const {
+    switch (type_) {
+    case TraceInfoType::kMagicNumber:
+        return fbl::StringPrintf("MagicNumberInfo(magic_value: 0x%" PRIx32 ")",
+                                 magic_number_info_.magic_value);
+    }
+    ZX_ASSERT(false);
+}
+
 void MetadataContent::Destroy() {
     switch (type_) {
     case MetadataType::kProviderInfo:
@@ -210,6 +242,9 @@ void MetadataContent::Destroy() {
         break;
     case MetadataType::kProviderEvent:
         provider_event_.~ProviderEvent();
+        break;
+    case MetadataType::kTraceInfo:
+        trace_info_.~TraceInfo();
         break;
     }
 }
@@ -225,6 +260,9 @@ void MetadataContent::MoveFrom(MetadataContent&& other) {
         break;
     case MetadataType::kProviderEvent:
         new (&provider_event_) ProviderEvent(std::move(other.provider_event_));
+        break;
+    case MetadataType::kTraceInfo:
+        new (&trace_info_) TraceInfo(std::move(other.trace_info_));
         break;
     }
 }
@@ -251,6 +289,10 @@ fbl::String MetadataContent::ToString() const {
         }
         return fbl::StringPrintf("ProviderEvent(id: %" PRId32 ", %s)",
                                  provider_event_.id, name.c_str());
+    }
+    case MetadataType::kTraceInfo: {
+        return fbl::StringPrintf("TraceInfo(content: %s)",
+                                 trace_info_.content.ToString().c_str());
     }
     }
     ZX_ASSERT(false);

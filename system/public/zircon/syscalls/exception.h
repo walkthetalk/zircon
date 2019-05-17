@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef ZIRCON_SYSCALLS_EXCEPTION_H_
-#define ZIRCON_SYSCALLS_EXCEPTION_H_
+#ifndef SYSROOT_ZIRCON_SYSCALLS_EXCEPTION_H_
+#define SYSROOT_ZIRCON_SYSCALLS_EXCEPTION_H_
 
 #include <zircon/compiler.h>
 #include <zircon/syscalls/port.h>
@@ -110,6 +110,13 @@ typedef struct zx_exception_report {
     zx_exception_context_t context;
 } zx_exception_report_t;
 
+// Basic info sent along with the handle over an exception channel.
+typedef struct zx_exception_info {
+    zx_koid_t pid;
+    zx_koid_t tid;
+    zx_excp_type_t type;
+} zx_exception_info_t;
+
 // Options for zx_task_resume_from_exception()
 #define ZX_RESUME_TRY_NEXT ((uint32_t)2)
 // Indicates that instead of resuming from the faulting instruction we instead
@@ -132,4 +139,4 @@ typedef struct zx_exception_report {
 
 __END_CDECLS
 
-#endif // ZIRCON_SYSCALLS_EXCEPTION_H_
+#endif // SYSROOT_ZIRCON_SYSCALLS_EXCEPTION_H_

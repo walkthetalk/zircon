@@ -73,6 +73,9 @@
 #define T931_HIU_BASE                   0xff63c000
 #define T931_HIU_LENGTH                 0x2000
 
+#define T931_DSI_PHY_BASE               0xff644000
+#define T931_DSI_PHY_LENGTH             0x2000
+
 #define T931_AOBUS_BASE                 0xff800000
 #define T931_AOBUS_LENGTH               0x100000
 
@@ -82,11 +85,20 @@
 #define T931_CBUS_BASE                  0xffd00000
 #define T931_CBUS_LENGTH                0x100000
 
+#define T931_MIPI_DSI_BASE              0xffd07000
+#define T931_MIPI_DSI_LENGTH            0x1000
+
+#define T931_TOP_MIPI_DSI_BASE          0xffd073C0
+#define T931_TOP_MIPI_DSI_LENGTH        0x40
+
 #define T931_MSR_CLK_BASE               0xffd18000
 #define T931_MSR_CLK_LENGTH             0x1000
 
 #define T931_MALI_BASE                  0xffe40000
 #define T931_MALI_LENGTH                0x40000
+
+#define T931_TEMP_SENSOR_BASE           0xff634000
+#define T931_TEMP_SENSOR_LENGTH         0x1000
 
 // MIPI CSI & Adapter
 #define T931_CSI_PHY0_BASE              0xff650000
@@ -116,6 +128,10 @@
 
 #define T931_USBPHY21_BASE              0xff63a000
 #define T931_USBPHY21_LENGTH            0x2000
+
+// ISP
+#define T931_ISP_BASE                   0xff140000
+#define T931_ISP_LENGTH                 0x00040000
 
 // eMMC/SD register blocks
 #define T931_SD_EMMC_A_BASE             0xffE03000
@@ -155,6 +171,7 @@
 #define T931_UART_A_IRQ                 58
 #define T931_USB0_IRQ                   62
 #define T931_PARSER_IRQ                 64
+#define T931_TS_PLL_IRQ                 67
 #define T931_I2C3_IRQ                   71
 #define T931_DOS_MBOX_0_IRQ             75
 #define T931_DOS_MBOX_1_IRQ             76
@@ -170,6 +187,7 @@
 #define T931_UART_B_IRQ                 107
 #define T931_RDMA_DONE                  121
 #define T931_UART_C_IRQ                 125
+#define T931_MALI_ISP_IRQ               174
 #define T931_MALI_IRQ_GP                192
 #define T931_MALI_IRQ_GPMMU             193
 #define T931_MALI_IRQ_PP                194

@@ -38,7 +38,17 @@ zx_status_t PseudoFile::Getattr(vnattr_t* attr) {
         attr->mode |= V_IRUSR;
     if (write_handler_)
         attr->mode |= V_IWUSR;
+    attr->inode = fuchsia_io_INO_UNKNOWN;
     attr->nlink = 1;
+    return ZX_OK;
+}
+
+bool PseudoFile::IsDirectory() const {
+    return false;
+}
+
+zx_status_t PseudoFile::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
+    info->tag = fuchsia_io_NodeInfoTag_file;
     return ZX_OK;
 }
 
@@ -152,6 +162,14 @@ zx_status_t BufferedPseudoFile::Content::Truncate(size_t length) {
     return ZX_OK;
 }
 
+bool BufferedPseudoFile::Content::IsDirectory() const {
+    return false;
+}
+
+zx_status_t BufferedPseudoFile::Content::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
+    return file_->GetNodeInfo(flags, info);
+}
+
 void BufferedPseudoFile::Content::SetInputLength(size_t length) {
     ZX_DEBUG_ASSERT(length <= file_->input_buffer_capacity_);
 
@@ -254,6 +272,14 @@ zx_status_t UnbufferedPseudoFile::Content::Truncate(size_t length) {
 
     truncated_since_last_successful_write_ = true;
     return ZX_OK;
+}
+
+bool UnbufferedPseudoFile::Content::IsDirectory() const {
+    return false;
+}
+
+zx_status_t UnbufferedPseudoFile::Content::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
+    return file_->GetNodeInfo(flags, info);
 }
 
 } // namespace fs

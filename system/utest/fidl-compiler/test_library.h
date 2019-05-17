@@ -8,29 +8,32 @@
 #include <fidl/flat_ast.h>
 #include <fidl/json_generator.h>
 #include <fidl/lexer.h>
+#include <fidl/linter.h>
 #include <fidl/parser.h>
 #include <fidl/source_file.h>
 
-static fidl::SourceFile MakeSourceFile(const std::string& filename, const std::string& raw_source_code) {
+static std::unique_ptr<fidl::SourceFile> MakeSourceFile(const std::string& filename,
+                                                        const std::string& raw_source_code) {
     std::string source_code(raw_source_code);
     // NUL terminate the string.
     source_code.resize(source_code.size() + 1);
-    return fidl::SourceFile(filename, source_code);
+    return std::make_unique<fidl::SourceFile>(filename, source_code);
 }
 
 class SharedAmongstLibraries {
 public:
-    SharedAmongstLibraries() :
-        typespace(fidl::flat::Typespace::RootTypes()) {}
+    SharedAmongstLibraries()
+        : typespace(fidl::flat::Typespace::RootTypes(&error_reporter)) {}
 
     fidl::ErrorReporter error_reporter;
     fidl::flat::Typespace typespace;
     fidl::flat::Libraries all_libraries;
+    std::set<std::unique_ptr<fidl::SourceFile>> all_sources;
 };
 
 class TestLibrary {
 public:
-    TestLibrary(const std::string& raw_source_code)
+    explicit TestLibrary(const std::string& raw_source_code)
         : TestLibrary("example.fidl", raw_source_code) {}
 
     TestLibrary(const std::string& filename, const std::string& raw_source_code)
@@ -41,11 +44,13 @@ public:
         : error_reporter_(&shared->error_reporter),
           typespace_(&shared->typespace),
           all_libraries_(&shared->all_libraries),
-          source_file_(MakeSourceFile(filename, raw_source_code)),
-          lexer_(source_file_, error_reporter_),
-          parser_(&lexer_, error_reporter_),
+          all_sources_(&shared->all_sources),
           library_(std::make_unique<fidl::flat::Library>(
-              all_libraries_, error_reporter_, typespace_)) {}
+              all_libraries_, error_reporter_, typespace_)) {
+        auto source_file = MakeSourceFile(filename, raw_source_code);
+        source_file_ = source_file.get();
+        all_sources_->insert(std::move(source_file));
+    }
 
     bool AddDependentLibrary(TestLibrary dependent_library) {
         return all_libraries_->Insert(std::move(dependent_library.library_));
@@ -56,15 +61,41 @@ public:
     }
 
     bool Parse(std::unique_ptr<fidl::raw::File>& ast_ptr) {
-        ast_ptr.reset(parser_.Parse().release());
-        return parser_.Ok();
+        fidl::Lexer lexer(*source_file_, error_reporter_);
+        fidl::Parser parser(&lexer, error_reporter_);
+        ast_ptr.reset(parser.Parse().release());
+        return parser.Ok();
     }
 
     bool Compile() {
-        auto ast = parser_.Parse();
-        return parser_.Ok() &&
+        fidl::Lexer lexer(*source_file_, error_reporter_);
+        fidl::Parser parser(&lexer, error_reporter_);
+        auto ast = parser.Parse();
+        return parser.Ok() &&
                library_->ConsumeFile(std::move(ast)) &&
                library_->Compile();
+    }
+
+    bool Lint(fidl::Findings* findings) {
+        fidl::Lexer lexer(*source_file_, error_reporter_);
+        fidl::Parser parser(&lexer, error_reporter_);
+        auto ast = parser.Parse();
+        if (!parser.Ok()) {
+            std::string_view beginning(source_file_->data().data(), 0);
+            fidl::SourceLocation source_location(beginning, *source_file_);
+            findings->emplace_back(source_location, "parser-error",
+                                   error_reporter_->errors().front() + "\n");
+            return false;
+        }
+        fidl::linter::Linter linter;
+        return linter.Lint(ast, findings);
+    }
+
+    bool Lint() {
+        fidl::Findings findings;
+        bool passed = Lint(&findings);
+        fidl::utils::WriteFindingsToErrorReporter(findings, error_reporter_);
+        return passed;
     }
 
     std::string GenerateJSON() {
@@ -75,12 +106,30 @@ public:
 
     bool AddSourceFile(const std::string& filename, const std::string& raw_source_code) {
         auto source_file = MakeSourceFile(filename, raw_source_code);
-        fidl::Lexer lexer(source_file, error_reporter_);
+        fidl::Lexer lexer(*source_file, error_reporter_);
         fidl::Parser parser(&lexer, error_reporter_);
         auto ast = parser.Parse();
         return parser.Ok() &&
                library_->ConsumeFile(std::move(ast)) &&
                library_->Compile();
+    }
+
+    const fidl::flat::Bits* LookupBits(const std::string& name) {
+        for (const auto& bits_decl : library_->bits_declarations_) {
+            if (bits_decl->GetName() == name) {
+                return bits_decl.get();
+            }
+        }
+        return nullptr;
+    }
+
+    const fidl::flat::Const* LookupConstant(const std::string& name) {
+        for (const auto& const_decl : library_->const_declarations_) {
+            if (const_decl->GetName() == name) {
+                return const_decl.get();
+            }
+        }
+        return nullptr;
     }
 
     const fidl::flat::Struct* LookupStruct(const std::string& name) {
@@ -128,12 +177,45 @@ public:
         return nullptr;
     }
 
+    void set_warnings_as_errors(bool value) {
+        error_reporter_->set_warnings_as_errors(value);
+    }
+
     const fidl::flat::Library* library() const {
         return library_.get();
     }
 
-    fidl::SourceFile source_file() {
-        return source_file_;
+    const fidl::SourceFile& source_file() const {
+        return *source_file_;
+    }
+
+    std::string filename() const {
+        return std::string(source_file().filename());
+    }
+
+    std::string FileData() const {
+        return std::string(source_file().data());
+    }
+
+    std::string FileLocation(std::string within, std::string to_find) const {
+        std::istringstream lines(within);
+        std::string line;
+        size_t line_number = 0;
+        while (std::getline(lines, line)) {
+            line_number++;
+            size_t column_index = line.find(to_find);
+            if (column_index != std::string::npos) {
+                std::stringstream position;
+                position << filename() << ":" << line_number << ":" << (column_index + 1);
+                return position.str();
+            }
+        }
+        assert(false); // Bug in test
+        return "never reached";
+    }
+
+    std::string FileLocation(std::string to_find) const {
+        return FileLocation(FileData(), to_find);
     }
 
     const std::vector<std::string>& errors() const {
@@ -153,9 +235,8 @@ protected:
     fidl::ErrorReporter* error_reporter_;
     fidl::flat::Typespace* typespace_;
     fidl::flat::Libraries* all_libraries_;
-    fidl::SourceFile source_file_;
-    fidl::Lexer lexer_;
-    fidl::Parser parser_;
+    std::set<std::unique_ptr<fidl::SourceFile>>* all_sources_;
+    fidl::SourceFile* source_file_;
     std::unique_ptr<fidl::flat::Library> library_;
 };
 

@@ -12,15 +12,18 @@
 #include <ddk/driver.h>
 #include <ddk/io-buffer.h>
 #include <ddk/platform-defs.h>
+#include <ddk/protocol/composite.h>
 #include <ddk/protocol/display/controller.h>
 #include <ddk/protocol/i2cimpl.h>
-#include <ddk/protocol/platform/device.h>
 #include <ddk/protocol/platform-device-lib.h>
+#include <ddk/protocol/platform/device.h>
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <fbl/unique_ptr.h>
+#include <fuchsia/sysmem/c/fidl.h>
 #include <hw/arch_ops.h>
 #include <hw/reg.h>
+#include <lib/image-format/image_format.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +32,14 @@
 #include <zircon/assert.h>
 #include <zircon/pixelformat.h>
 #include <zircon/syscalls.h>
+
+enum {
+    COMPONENT_PDEV,
+    COMPONENT_HPD_GPIO,
+    COMPONENT_CANVAS,
+    COMPONENT_SYSMEM,
+    COMPONENT_COUNT,
+};
 
 /* Default formats */
 static const uint8_t _ginput_color_format   = HDMI_COLOR_FORMAT_444;
@@ -60,7 +71,7 @@ static uint32_t vim_compute_linear_stride(void* ctx, uint32_t width, zx_pixel_fo
 }
 
 static void vim_set_display_controller_interface(void* ctx,
-                                                 const display_controller_interface_t* intf) {
+                                                 const display_controller_interface_protocol_t* intf) {
     vim2_display_t* display = static_cast<vim2_display_t*>(ctx);
     mtx_lock(&display->display_lock);
 
@@ -111,6 +122,7 @@ static zx_status_t vim_import_vmo_image(void* ctx, image_t* image, zx_handle_t v
         info.wrap = 0;
         info.blkmode = 0;
         info.endianness = 0;
+        info.flags = CANVAS_FLAGS_READ;
 
         status = amlogic_canvas_config(&display->canvas, vmo.release(),
                                        offset + image->planes[0].byte_offset,
@@ -134,6 +146,7 @@ static zx_status_t vim_import_vmo_image(void* ctx, image_t* image, zx_handle_t v
         info.blkmode = 0;
         // Do 64-bit endianness conversion.
         info.endianness = 7;
+        info.flags = CANVAS_FLAGS_READ;
 
         zx::vmo dup_vmo;
         status = vmo.duplicate(ZX_RIGHT_SAME_RIGHTS, &dup_vmo);
@@ -155,6 +168,149 @@ static zx_status_t vim_import_vmo_image(void* ctx, image_t* image, zx_handle_t v
 
         status = amlogic_canvas_config(&display->canvas, vmo.release(),
                                        offset + image->planes[1].byte_offset,
+                                       &info, &import_info->canvas_idx[1]);
+        if (status != ZX_OK) {
+            amlogic_canvas_free(&display->canvas, import_info->canvas_idx[0]);
+            return ZX_ERR_NO_RESOURCES;
+        }
+        // The handle used by hardware is VVUUYY, so the UV plane is included twice.
+        image->handle = (((uint64_t)import_info->canvas_idx[1] << 16) |
+                         (import_info->canvas_idx[1] << 8) | import_info->canvas_idx[0]);
+    } else {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    list_add_head(&display->imported_images, &import_info.release()->node);
+
+    return ZX_OK;
+}
+
+zx_status_t vim_import_image(void* ctx, image_t* image, zx_unowned_handle_t handle,
+                             uint32_t index) {
+    zx_status_t status = ZX_OK;
+
+    if (image->type != IMAGE_TYPE_SIMPLE) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    zx_status_t status2;
+    fuchsia_sysmem_BufferCollectionInfo_2 collection_info;
+    status =
+        fuchsia_sysmem_BufferCollectionWaitForBuffersAllocated(handle, &status2, &collection_info);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (status2 != ZX_OK) {
+        return status2;
+    }
+
+    fbl::Vector<zx::vmo> vmos;
+    for (uint32_t i = 0; i < collection_info.buffer_count; ++i) {
+        vmos.push_back(zx::vmo(collection_info.buffers[i].vmo));
+    }
+
+    if (!collection_info.settings.has_image_format_constraints || index >= vmos.size()) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+
+    uint64_t offset = collection_info.buffers[index].vmo_usable_start;
+
+    zx::vmo dup_vmo;
+    status = vmos[index].duplicate(ZX_RIGHT_SAME_RIGHTS, &dup_vmo);
+    if (status != ZX_OK) {
+        DISP_ERROR("Failed to duplicate vmo: %d\n", status);
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<image_info_t> import_info = fbl::make_unique_checked<image_info_t>(&ac);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    vim2_display_t* display = static_cast<vim2_display_t*>(ctx);
+    fbl::AutoLock lock(&display->image_lock);
+
+    if (image->type != IMAGE_TYPE_SIMPLE)
+        return ZX_ERR_INVALID_ARGS;
+
+    import_info->format = image->pixel_format;
+
+    if (image->pixel_format == ZX_PIXEL_FORMAT_RGB_x888) {
+        if (collection_info.settings.image_format_constraints.pixel_format.type !=
+            fuchsia_sysmem_PixelFormatType_BGRA32) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+        ZX_DEBUG_ASSERT(
+            !collection_info.settings.image_format_constraints.pixel_format.has_format_modifier);
+
+        uint32_t minimum_row_bytes;
+        if (!ImageFormatMinimumRowBytes(&collection_info.settings.image_format_constraints,
+                                        image->width, &minimum_row_bytes)) {
+            DISP_ERROR("Invalid image width %d for collection\n", image->width);
+            return ZX_ERR_INVALID_ARGS;
+        }
+        zx_status_t status = ZX_OK;
+        canvas_info_t info;
+        info.height = image->height;
+        info.stride_bytes = minimum_row_bytes;
+        info.wrap = 0;
+        info.blkmode = 0;
+        info.endianness = 0;
+        info.flags = CANVAS_FLAGS_READ;
+
+        status = amlogic_canvas_config(&display->canvas, dup_vmo.release(),
+                                       offset,
+                                       &info, &import_info->canvas_idx[0]);
+        if (status != ZX_OK) {
+            return ZX_ERR_NO_RESOURCES;
+        }
+        image->handle = import_info->canvas_idx[0];
+    } else if (image->pixel_format == ZX_PIXEL_FORMAT_NV12) {
+        if (image->height % 2 != 0) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+        if (collection_info.settings.image_format_constraints.pixel_format.type !=
+            fuchsia_sysmem_PixelFormatType_NV12) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+        ZX_DEBUG_ASSERT(
+            !collection_info.settings.image_format_constraints.pixel_format.has_format_modifier);
+
+        uint32_t minimum_row_bytes;
+        if (!ImageFormatMinimumRowBytes(&collection_info.settings.image_format_constraints,
+                                        image->width, &minimum_row_bytes)) {
+            DISP_ERROR("Invalid image width %d for collection\n", image->width);
+            return ZX_ERR_INVALID_ARGS;
+        }
+        zx_status_t status = ZX_OK;
+        canvas_info_t info;
+        info.height = image->height;
+        info.stride_bytes = minimum_row_bytes;
+        info.wrap = 0;
+        info.blkmode = 0;
+        // Do 64-bit endianness conversion.
+        info.endianness = 7;
+        info.flags = CANVAS_FLAGS_READ;
+
+        zx::vmo dup_vmo2;
+        status = dup_vmo.duplicate(ZX_RIGHT_SAME_RIGHTS, &dup_vmo2);
+        if (status != ZX_OK) {
+            return status;
+        }
+
+        status = amlogic_canvas_config(&display->canvas, dup_vmo.release(),
+                                       offset,
+                                       &info, &import_info->canvas_idx[0]);
+        if (status != ZX_OK) {
+            return ZX_ERR_NO_RESOURCES;
+        }
+
+        info.height /= 2;
+        uint32_t plane_offset = minimum_row_bytes * image->height;
+
+        status = amlogic_canvas_config(&display->canvas, dup_vmo2.release(),
+                                       offset + plane_offset,
                                        &info, &import_info->canvas_idx[1]);
         if (status != ZX_OK) {
             amlogic_canvas_free(&display->canvas, import_info->canvas_idx[0]);
@@ -322,14 +478,88 @@ static zx_status_t allocate_vmo(void* ctx, uint64_t size, zx_handle_t* vmo_out) 
     return status;
 }
 
+static zx_status_t get_sysmem_connection(void* ctx, zx_handle_t handle) {
+    vim2_display_t* display = static_cast<vim2_display_t*>(ctx);
+    zx::channel request_handle(handle);
+
+    zx_status_t status = sysmem_connect(&display->sysmem, request_handle.release());
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not connect to sysmem - status: %d\n", status);
+        return status;
+    }
+
+    return ZX_OK;
+}
+
+static zx_status_t set_buffer_collection_constraints(
+    void* ctx, const image_t* config, uint32_t client_endpoint) {
+    fuchsia_sysmem_BufferCollectionConstraints constraints = {};
+    constraints.usage.display = fuchsia_sysmem_displayUsageLayer;
+    constraints.has_buffer_memory_constraints = true;
+    fuchsia_sysmem_BufferMemoryConstraints& buffer_constraints =
+        constraints.buffer_memory_constraints;
+    buffer_constraints.min_size_bytes = 0;
+    buffer_constraints.max_size_bytes = 0xffffffff;
+    buffer_constraints.physically_contiguous_required = true;
+    buffer_constraints.secure_required = false;
+    buffer_constraints.secure_permitted = false;
+    buffer_constraints.ram_domain_supported = true;
+    buffer_constraints.cpu_domain_supported = true;
+    constraints.image_format_constraints_count = 1;
+    fuchsia_sysmem_ImageFormatConstraints& image_constraints =
+        constraints.image_format_constraints[0];
+    if (config->pixel_format == ZX_PIXEL_FORMAT_NV12) {
+        image_constraints.pixel_format.type = fuchsia_sysmem_PixelFormatType_NV12;
+        image_constraints.color_spaces_count = 1;
+        image_constraints.color_space[0].type = fuchsia_sysmem_ColorSpaceType_REC709;
+    } else {
+        image_constraints.pixel_format.type = fuchsia_sysmem_PixelFormatType_BGRA32;
+        image_constraints.color_spaces_count = 1;
+        image_constraints.color_space[0].type = fuchsia_sysmem_ColorSpaceType_SRGB;
+    }
+    image_constraints.min_coded_width = 0;
+    image_constraints.max_coded_width = 0xffffffff;
+    image_constraints.min_coded_height = 0;
+    image_constraints.max_coded_height = 0xffffffff;
+    image_constraints.min_bytes_per_row = 0;
+    image_constraints.max_bytes_per_row = 0xffffffff;
+    image_constraints.max_coded_width_times_coded_height = 0xffffffff;
+    image_constraints.layers = 1;
+    image_constraints.coded_width_divisor = 1;
+    image_constraints.coded_height_divisor = 1;
+    image_constraints.bytes_per_row_divisor = 32;
+    image_constraints.start_offset_divisor = 32;
+    image_constraints.display_width_divisor = 1;
+    image_constraints.display_height_divisor = 1;
+
+    zx_status_t status = fuchsia_sysmem_BufferCollectionSetConstraints(client_endpoint, true,
+                                                                       &constraints);
+
+    if (status != ZX_OK) {
+        DISP_ERROR("Failed to set constraints");
+        return status;
+    }
+
+    return ZX_OK;
+}
+
+static zx_status_t get_single_buffer_framebuffer(void* ctx, zx_handle_t* out_vmo,
+                                                 uint32_t* out_stride) {
+    return ZX_ERR_NOT_SUPPORTED;
+}
+
 static display_controller_impl_protocol_ops_t display_controller_ops = {
     .set_display_controller_interface = vim_set_display_controller_interface,
     .import_vmo_image = vim_import_vmo_image,
+    .import_image = vim_import_image,
     .release_image = vim_release_image,
     .check_configuration = vim_check_configuration,
     .apply_configuration = vim_apply_configuration,
     .compute_linear_stride = vim_compute_linear_stride,
     .allocate_vmo = allocate_vmo,
+    .get_sysmem_connection = get_sysmem_connection,
+    .set_buffer_collection_constraints = set_buffer_collection_constraints,
+    .get_single_buffer_framebuffer = get_single_buffer_framebuffer,
 };
 
 static uint32_t get_bus_count(void* ctx) {
@@ -486,7 +716,6 @@ static zx_protocol_device_t main_device_proto = {
     .version = DEVICE_OPS_VERSION,
     .get_protocol = display_get_protocol,
     .open = nullptr,
-    .open_at = nullptr,
     .close = nullptr,
     .unbind = display_unbind,
     .release =  display_release,
@@ -633,9 +862,24 @@ zx_status_t vim2_display_bind(void* ctx, zx_device_t* parent) {
         display_release(display);
     });
 
-    status = device_get_protocol(parent, ZX_PROTOCOL_PDEV, &display->pdev);
+    composite_protocol_t composite;
+    status = device_get_protocol(parent, ZX_PROTOCOL_COMPOSITE, &composite);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not get composite protocol\n");
+        return status;
+    }
+
+    zx_device_t* components[COMPONENT_COUNT];
+    size_t actual;
+    composite_get_components(&composite, components, countof(components), &actual);
+    if (actual != countof(components)) {
+        DISP_ERROR("could not get components\n");
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    status = device_get_protocol(components[COMPONENT_PDEV], ZX_PROTOCOL_PDEV, &display->pdev);
     if (status !=  ZX_OK) {
-        DISP_ERROR("Could not get parent protocol\n");
+        DISP_ERROR("Could not get PDEV protocol\n");
         return status;
     }
 
@@ -675,15 +919,22 @@ zx_status_t vim2_display_bind(void* ctx, zx_device_t* parent) {
         return status;
     }
 
-    status = device_get_protocol(parent, ZX_PROTOCOL_GPIO, &display->gpio);
+    status = device_get_protocol(components[COMPONENT_HPD_GPIO], ZX_PROTOCOL_GPIO, &display->gpio);
     if (status != ZX_OK) {
         DISP_ERROR("Could not get Display GPIO protocol\n");
         return status;
     }
 
-    status = device_get_protocol(parent, ZX_PROTOCOL_AMLOGIC_CANVAS, &display->canvas);
+    status = device_get_protocol(components[COMPONENT_CANVAS], ZX_PROTOCOL_AMLOGIC_CANVAS,
+                                 &display->canvas);
     if (status != ZX_OK) {
         DISP_ERROR("Could not get Display CANVAS protocol\n");
+        return status;
+    }
+
+    status = device_get_protocol(components[COMPONENT_SYSMEM], ZX_PROTOCOL_SYSMEM, &display->sysmem);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not get Display SYSMEM protocol\n");
         return status;
     }
 
@@ -749,13 +1000,13 @@ zx_status_t vim2_display_bind(void* ctx, zx_device_t* parent) {
         return status;
     }
 
-    status = pdev_map_interrupt(&display->pdev, IRQ_VSYNC, &display->vsync_interrupt);
+    status = pdev_get_interrupt(&display->pdev, IRQ_VSYNC, 0, &display->vsync_interrupt);
     if (status != ZX_OK) {
         DISP_ERROR("Could not map vsync interrupt\n");
         return status;
     }
 
-    status = pdev_map_interrupt(&display->pdev, IRQ_RDMA, &display->rdma_interrupt);
+    status = pdev_get_interrupt(&display->pdev, IRQ_RDMA, 0, &display->rdma_interrupt);
     if (status != ZX_OK) {
         DISP_ERROR("Could not map RDMA interrupt\n");
         return status;
@@ -953,7 +1204,7 @@ static zx_driver_ops_t vim2_display_driver_ops = {
 };
 
 ZIRCON_DRIVER_BEGIN(vim2_display, vim2_display_driver_ops, "zircon", "0.1", 4)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PDEV),
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_COMPOSITE),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_KHADAS),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_VIM2),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_VIM_DISPLAY),

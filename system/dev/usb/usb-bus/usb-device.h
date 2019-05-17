@@ -87,7 +87,7 @@ class UsbDevice : public UsbDeviceType,
     zx_status_t MsgSetConfiguration(uint8_t configuration, fidl_txn_t* txn);
 
     // Hub support.
-    void SetHubInterface(const usb_hub_interface_t* hub_intf);
+    void SetHubInterface(const usb_hub_interface_protocol_t* hub_intf);
     zx_status_t HubResetPort(uint32_t port);
 
     zx_status_t GetDescriptor(uint16_t type, uint16_t index, uint16_t language, void* data,
@@ -100,9 +100,23 @@ class UsbDevice : public UsbDeviceType,
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(UsbDevice);
 
+    struct RequestData {
+        // True if the request is ready to be processed by the client during the next callback.
+        bool ready_for_client;
+        bool require_callback;
+        size_t silent_completions_count;
+    };
+
     using Request = usb::Request<void>;
-    using UnownedRequest = usb::UnownedRequest<void>;
-    using UnownedRequestQueue = usb::UnownedRequestQueue<void>;
+    using UnownedRequest = usb::UnownedRequest<RequestData>;
+    using UnownedRequestList = usb::UnownedRequestList<RequestData>;
+    using UnownedRequestQueue = usb::UnownedRequestQueue<RequestData>;
+
+    struct Endpoint {
+        // Requests that have not yet had an associated callback to the client.
+        UnownedRequestList pending_reqs __TA_GUARDED(lock);
+        fbl::Mutex lock;
+    };
 
     zx_status_t Init();
 
@@ -110,7 +124,16 @@ private:
     void StartCallbackThread();
     void StopCallbackThread();
 
+    Endpoint* GetEndpoint(uint8_t ep_address);
+    // Updates the endpoint state with the completed request.
+    // As erroneous requests may complete out of order, the request queued prior to it will also
+    // get a callback. If that prior request has also already completed,
+    // |out_additional_callback| will be populated.
+    // Returns true if a callback is required.
+    bool UpdateEndpoint(Endpoint* ep, usb_request_t* completed_req);
+
     void RequestComplete(usb_request_t* req);
+    void QueueCallback(usb_request_t* req);
     static void ControlComplete(void* ctx, usb_request_t* req);
      zx_status_t Control(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
                          zx_time_t timeout, const void* write_buffer, size_t write_size,
@@ -127,7 +150,7 @@ private:
     ddk::UsbHciProtocolClient hci_;
 
     // Hub interface, for devices that are hubs.
-    ddk::UsbHubInterfaceClient hub_intf_;
+    ddk::UsbHubInterfaceProtocolClient hub_intf_;
 
     usb_device_descriptor_t device_desc_;
 
@@ -140,6 +163,8 @@ private:
     bool resetting_ __TA_GUARDED(state_lock_) = false;
     // mutex that protects the resetting state member
     fbl::Mutex state_lock_;
+
+    Endpoint eps_[USB_MAX_EPS];
 
     // thread for calling client's usb request complete callback
     thrd_t callback_thread_ = 0;

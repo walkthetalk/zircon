@@ -10,7 +10,7 @@
 #include <ddk/protocol/platform/device.h>
 #include <ddk/protocol/usb/dci.h>
 #include <ddk/protocol/usb/modeswitch.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/mutex.h>
 #include <lib/zx/handle.h>
 #include <lib/zx/interrupt.h>
@@ -83,11 +83,12 @@ typedef struct {
 
 typedef struct {
     zx_device_t* zxdev = nullptr;
+    zx_device_t* pdev_dev = nullptr;
     zx_device_t* xhci_dev = nullptr;
     zx_device_t* parent = nullptr;
     pdev_protocol_t pdev;
     usb_mode_switch_protocol_t ums;
-    usb_dci_interface_t dci_intf;
+    usb_dci_interface_protocol_t dci_intf;
     std::optional<ddk::MmioBuffer> mmio;
     zx::handle bti_handle;
 
@@ -116,6 +117,8 @@ typedef struct {
     // if acquiring both locks.
     fbl::Mutex lock;
     bool configured = false;
+    fbl::Mutex pending_completions_lock;
+    list_node_t pending_completions __TA_GUARDED(pending_completions_lock);
 } dwc3_t;
 
 // Internal context for USB requests
@@ -124,10 +127,11 @@ typedef struct {
      usb_request_complete_t complete_cb;
      // for queueing requests internally
      list_node_t node;
+     list_node_t pending_node;
 } dwc_usb_req_internal_t;
 
-#define USB_REQ_TO_INTERNAL(req) \
-    ((dwc_usb_req_internal_t *)((uintptr_t)(req) + sizeof(usb_request_t)))
+#define USB_REQ_TO_INTERNAL(req)                                                                   \
+    ((dwc_usb_req_internal_t*)((uintptr_t)(req) + sizeof(usb_request_t)))
 #define INTERNAL_TO_USB_REQ(ctx) ((usb_request_t *)((uintptr_t)(ctx) - sizeof(usb_request_t)))
 
 static inline ddk::MmioBuffer* dwc3_mmio(dwc3_t* dwc) {

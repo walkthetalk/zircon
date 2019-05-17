@@ -9,7 +9,9 @@
 #include <stdint.h>
 
 #include <object/dispatcher.h>
+#include <object/exceptionate.h>
 #include <object/excp_port.h>
+#include <object/handle.h>
 #include <object/job_policy.h>
 #include <object/process_dispatcher.h>
 
@@ -76,7 +78,7 @@ public:
     static fbl::RefPtr<JobDispatcher> CreateRootJob();
     static zx_status_t Create(uint32_t flags,
                               fbl::RefPtr<JobDispatcher> parent,
-                              fbl::RefPtr<Dispatcher>* dispatcher,
+                              KernelHandle<JobDispatcher>* handle,
                               zx_rights_t* rights);
 
     ~JobDispatcher() final;
@@ -97,8 +99,8 @@ public:
     // Terminate the child processes and jobs. Returns |false| if the job is already
     // in the process of killing, or the children are already terminated. Regardless
     // of return value, the Job now will not accept new children and eventually
-    // transitions to |DEAD|.
-    bool Kill();
+    // transitions to |DEAD|.  |return_code| can be obtained via ZX_INFO_JOB.
+    bool Kill(int64_t return_code);
 
     // Set basic policy. |mode| is is either ZX_JOB_POL_RELATIVE or ZX_JOB_POL_ABSOLUTE and
     // in_policy is an array of |count| elements.
@@ -127,7 +129,7 @@ public:
     // returning the error value.
     template <typename T>
     static zx_status_t ForEachJob(T func) {
-        Guard<fbl::Mutex> guard{AllJobsLock::Get()};
+        Guard<Mutex> guard{AllJobsLock::Get()};
         for (auto &job : all_jobs_list_) {
             zx_status_t s = func(&job);
             if (s != ZX_OK)
@@ -151,8 +153,14 @@ public:
     fbl::RefPtr<ExceptionPort> exception_port();
     fbl::RefPtr<ExceptionPort> debugger_exception_port();
 
+    // TODO(ZX-3072): remove the port-based exception code once everyone is
+    // switched over to channels.
+    Exceptionate* exceptionate(Exceptionate::Type type);
+
     void set_kill_on_oom(bool kill);
     bool get_kill_on_oom() const;
+
+    void GetInfo(zx_info_job_t* info) const;
 
 private:
     enum class State {
@@ -168,6 +176,27 @@ private:
     bool AddChildJob(const fbl::RefPtr<JobDispatcher>& job);
     void RemoveChildJob(JobDispatcher* job);
 
+    State GetState() const;
+
+    // Remove this job from its parent's job list and the global job tree,
+    // either when the job was killed or its last reference was dropped.
+    // It's safe to call this multiple times.
+    //
+    // We cannot be holding our lock when we call this because it requires
+    // locking our parent, and we only nest locks down the tree.
+    void RemoveFromJobTreesUnlocked() TA_EXCL(get_lock());
+
+    // Helpers to transition into the DEAD state.
+    //
+    // The check for whether we should transition needs to be done under the
+    // lock, but actually moving into the dead state has to be done after
+    // releasing the lock.
+    //
+    // FinishDeadTransitionUnlocked() is thread-safe and idempotent so it's OK
+    // if multiple concurrent threads end up calling it.
+    bool IsReadyForDeadTransitionLocked() TA_REQ(get_lock());
+    void FinishDeadTransitionUnlocked() TA_EXCL(get_lock());
+
     void UpdateSignalsIncrementLocked() TA_REQ(get_lock());
     void UpdateSignalsDecrementLocked() TA_REQ(get_lock());
 
@@ -179,8 +208,6 @@ private:
     uint32_t ChildCountLocked() const TA_REQ(get_lock());
 
     bool CanSetPolicy() TA_REQ(get_lock());
-
-    fbl::Canary<fbl::magic("JOBD")> canary_;
 
     const fbl::RefPtr<JobDispatcher> parent_;
     const uint32_t max_height_;
@@ -196,6 +223,7 @@ private:
     State state_ TA_GUARDED(get_lock());
     uint32_t process_count_ TA_GUARDED(get_lock());
     uint32_t job_count_ TA_GUARDED(get_lock());
+    int64_t  return_code_ TA_GUARDED(get_lock());
     // TODO(cpu): The OOM kill system is incomplete, see ZX-2731 for details.
     bool kill_on_oom_ TA_GUARDED(get_lock());
 
@@ -220,6 +248,8 @@ private:
 
     fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(get_lock());
     fbl::RefPtr<ExceptionPort> debugger_exception_port_ TA_GUARDED(get_lock());
+    Exceptionate exceptionate_;
+    Exceptionate debug_exceptionate_;
 
     // Global list of JobDispatchers, ordered by hierarchy and
     // creation order. Used to find victims in low-resource

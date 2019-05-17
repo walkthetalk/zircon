@@ -21,7 +21,7 @@ enum PhysicalStatus {
     UP = 2;
 };
 
-enum EnablementStatus {
+enum AdministrativeStatus {
     /// The interface is administratively disabled.
     DISABLED = 1;
     /// The interface is administratively enabled.
@@ -31,7 +31,7 @@ enum EnablementStatus {
 union InterfaceStatus {
     PresenceStatus presence;
     PhysicalStatus physical;
-    EnablementStatus enablement;
+    AdministrativeStatus administrative;
 };
 
 struct InterfaceAddress {
@@ -67,10 +67,10 @@ struct InterfaceProperties {
     /// fuchsia.hardware.ethernet.INFO_FEATURE_*.
     uint32 features;
 
-    /// The enablement status of the interface.
-    EnablementStatus enablementStatus;
+    /// The administrative status of the interface.
+    AdministrativeStatus administrativeStatus;
 
-    /// The physcial link status of the interface.
+    /// The physical link status of the interface.
     PhysicalStatus physicalStatus;
 
     /// The list of addresses currently assigned to the interface.
@@ -133,7 +133,7 @@ struct Error {
 };
 
 [Discoverable]
-interface Stack {
+protocol Stack {
     /// Add an Ethernet interface to the network stack. On success, returns the identifier assigned
     /// by the stack for use in subsequent calls.
     AddEthernetInterface(string topological_path, fuchsia.hardware.ethernet.Device device) -> (Error? err, uint64 id);
@@ -159,7 +159,7 @@ interface Stack {
 
     /// Remove the address from the interface. If the address is not assigned to the interface, an
     /// error is returned.
-    DelInterfaceAddress(uint64 id, fuchsia.net.IpAddress addr) -> (Error? err);
+    DelInterfaceAddress(uint64 id, InterfaceAddress addr) -> (Error? err);
 
     /// List all the entries in the forwarding table for the network stack.
     GetForwardingTable() -> (vector<ForwardingEntry> table);
@@ -173,7 +173,13 @@ interface Stack {
     /// table. If no entry for the subnet exists, an error is returned.
     DelForwardingEntry(fuchsia.net.Subnet subnet) -> (Error? err);
 
-    /// Events
+    /// Enable the packet filter on a specific interface.
+    EnablePacketFilter(uint64 id) -> (Error? err);
+
+    /// Disable the packet filter on a specific interface.
+    DisablePacketFilter(uint64 id) -> (Error? err);
+
+    // Events
 
     /// A status change event is triggered whenever an interface's status changes.
     -> OnInterfaceStatusChange(InterfaceStatusChange info);

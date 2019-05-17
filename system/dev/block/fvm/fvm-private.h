@@ -9,7 +9,7 @@
 #include <stdlib.h>
 
 #include <ddk/device.h>
-#include <fvm/fvm.h>
+#include <fvm/format.h>
 #include <zircon/device/block.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
@@ -25,6 +25,8 @@
 #include <fbl/mutex.h>
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
+#include <fuchsia/hardware/block/volume/c/fidl.h>
+#include <lib/fidl-utils/bind.h>
 #include <lib/fzl/owned-vmo-mapper.h>
 #include <lib/zx/vmo.h>
 
@@ -33,9 +35,11 @@
 
 namespace fvm {
 
+using volume_info_t = fuchsia_hardware_block_volume_VolumeInfo;
+
 // Forward declaration
 class VPartitionManager;
-using ManagerDeviceType = ddk::Device<VPartitionManager, ddk::Ioctlable, ddk::Unbindable>;
+using ManagerDeviceType = ddk::Device<VPartitionManager, ddk::Messageable, ddk::Unbindable>;
 
 class VPartitionManager : public ManagerDeviceType {
 public:
@@ -68,15 +72,16 @@ public:
     zx_status_t FreeSlices(VPartition* vp, size_t vslice_start, size_t count) TA_EXCL(lock_);
 
     // Returns global information about the FVM.
-    void Query(fvm_info_t* info) TA_EXCL(lock_);
+    void Query(volume_info_t* info) TA_EXCL(lock_);
 
     size_t DiskSize() const { return info_.block_count * info_.block_size; }
-    size_t SliceSize() const { return slice_size_; }
-    size_t VSliceMax() const { return VSLICE_MAX; }
+    size_t SliceSize() const { return format_info_.slice_size(); }
+    // format_info_ is calculated on Load and never updated again.
+    const FormatInfo& format_info() const { return format_info_; }
+    uint64_t VSliceMax() const { return fvm::kMaxVSlices; }
     const block_info_t& Info() const { return info_; }
 
-    zx_status_t DdkIoctl(uint32_t op, const void* cmd, size_t cmdlen, void* reply, size_t max,
-                         size_t* out_actual);
+    zx_status_t DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn);
     void DdkUnbind();
     void DdkRelease();
 
@@ -85,6 +90,27 @@ public:
     ~VPartitionManager();
 
 private:
+    static const fuchsia_hardware_block_volume_VolumeManager_ops* Ops() {
+        using Binder = fidl::Binder<VPartitionManager>;
+        static const fuchsia_hardware_block_volume_VolumeManager_ops kOps = {
+            .AllocatePartition = Binder::BindMember<&VPartitionManager::FIDLAllocatePartition>,
+            .Query = Binder::BindMember<&VPartitionManager::FIDLQuery>,
+            .Activate = Binder::BindMember<&VPartitionManager::FIDLActivate>,
+        };
+        return &kOps;
+    }
+
+    // FIDL interface VolumeManager
+    zx_status_t FIDLAllocatePartition(uint64_t slice_count,
+                                      const fuchsia_hardware_block_partition_GUID* type,
+                                      const fuchsia_hardware_block_partition_GUID* instance,
+                                      const char* name_data, size_t name_size, uint32_t flags,
+                                      fidl_txn_t* txn);
+    zx_status_t FIDLQuery(fidl_txn_t* txn);
+    zx_status_t FIDLActivate(const fuchsia_hardware_block_partition_GUID* old_guid,
+                             const fuchsia_hardware_block_partition_GUID* new_guid,
+                             fidl_txn_t* txn);
+
     // Marks the partition with instance GUID |old_guid| as inactive,
     // and marks partitions with instance GUID |new_guid| as active.
     //
@@ -132,14 +158,14 @@ private:
     vpart_entry_t* GetVPartEntryLocked(size_t index) const TA_REQ(lock_);
 
     size_t PrimaryOffsetLocked() const TA_REQ(lock_) {
-        return first_metadata_is_primary_ ? 0 : MetadataSize();
+        return format_info_.GetSuperblockOffset(
+            (first_metadata_is_primary_) ? SuperblockType::kPrimary : SuperblockType::kSecondary);
     }
 
     size_t BackupOffsetLocked() const TA_REQ(lock_) {
-        return first_metadata_is_primary_ ? MetadataSize() : 0;
+        return format_info_.GetSuperblockOffset(
+            (first_metadata_is_primary_) ? SuperblockType::kSecondary : SuperblockType::kPrimary);
     }
-
-    size_t MetadataSize() const { return metadata_size_; }
 
     zx_status_t DoIoLocked(zx_handle_t vmo, size_t off, size_t len, uint32_t command);
 
@@ -149,12 +175,12 @@ private:
     fbl::Mutex lock_;
     fzl::OwnedVmoMapper metadata_ TA_GUARDED(lock_);
     bool first_metadata_is_primary_ TA_GUARDED(lock_);
-    size_t metadata_size_;
-    size_t slice_size_;
-    // Number of allocatable slices.
-    size_t pslice_total_count_;
     // Number of currently allocated slices.
     size_t pslice_allocated_count_ TA_GUARDED(lock_);
+
+    // Format information of the fvm. This is only set when the driver is loaded, and not
+    // modified.
+    fvm::FormatInfo format_info_;
 
     // Block Protocol
     const size_t block_op_size_;

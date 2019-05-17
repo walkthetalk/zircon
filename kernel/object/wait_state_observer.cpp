@@ -29,7 +29,7 @@ zx_status_t WaitStateObserver::Begin(Event* event,
     dispatcher_ = handle->dispatcher();
     wakeup_reasons_ = 0u;
 
-    auto status = dispatcher_->add_observer(this);
+    auto status = dispatcher_->AddObserver(this);
     if (status != ZX_OK) {
         dispatcher_.reset();
         return status;
@@ -41,7 +41,8 @@ zx_signals_t WaitStateObserver::End() {
     canary_.Assert();
     DEBUG_ASSERT(dispatcher_);
 
-    dispatcher_->RemoveObserver(this);
+    const bool removed = dispatcher_->RemoveObserver(this);
+    DEBUG_ASSERT(removed);
     dispatcher_.reset();
 
     // Return the set of reasons that we may have been woken.  Basically, this

@@ -10,12 +10,13 @@
 #include <string.h>
 
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <ramdevice-client/ramdisk.h>
 #include <unittest/unittest.h>
 #include <zircon/compiler.h>
 #include <zircon/device/block.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 typedef struct fs_info {
     const char* name;
@@ -48,7 +49,7 @@ extern ramdisk_client_t* test_ramdisk;
 extern bool use_real_disk;
 
 // The disk's cached info.
-extern block_info_t test_disk_info;
+extern fuchsia_hardware_block_BlockInfo test_disk_info;
 
 // A filter of the filesystems; indicates which one should be tested.
 extern const char* filesystem_name_filter;
@@ -134,16 +135,14 @@ inline bool can_execute_test(const fs_info_t* info, const test_disk_t* requested
 
 #define RUN_FOR_ALL_FILESYSTEMS_TYPE(case_name, disk, test_type, CASE_TESTS)     \
     FS_TEST_CASE(case_name, disk, CASE_TESTS, test_type, memfs, 0)  \
-    FS_TEST_CASE(case_name, disk, CASE_TESTS, test_type, minfs, 1)  \
-    FS_TEST_CASE(case_name, disk, CASE_TESTS, test_type, thinfs, 2)
+    FS_TEST_CASE(case_name, disk, CASE_TESTS, test_type, minfs, 1)
 
 #define RUN_FOR_ALL_FILESYSTEMS_SIZE(case_name, disk, CASE_TESTS)          \
     FS_TEST_CASE(case_name, disk, CASE_TESTS, FS_TEST_NORMAL, memfs, 0)    \
     FS_TEST_CASE(case_name, disk, CASE_TESTS, FS_TEST_NORMAL, minfs, 1)    \
-    FS_TEST_CASE(case_name##_fvm, disk, CASE_TESTS, FS_TEST_FVM, minfs, 1) \
-    FS_TEST_CASE(case_name, disk, CASE_TESTS, FS_TEST_NORMAL, thinfs, 2)
+    FS_TEST_CASE(case_name##_fvm, disk, CASE_TESTS, FS_TEST_FVM, minfs, 1)
 
 #define RUN_FOR_ALL_FILESYSTEMS(case_name, CASE_TESTS)                     \
     RUN_FOR_ALL_FILESYSTEMS_SIZE(case_name, default_test_disk, CASE_TESTS)
 
-__END_CDECLS;
+__END_CDECLS

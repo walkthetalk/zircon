@@ -11,7 +11,9 @@
 #include <unistd.h>
 
 #include <fbl/unique_fd.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/vmo.h>
 #include <zircon/device/block.h>
 #include <zircon/syscalls.h>
@@ -44,7 +46,7 @@ const uint8_t kEfiGUID[GPT_GUID_LEN] = GUID_EFI_VALUE;
 const uint8_t kFvmGUID[GPT_GUID_LEN] = GUID_FVM_VALUE;
 const uint64_t kCPartsInitSize = 1;
 
-const block_info_t kDefaultBlockInfo = {
+const fuchsia_hardware_block_BlockInfo kDefaultBlockInfo = {
     .block_count = TOTAL_BLOCKS,
     .block_size = BLOCK_SIZE,
     .max_transfer_size = BLOCK_MAX_TRANSFER_UNBOUNDED,
@@ -98,11 +100,11 @@ class TestState {
 public:
     DISALLOW_COPY_ASSIGN_AND_MOVE(TestState);
 
-    TestState(block_info_t info = kDefaultBlockInfo) : device_(nullptr) {
+    TestState(fuchsia_hardware_block_BlockInfo info = kDefaultBlockInfo) : device_(nullptr) {
         Initialize(info);
     }
 
-    void Initialize(block_info_t info) {
+    void Initialize(fuchsia_hardware_block_BlockInfo info) {
         ReleaseGpt();
         blk_sz_root_ = howmany(SZ_ROOT_PART, info.block_size);
         blk_sz_kern_ = howmany(SZ_KERN_PART, info.block_size);
@@ -145,7 +147,7 @@ public:
         return device_.get();
     }
 
-    const block_info_t* Info() const {
+    const fuchsia_hardware_block_BlockInfo* Info() const {
         return &block_info_;
     }
 
@@ -175,7 +177,7 @@ private:
     uint64_t blk_sz_fvm_;
     uint64_t blk_sz_kernc_;
     uint64_t blk_sz_rootc_;
-    block_info_t block_info_;
+    fuchsia_hardware_block_BlockInfo block_info_;
     fbl::unique_ptr<GptDevice> device_;
     fbl::unique_fd fd_;
 };
@@ -543,8 +545,8 @@ bool TestDiskTooSmall(void) {
     // now remove a few blocks so we can't satisfy all constraints
     needed_blks--;
 
-    block_info_t info;
-    memcpy(&info, &kDefaultBlockInfo, sizeof(block_info_t));
+    fuchsia_hardware_block_BlockInfo info;
+    memcpy(&info, &kDefaultBlockInfo, sizeof(fuchsia_hardware_block_BlockInfo));
     info.block_count = dev->GetPartition(0)->first + needed_blks - 1;
 
     // now that we've calculated the block count, create a device with that
@@ -592,7 +594,3 @@ RUN_TEST(TestNoKernc)
 RUN_TEST(TestDiskTooSmall)
 RUN_TEST(TestIsCrosDevice)
 END_TEST_CASE(disk_wizard_tests)
-
-int main(int argc, char** argv) {
-    return unittest_run_all_tests(argc, argv) ? 0 : -1;
-}

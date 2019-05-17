@@ -5,9 +5,9 @@
 #pragma once
 
 #include <ddk/platform-defs.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <ddktl/pdev.h>
-#include <ddktl/protocol/clk.h>
+#include <ddktl/protocol/clock.h>
 #include <hwreg/mmio.h>
 #include <lib/zx/bti.h>
 #include <soc/aml-s905d2/s905d2-hiu.h>
@@ -21,13 +21,20 @@ class AmlCpuFrequency {
 
 public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(AmlCpuFrequency);
-    AmlCpuFrequency(){};
+    AmlCpuFrequency(){}
     ~AmlCpuFrequency() = default;
     zx_status_t SetFrequency(uint32_t rate);
     zx_status_t Init(zx_device_t* parent);
     uint32_t GetFrequency();
 
 private:
+    // CLK indexes.
+    enum {
+        kSysPllDiv16,
+        kSysCpuClkDiv16,
+        kClockCount,
+    };
+
     zx_status_t WaitForBusy();
     zx_status_t ConfigureSysPLL(uint32_t new_rate);
     zx_status_t ConfigureFixedPLL(uint32_t new_rate);
@@ -36,7 +43,7 @@ private:
     // Initialize platform stuff.
     zx_status_t InitPdev(zx_device_t* parent);
     // Protocols.
-    ddk::ClkProtocolClient clk_;
+    ddk::ClockProtocolClient clks_[kClockCount];
     // MMIOS.
     std::optional<ddk::MmioBuffer> hiu_mmio_;
     // BTI handle.

@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_ASYNC_CPP_WAIT_H_
+#define LIB_ASYNC_CPP_WAIT_H_
 
-#include <fbl/function.h>
 #include <lib/async/wait.h>
+#include <lib/fit/function.h>
 
 #include <utility>
 
@@ -97,7 +98,7 @@ public:
     // The |status| is |ZX_OK| if the wait was satisfied and |signal| is non-null.
     // The |status| is |ZX_ERR_CANCELED| if the dispatcher was shut down before
     // the task's handler ran or the task was canceled.
-    using Handler = fbl::Function<void(async_dispatcher_t* dispatcher,
+    using Handler = fit::function<void(async_dispatcher_t* dispatcher,
                                        async::Wait* wait,
                                        zx_status_t status,
                                        const zx_packet_signal_t* signal)>;
@@ -149,3 +150,5 @@ private:
 };
 
 } // namespace async
+
+#endif  // LIB_ASYNC_CPP_WAIT_H_

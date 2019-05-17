@@ -42,20 +42,19 @@ zx_status_t sys_vmo_create(uint64_t size, uint32_t options,
                            user_out_handle* out) {
     LTRACEF("size %#" PRIx64 "\n", size);
 
-    switch (options) {
-    case 0: options = VmObjectPaged::kResizable; break;
-    case ZX_VMO_NON_RESIZABLE: options = 0u; break;
-    default: return ZX_ERR_INVALID_ARGS;
-    }
-
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_VMO);
+    zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_VMO);
+    if (res != ZX_OK)
+        return res;
+
+    uint32_t vmo_options = 0;
+    res = VmObjectDispatcher::parse_create_syscall_flags(options, &vmo_options);
     if (res != ZX_OK)
         return res;
 
     // create a vm object
     fbl::RefPtr<VmObject> vmo;
-    res = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, options, size, &vmo);
+    res = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, vmo_options, size, &vmo);
     if (res != ZX_OK)
         return res;
 
@@ -162,12 +161,10 @@ zx_status_t sys_vmo_get_size(zx_handle_t handle, user_out_ptr<uint64_t> _size) {
     uint64_t size = 0;
     status = vmo->GetSize(&size);
 
-    // copy the size back, even if it failed
-    status = _size.copy_to_user(size);
     if (status != ZX_OK)
         return status;
 
-    return status;
+    return _size.copy_to_user(size);
 }
 
 // zx_status_t zx_vmo_set_size
@@ -227,17 +224,17 @@ zx_status_t sys_vmo_set_cache_policy(zx_handle_t handle, uint32_t cache_policy) 
     return vmo->SetMappingCachePolicy(cache_policy);
 }
 
-// zx_status_t zx_vmo_clone
-zx_status_t sys_vmo_clone(zx_handle_t handle, uint32_t options,
-                          uint64_t offset, uint64_t size,
-                          user_out_handle* out_handle) {
+// zx_status_t zx_vmo_create_child
+zx_status_t sys_vmo_create_child(zx_handle_t handle, uint32_t options,
+                                 uint64_t offset, uint64_t size,
+                                 user_out_handle* out_handle) {
     LTRACEF("handle %x options %#x offset %#" PRIx64 " size %#" PRIx64 "\n",
             handle, options, offset, size);
 
     auto up = ProcessDispatcher::GetCurrent();
 
     zx_status_t status;
-    fbl::RefPtr<VmObject> clone_vmo;
+    fbl::RefPtr<VmObject> child_vmo;
     zx_rights_t in_rights;
 
     {
@@ -248,17 +245,19 @@ zx_status_t sys_vmo_clone(zx_handle_t handle, uint32_t options,
             return status;
 
         // clone the vmo into a new one
-        status = vmo->Clone(options, offset, size, in_rights & ZX_RIGHT_GET_PROPERTY,  &clone_vmo);
+        status = vmo->CreateChild(options, offset, size,
+                                  in_rights & ZX_RIGHT_GET_PROPERTY,  &child_vmo);
         if (status != ZX_OK)
             return status;
 
-        DEBUG_ASSERT(clone_vmo);
+        DEBUG_ASSERT(child_vmo);
     }
 
     // create a Vm Object dispatcher
     fbl::RefPtr<Dispatcher> dispatcher;
     zx_rights_t default_rights;
-    zx_status_t result = VmObjectDispatcher::Create(ktl::move(clone_vmo), &dispatcher, &default_rights);
+    zx_status_t result = VmObjectDispatcher::Create(ktl::move(child_vmo),
+                                                    &dispatcher, &default_rights);
     if (result != ZX_OK)
         return result;
 
@@ -267,11 +266,13 @@ zx_status_t sys_vmo_clone(zx_handle_t handle, uint32_t options,
     // GET/SET_PROPERTY so the user can set ZX_PROP_NAME on the new clone.
     zx_rights_t rights =
         in_rights | ZX_RIGHT_GET_PROPERTY | ZX_RIGHT_SET_PROPERTY;
-    if (options & ZX_VMO_CLONE_COPY_ON_WRITE)
+    if (options & (ZX_VMO_CHILD_COPY_ON_WRITE | ZX_VMO_CHILD_COPY_ON_WRITE2)) {
+        rights &= ~ZX_RIGHT_EXECUTE;
         rights |= ZX_RIGHT_WRITE;
+    }
 
     // make sure we're somehow not elevating rights beyond what a new vmo should have
-    DEBUG_ASSERT((default_rights & rights) == rights);
+    DEBUG_ASSERT(((default_rights | ZX_RIGHT_EXECUTE) & rights) == rights);
 
     // create a handle and attach the dispatcher to it
     return out_handle->make(ktl::move(dispatcher), rights);
@@ -292,13 +293,13 @@ zx_status_t sys_vmo_replace_as_executable(
 
     auto up = ProcessDispatcher::GetCurrent();
 
-    Guard<fbl::Mutex> guard{up->handle_table_lock()};
+    Guard<BrwLockPi, BrwLockPi::Writer> guard{up->handle_table_lock()};
     auto source = up->GetHandleLocked(handle);
     if (!source)
         return ZX_ERR_BAD_HANDLE;
 
-    auto handle_cleanup = fbl::MakeAutoCall([up, handle]() TA_NO_THREAD_SAFETY_ANALYSIS {
-        up->RemoveHandleLocked(handle);
+    auto handle_cleanup = fbl::MakeAutoCall([up, source]() TA_NO_THREAD_SAFETY_ANALYSIS {
+        up->RemoveHandleLocked(source);
     });
 
     if (vmex_status != ZX_OK)

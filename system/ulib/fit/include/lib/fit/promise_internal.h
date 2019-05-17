@@ -306,13 +306,11 @@ class result_handler_invoker final {
         typename ::fit::callable_traits<Handler>::args::template at<
             base_type::next_arg_index>;
     static_assert(
-        (std::is_same<result_arg_type, PriorResult>::value &&
-         std::is_copy_constructible<result_arg_type>::value) ||
-            std::is_same<result_arg_type, PriorResult&>::value ||
+        std::is_same<result_arg_type, PriorResult&>::value ||
             std::is_same<result_arg_type, const PriorResult&>::value,
         "The provided handler's last argument was expected to be of type "
-        "fit::result<V, E>&, const fit::result<V, E>&, or fit::result<V, E> "
-        "(if the result is copy-constructible).  "
+        "fit::result<V, E>& or const fit::result<V, E>& where V is the prior "
+        "result's value type and E is the prior result's error type.  "
         "Please refer to the combinator's documentation for a list of "
         "supported handler function signatures.");
 
@@ -340,12 +338,10 @@ class value_handler_invoker final {
         typename ::fit::callable_traits<Handler>::args::template at<
             base_type::next_arg_index>;
     static_assert(
-        (std::is_same<value_arg_type, V>::value &&
-         std::is_copy_constructible<value_arg_type>::value) ||
-            std::is_same<value_arg_type, V&>::value ||
+        std::is_same<value_arg_type, V&>::value ||
             std::is_same<value_arg_type, const V&>::value,
         "The provided handler's last argument was expected to be of type "
-        "V&, const V&, or V (if the value is copy-constructible).  "
+        "V& or const V& where V is the prior result's value type.  "
         "Please refer to the combinator's documentation for a list of "
         "supported handler function signatures.");
 
@@ -393,12 +389,10 @@ class error_handler_invoker final {
         typename ::fit::callable_traits<Handler>::args::template at<
             base_type::next_arg_index>;
     static_assert(
-        (std::is_same<error_arg_type, E>::value &&
-         std::is_copy_constructible<error_arg_type>::value) ||
-            std::is_same<error_arg_type, E&>::value ||
+        std::is_same<error_arg_type, E&>::value ||
             std::is_same<error_arg_type, const E&>::value,
         "The provided handler's last argument was expected to be of type "
-        "E&, const E&, or E (if the error is copy-constructible).  "
+        "E& or const E& where E is the prior result's error type.  "
         "Please refer to the combinator's documentation for a list of "
         "supported handler function signatures.");
 
@@ -551,6 +545,21 @@ private:
 template <typename PromiseHandler>
 using promise_continuation = context_handler_invoker<PromiseHandler>;
 
+// The continuation produced by |make_result_promise()|.
+template <typename V, typename E>
+class result_continuation final {
+public:
+    explicit result_continuation(::fit::result<V, E> result)
+        : result_(std::move(result)) {}
+
+    ::fit::result<V, E> operator()(::fit::context& context) {
+        return std::move(result_);
+    }
+
+private:
+    ::fit::result<V, E> result_;
+};
+
 // Returns true if all arguments are true or if there are none.
 inline bool all_true() {
     return true;
@@ -583,6 +592,35 @@ private:
     }
 
     std::tuple<future_impl<Promises>...> promises_;
+};
+
+// The continuation produced by |join_promise_vector()|.
+template <typename Promise>
+class join_vector_continuation final {
+    using promise_vector = std::vector<Promise>;
+    using result_vector = std::vector<typename Promise::result_type>;
+
+public:
+    explicit join_vector_continuation(promise_vector promises)
+        : promises_(std::move(promises)), results_(promises_.size()) {}
+
+    ::fit::result<result_vector> operator()(::fit::context& context) {
+        bool all_done{true};
+        for (size_t i = 0; i < promises_.size(); ++i) {
+            if (!results_[i]) {
+                results_[i] = promises_[i](context);
+                all_done &= !results_[i].is_pending();
+            }
+        }
+        if (all_done) {
+            return fit::ok(std::move(results_));
+        }
+        return ::fit::pending();
+    }
+
+private:
+    promise_vector promises_;
+    result_vector results_;
 };
 
 } // namespace internal

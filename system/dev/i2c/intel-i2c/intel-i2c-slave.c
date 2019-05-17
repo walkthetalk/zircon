@@ -40,11 +40,6 @@ static const zx_duration_t timeout_ns = ZX_SEC(2);
 
 #define WAIT_FOR(condition, poll_interval) DO_UNTIL(condition, , poll_interval)
 
-// This is a controller implementation constant.  This value is likely lower
-// than reality, but it is a conservative choice.
-// TODO(teisenbe): Discover this/look it up from a table
-const uint32_t kRxFifoDepth = 8;
-
 // Implement the functionality of the i2c slave devices.
 
 static int bus_is_idle(intel_serialio_i2c_device_t *controller) {
@@ -58,6 +53,9 @@ static int stop_detected(intel_serialio_i2c_device_t *controller) {
             (0x1 << INTR_STOP_DETECTION));
 }
 
+static uint32_t rx_fifo_level(intel_serialio_i2c_device_t *controller) {
+    return readl(&controller->regs->rxflr) & 0x1ff;
+}
 static int rx_fifo_empty(intel_serialio_i2c_device_t *controller) {
     return !(readl(&controller->regs->i2c_sta) & (0x1 << I2C_STA_RFNE));
 }
@@ -124,7 +122,7 @@ zx_status_t intel_serialio_i2c_slave_transfer(
         if (last_type == segments->type)
             restart = 1;
         size_t outstanding_reads = 0;
-        while (len--) {
+        while (len-- || outstanding_reads) {
             // Build the cmd register value.
             uint32_t cmd = (restart << DATA_CMD_RESTART);
             restart = 0;
@@ -132,7 +130,7 @@ zx_status_t intel_serialio_i2c_slave_transfer(
             case fuchsia_hardware_i2c_SegmentType_WRITE:
                 // Wait if the TX FIFO is full
                 if (!(readl(&controller->regs->i2c_sta) &
-                      (0x1 << I2C_STA_TFNF))) {
+                        (0x1 << I2C_STA_TFNF))) {
                     status = intel_serialio_i2c_wait_for_tx_empty(
                         controller, zx_deadline_after(timeout_ns));
                     if (status != ZX_OK) {
@@ -169,42 +167,39 @@ zx_status_t intel_serialio_i2c_slave_transfer(
                 goto transfer_finish_1;
             }
 
+            // If its a read then queue up more reads until we hit fifo_depth.
+            // (We use fifo_depth - 1 because going to the full fifo_depth
+            // causes an overflow interrupt).
+            if (outstanding_reads != 0 && len > 0 && outstanding_reads < (size_t) (controller->rx_fifo_depth - 1)) {
+                continue;
+            }
+
+            uint32_t rx_data_left = rx_fifo_level(controller);
             // If this is a read, extract data if it's ready.
             while (outstanding_reads) {
-                // If len is > 0 and the queue has more space, we can go queue up more work.
-                if (len > 0 && outstanding_reads < kRxFifoDepth) {
-                    if (rx_fifo_empty(controller)) {
-                        break;
+                while (rx_data_left == 0) {
+                    // Make sure that the FIFO threshold will be crossed when
+                    // the reads are ready.
+                    uint32_t rx_threshold = outstanding_reads;
+                    status = intel_serialio_i2c_set_rx_fifo_threshold(controller,
+                            rx_threshold);
+                    if (status != ZX_OK) {
+                        goto transfer_finish_1;
                     }
-                } else {
-                    if (rx_fifo_empty(controller)) {
-                        // If we've issued all of our read requests, make sure
-                        // that the FIFO threshold will be crossed when the
-                        // reads are ready.
-                        uint32_t rx_threshold;
-                        intel_serialio_i2c_get_rx_fifo_threshold(controller, &rx_threshold);
-                        if (len == 0 && outstanding_reads < rx_threshold) {
-                            status = intel_serialio_i2c_set_rx_fifo_threshold(controller,
-                                                                              outstanding_reads);
-                            if (status != ZX_OK) {
-                                goto transfer_finish_1;
-                            }
-                        }
 
-                        // Wait for the FIFO to get some data.
-                        status = intel_serialio_i2c_wait_for_rx_full(controller,
-                                                                     zx_deadline_after(timeout_ns));
-                        if (status != ZX_OK) {
-                            goto transfer_finish_1;
-                        }
-
-                        // Restore the RX threshold in case we changed it
-                        status = intel_serialio_i2c_set_rx_fifo_threshold(controller,
-                                                                          rx_threshold);
-                        if (status != ZX_OK) {
-                            goto transfer_finish_1;
-                        }
+                    // Clear the RX threshold signal
+                    status = intel_serialio_i2c_flush_rx_full_irq(controller);
+                    if (status != ZX_OK) {
+                        goto transfer_finish_1;
                     }
+
+                    // Wait for the FIFO to get some data.
+                    status = intel_serialio_i2c_wait_for_rx_full(controller,
+                            zx_deadline_after(timeout_ns));
+                    if (status != ZX_OK) {
+                        goto transfer_finish_1;
+                    }
+                    rx_data_left = rx_fifo_level(controller);
                 }
 
                 status = intel_serialio_i2c_read_rx(controller, buf);
@@ -213,6 +208,7 @@ zx_status_t intel_serialio_i2c_slave_transfer(
                 }
                 buf++;
                 outstanding_reads--;
+                rx_data_left--;
             }
         }
         if (outstanding_reads != 0) {
@@ -388,6 +384,7 @@ zx_status_t intel_serialio_i2c_slave_get_irq(intel_serialio_i2c_slave_device_t* 
                                              zx_handle_t* out) {
     if (slave->chip_address == 0xa) {
         zx_handle_t irq;
+        // Please do not use get_root_resource() in new code. See ZX-1467.
         zx_status_t status = zx_interrupt_create(get_root_resource(), 0x1f,
                             ZX_INTERRUPT_MODE_LEVEL_LOW, &irq);
         if (status != ZX_OK) {
@@ -397,6 +394,7 @@ zx_status_t intel_serialio_i2c_slave_get_irq(intel_serialio_i2c_slave_device_t* 
         return ZX_OK;
     } else if (slave->chip_address == 0x49) {
         zx_handle_t irq;
+        // Please do not use get_root_resource() in new code. See ZX-1467.
         zx_status_t status = zx_interrupt_create(get_root_resource(), 0x33,
                             ZX_INTERRUPT_MODE_LEVEL_LOW, &irq);
         if (status != ZX_OK) {
@@ -407,6 +405,7 @@ zx_status_t intel_serialio_i2c_slave_get_irq(intel_serialio_i2c_slave_device_t* 
     } else if (slave->chip_address == 0x10) {
         // Acer12
         zx_handle_t irq;
+        // Please do not use get_root_resource() in new code. See ZX-1467.
         zx_status_t status = zx_interrupt_create(get_root_resource(), 0x1f,
                             ZX_INTERRUPT_MODE_LEVEL_LOW, &irq);
         if (status != ZX_OK) {
@@ -416,6 +415,7 @@ zx_status_t intel_serialio_i2c_slave_get_irq(intel_serialio_i2c_slave_device_t* 
         return ZX_OK;
     } else if (slave->chip_address == 0x50) {
         zx_handle_t irq;
+        // Please do not use get_root_resource() in new code. See ZX-1467.
         zx_status_t status = zx_interrupt_create(get_root_resource(), 0x18,
                             ZX_INTERRUPT_MODE_EDGE_LOW, &irq);
         if (status != ZX_OK) {

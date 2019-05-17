@@ -6,8 +6,14 @@
 #include <mini-process/mini-process.h>
 
 // This function is the entire program that the child process will execute. It
-// gets directly mapped into the child process via zx_vmo_write() so it must not
-// reference any addressable entity outside it.
+// gets directly mapped into the child process via zx_vmo_write() so it,
+//
+// 1. must not reference any addressable entity outside the function
+//
+// 2. must fit entirely within its containing VMO
+//
+// If you find that this program is crashing for no apparent reason, check to
+// see if it has outgrown its VMO. See kSizeLimit in mini-process.c.
 void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
     if (fnptr == 0) {
         // In this mode we don't have a VDSO so we don't care what the handle is
@@ -27,8 +33,8 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
 
         uint32_t actual = 0u;
         uint32_t actual_handles = 0u;
-        zx_handle_t handle[2];
-        minip_ctx_t ctx;
+        zx_handle_t handle[2] = {ZX_HANDLE_INVALID, ZX_HANDLE_INVALID};
+        minip_ctx_t ctx = {0};
 
         zx_status_t status = (*read_fn)(
                 channel, 0u, &ctx, handle, sizeof(ctx), 1, &actual, &actual_handles);
@@ -51,9 +57,12 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
             if (status != ZX_OK)
                 break;
 
-            minip_cmd_t cmd;
+            minip_cmd_t cmd = {0};
             status = ctx.channel_read(
                 channel, 0u, &cmd, NULL,  sizeof(cmd), 0u, &actual, &actual_handles);
+
+            if (status != ZX_OK)
+                break;
 
             // Execute one or more commands. After each we send a reply with the
             // result. If the command does not cause to crash or exit.
@@ -78,6 +87,19 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
                     cmd.status = ctx.event_create(0u, &handle[0]);
                     goto reply;
                 }
+                if (what & MINIP_CMD_CREATE_PROFILE) {
+                    what &= ~MINIP_CMD_CREATE_PROFILE;
+
+                    // zx_profile_create() needs a handle to the root job, but we don't have one so
+                    // we're passing ZX_HANDLE_INVALID. It is expected that this call will fail.
+                    //
+                    // Note, we're passing NULL instead of a pointer to a properly initialized
+                    // zx_profile_info_t. That's to prevent the compiler from getting smart and
+                    // using a pre-computed structure in the data segment. This function is
+                    // "injected" into the mini-process so there can be no external dependencies.
+                    cmd.status = ctx.profile_create(ZX_HANDLE_INVALID, NULL, &handle[0]);
+                    goto reply;
+                }
                 if (what & MINIP_CMD_CREATE_CHANNEL) {
                     what &= ~MINIP_CMD_CREATE_CHANNEL;
                     cmd.status = ctx.channel_create(0u, &handle[0], &handle[1]);
@@ -88,7 +110,7 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
 
                     // Test one case of using an invalid handle.  This
                     // tests a double-close of an event handle.
-                    zx_handle_t handle;
+                    zx_handle_t handle = ZX_HANDLE_INVALID;
                     if (ctx.event_create(0u, &handle) != ZX_OK ||
                         ctx.handle_close(handle) != ZX_OK)
                         __builtin_trap();
@@ -103,9 +125,9 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
                     // out of the process (by writing it to a channel).  In
                     // this case, the Handle object still exists inside the
                     // kernel.
-                    zx_handle_t handle;
-                    zx_handle_t channel1;
-                    zx_handle_t channel2;
+                    zx_handle_t handle = ZX_HANDLE_INVALID;
+                    zx_handle_t channel1 = ZX_HANDLE_INVALID;
+                    zx_handle_t channel2 = ZX_HANDLE_INVALID;
                     if (ctx.event_create(0u, &handle) != ZX_OK ||
                         ctx.channel_create(0u, &channel1, &channel2) != ZX_OK ||
                         ctx.channel_write(channel1, 0, NULL, 0,
@@ -122,12 +144,41 @@ void minipr_thread_loop(zx_handle_t channel, uintptr_t fnptr) {
                 if (what & MINIP_CMD_VALIDATE_CLOSED_HANDLE) {
                     what &= ~MINIP_CMD_VALIDATE_CLOSED_HANDLE;
 
-                    zx_handle_t event;
+                    zx_handle_t event = ZX_HANDLE_INVALID;
                     if (ctx.event_create(0u, &event) != ZX_OK)
                         __builtin_trap();
                     ctx.handle_close(event);
                     cmd.status = ctx.object_get_info(
                         event, ZX_INFO_HANDLE_VALID, NULL, 0, NULL, NULL);
+                    goto reply;
+                }
+                if (what & MINIP_CMD_CREATE_PAGER_VMO) {
+                    what &= ~MINIP_CMD_CREATE_PAGER_VMO;
+
+                    zx_handle_t pager = ZX_HANDLE_INVALID;
+                    if (ctx.pager_create(0u, &pager) != ZX_OK)
+                        __builtin_trap();
+                    zx_handle_t port = ZX_HANDLE_INVALID;
+                    if (ctx.port_create(0u, &port) != ZX_OK)
+                        __builtin_trap();
+                    cmd.status = ctx.pager_create_vmo(pager, 0u, port, 0u, 0u, &handle[0]);
+                    goto reply;
+                }
+                if (what & MINIP_CMD_CREATE_VMO_CONTIGUOUS) {
+                    what &= ~MINIP_CMD_CREATE_VMO_CONTIGUOUS;
+
+                    // This call will fail because we don't have a bti handle, but that's OK because
+                    // we only care about *how* it fails.
+                    cmd.status =
+                        ctx.vmo_contiguous_create(ZX_HANDLE_INVALID, ZX_PAGE_SIZE, 0u, &handle[0]);
+                    goto reply;
+                }
+                if (what & MINIP_CMD_CREATE_VMO_PHYSICAL) {
+                    what &= ~MINIP_CMD_CREATE_VMO_PHYSICAL;
+
+                    // This call will fail because we don't have a mmio resource, but that's OK
+                    // because we only care about *how* it fails.
+                    cmd.status = ctx.vmo_physical_create(ZX_HANDLE_INVALID, 0u, 0u, &handle[0]);
                     goto reply;
                 }
 

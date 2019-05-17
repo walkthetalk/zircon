@@ -56,7 +56,7 @@ void MarkPagesInUsePhys(paddr_t pa, size_t len) {
     // mark all of the pages we allocated as WIRED
     vm_page_t* p;
     list_for_every_entry (&list, p, vm_page_t, queue_node) {
-        p->state = VM_PAGE_STATE_WIRED;
+        p->set_state(VM_PAGE_STATE_WIRED);
     }
 }
 
@@ -287,4 +287,4 @@ STATIC_COMMAND_START
 #if LK_DEBUGLEVEL > 0
 STATIC_COMMAND("vm", "vm commands", &cmd_vm)
 #endif
-STATIC_COMMAND_END(vm);
+STATIC_COMMAND_END(vm)

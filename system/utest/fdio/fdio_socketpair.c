@@ -14,7 +14,9 @@
 
 #include <lib/fdio/limits.h>
 #include <lib/fdio/unsafe.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
 
@@ -200,9 +202,9 @@ int poll_for_read_with_timeout(void* arg) {
     pollfd.revents = 0;
 
     int timeout_ms = 100;
-    zx_time_t time_before = zx_clock_get(CLOCK_MONOTONIC);
+    zx_time_t time_before = zx_clock_get_monotonic();
     poll_args->poll_result = poll(&pollfd, 1, timeout_ms);
-    zx_time_t time_after = zx_clock_get(CLOCK_MONOTONIC);
+    zx_time_t time_after = zx_clock_get_monotonic();
     poll_args->poll_time = time_after - time_before;
 
     int num_readable = 0;
@@ -409,23 +411,20 @@ bool socketpair_clone_or_unwrap_and_wrap_test(void) {
     int status = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     ASSERT_EQ(status, 0, "socketpair(AF_UNIX, SOCK_STREAM, 0, fds) failed");
 
-    zx_handle_t handles[FDIO_MAX_HANDLES];
-    uint32_t types[FDIO_MAX_HANDLES];
-    zx_status_t handle_count = fdio_clone_fd(fds[0], fds[0], handles, types);
-    ASSERT_GT(handle_count, 0, "fdio_clone_fd() failed");
-    EXPECT_EQ(PA_HND_TYPE(types[0]), PA_FDIO_SOCKET, "Wrong cloned fd type");
+    zx_handle_t handle = ZX_HANDLE_INVALID;
+    status = fdio_fd_clone(fds[0], &handle);
+    ASSERT_EQ(status, ZX_OK, "fdio_fd_clone() failed");
 
     int cloned_fd = -1;
-    status = fdio_create_fd(handles, types, handle_count, &cloned_fd);
-    EXPECT_EQ(status, 0, "fdio_create_fd(..., &cloned_fd) failed");
+    status = fdio_fd_create(handle, &cloned_fd);
+    EXPECT_EQ(status, 0, "fdio_fd_create(..., &cloned_fd) failed");
 
-    handle_count = fdio_transfer_fd(fds[0], fds[0], handles, types);
-    ASSERT_GT(handle_count, 0, "fdio_transfer_fd() failed");
-    EXPECT_EQ(PA_HND_TYPE(types[0]), PA_FDIO_SOCKET, "Wrong transferred fd type");
+    status = fdio_fd_transfer(fds[0], &handle);
+    ASSERT_EQ(status, ZX_OK, "fdio_fd_transfer() failed");
 
     int transferred_fd = -1;
-    status = fdio_create_fd(handles, types, handle_count, &transferred_fd);
-    EXPECT_EQ(status, 0, "fdio_create_fd(..., &transferred_fd) failed");
+    status = fdio_fd_create(handle, &transferred_fd);
+    EXPECT_EQ(status, 0, "fdio_fd_create(..., &transferred_fd) failed");
 
     // Verify that an operation specific to socketpairs works on these fds.
     ASSERT_EQ(shutdown(cloned_fd, SHUT_RD), 0, "shutdown(cloned_fd, SHUT_RD) failed");
@@ -598,6 +597,59 @@ bool socketpair_wait_begin_end(void) {
     END_TEST;
 }
 
+#define WRITE_DATA_SIZE 1024*1024
+
+struct full_read_args {
+    int fd;
+};
+int full_read_thread(void *arg) {
+    struct full_read_args *args = arg;
+    int status;
+    size_t progress = 0;
+    static char buf[WRITE_DATA_SIZE];
+    while (progress < WRITE_DATA_SIZE) {
+        size_t n = WRITE_DATA_SIZE - progress;
+        if (n > sizeof(buf))
+            n = sizeof(buf);
+        fflush(stdout);
+        status = read(args->fd, buf, n);
+        if (status < 0)
+            break;
+        progress += status;
+    }
+    if (status < 0)
+        return status;
+    return progress;
+}
+
+bool socketpair_partial_write_test(void) {
+    BEGIN_TEST;
+
+    int fds[2];
+    int status = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    ASSERT_EQ(status, 0, "socketpair(AF_UNIX, SOCK_STREAM, 0, fds) failed");
+
+    // Start a thread that reads everything we write.
+    thrd_t t;
+    struct full_read_args args = {.fd = fds[1]};
+    int thrd_create_result = thrd_create(&t, full_read_thread, &args);
+    ASSERT_EQ(thrd_create_result, thrd_success, "create reading thread");
+
+    // Write more data that can fit in the socket send buffer.
+    char *data = malloc(WRITE_DATA_SIZE);
+    memset(data, 'A', WRITE_DATA_SIZE);
+    int aa = write(fds[0], data, WRITE_DATA_SIZE);
+    EXPECT_EQ(aa, WRITE_DATA_SIZE, "write did not fully succeed");
+    free(data);
+
+    // Make sure the other thread read everything.
+    int size_read;
+    ASSERT_EQ(thrd_join(t, &size_read), 0, "join reading thread");
+    ASSERT_EQ(size_read, WRITE_DATA_SIZE, "other thread did not read everything");
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(fdio_socketpair_test)
 RUN_TEST(socketpair_test);
 RUN_TEST(socketpair_shutdown_rd_test);
@@ -613,4 +665,5 @@ RUN_TEST(socketpair_clone_or_unwrap_and_wrap_test);
 RUN_TEST(socketpair_recvmsg_nonblock_boundary_test);
 RUN_TEST(socketpair_sendmsg_nonblock_boundary_test);
 RUN_TEST(socketpair_wait_begin_end);
+RUN_TEST_MEDIUM(socketpair_partial_write_test)
 END_TEST_CASE(fdio_socketpair_test)

@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_MMIO_BUFFER_H_
+#define DDK_MMIO_BUFFER_H_
 
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 typedef struct {
     // |vaddr| points to the content starting at |offset| in |vmo|.
@@ -48,4 +49,6 @@ zx_status_t mmio_buffer_pin(mmio_buffer_t* buffer, zx_handle_t bti, mmio_pinned_
 // Unpins the buffer.
 void mmio_buffer_unpin(mmio_pinned_buffer_t* buffer);
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // DDK_MMIO_BUFFER_H_

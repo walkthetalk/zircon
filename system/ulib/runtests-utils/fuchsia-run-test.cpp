@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -49,7 +50,17 @@ fbl::String BaseName(const fbl::String& path) {
     return ret;
 }
 
-void TestFileComponentInfo(const fbl::String path,
+fbl::String RootName(const fbl::String& path) {
+  const size_t i = strspn(path.c_str(), "/");
+  const char* start = &path.c_str()[i];
+  const char* end = strchr(start, '/');
+  if (end == nullptr) {
+    end = &path.c_str()[path.size()];
+  }
+  return fbl::String::Concat({"/", fbl::String(start, end - start)});
+}
+
+void TestFileComponentInfo(const fbl::String& path,
                            fbl::String* component_url_out,
                            fbl::String* cmx_file_path_out) {
     if (strncmp(path.c_str(), kPkgPrefix, strlen(kPkgPrefix)) != 0) {
@@ -105,12 +116,29 @@ struct LoaderServiceState {
 const char* const kLibPaths[] = {"system/lib", "boot/lib"};
 
 // This is a helper specifically for the C API boundary with the implementation code.
-zx_status_t VmoFromFd(fbl::unique_fd fd, const char* file_name, zx_handle_t* out) {
-    zx_status_t status = fdio_get_vmo_clone(fd.get(), out);
+zx_status_t ExecVmoFromFd(fbl::unique_fd fd, const char* file_name, zx_handle_t* out) {
+    zx_handle_t vmo;
+    zx_handle_t exec_vmo;
+
+    zx_status_t status = fdio_get_vmo_clone(fd.get(), &vmo);
     if (status != ZX_OK) {
         return status;
     }
-    return zx_object_set_property(*out, ZX_PROP_NAME, file_name, strlen(file_name));
+
+    status = zx_vmo_replace_as_executable(vmo, ZX_HANDLE_INVALID, &exec_vmo);
+    if (status != ZX_OK) {
+        zx_handle_close(vmo);
+        return status;
+    }
+
+    status = zx_object_set_property(exec_vmo, ZX_PROP_NAME, file_name, strlen(file_name));
+    if (status != ZX_OK) {
+        zx_handle_close(exec_vmo);
+        return status;
+    }
+
+    *out = exec_vmo;
+    return ZX_OK;
 }
 
 zx_status_t LoadObject(void* ctx, const char* name, zx_handle_t* out) {
@@ -122,7 +150,7 @@ zx_status_t LoadObject(void* ctx, const char* name, zx_handle_t* out) {
         }
         fbl::unique_fd fd(openat(state->root_dir_fd.get(), path, O_RDONLY));
         if (fd) {
-            return VmoFromFd(std::move(fd), name, out);
+            return ExecVmoFromFd(std::move(fd), name, out);
         }
     }
     return ZX_ERR_NOT_FOUND;
@@ -132,7 +160,7 @@ zx_status_t LoadAbspath(void* ctx, const char* path, zx_handle_t* out) {
     const auto state = static_cast<LoaderServiceState*>(ctx);
     fbl::unique_fd fd(openat(state->root_dir_fd.get(), path, O_RDONLY));
     if (fd) {
-        return VmoFromFd(std::move(fd), path, out);
+        return ExecVmoFromFd(std::move(fd), path, out);
     }
     return ZX_ERR_NOT_FOUND;
 }
@@ -286,11 +314,36 @@ std::unique_ptr<Result> FuchsiaRunTest(const char* argv[],
         return std::make_unique<Result>(path, FAILED_TO_LAUNCH, 0);
     }
 
+    // The TEST_ROOT_DIR environment variable allows tests that could be stored in
+    // "/system" or "/boot" to discern where they are running, and modify paths
+    // accordingly.
+    //
+    // TODO(BLD-463): The hard-coded set of prefixes is not ideal. Ideally, this
+    // would instead set the "root" to the parent directory of the "test/"
+    // subdirectory where globbing was done to collect the set of tests in
+    // DiscoverAndRunTests().  But then it's not clear what should happen if
+    // using `-f` to provide a list of paths instead of directories to glob.
+    const fbl::String root = RootName(path);
+    // |root_var| must be kept alive for |env_vars| since |env_vars| may hold
+    // a pointer into it.
+    fbl::String root_var;
+    fbl::Vector<const char*> env_vars;
+    if (root == "/system" || root == "/boot") {
+      for (size_t i = 0; environ[i] != nullptr; ++i) {
+        env_vars.push_back(environ[i]);
+      }
+      root_var = fbl::String::Concat({"TEST_ROOT_DIR=", root});
+      env_vars.push_back(root_var.c_str());
+      env_vars.push_back(nullptr);
+    }
+    const char* const* env_vars_p =
+        !env_vars.is_empty() ? env_vars.begin() : nullptr;
+
     fds[1].release(); // To avoid double close since fdio_spawn_etc() closes it.
     zx::process process;
     char err_msg[FDIO_SPAWN_ERR_MSG_MAX_LENGTH];
     status = fdio_spawn_etc(test_job.get(), FDIO_SPAWN_CLONE_ALL,
-                            args[0], args, nullptr,
+                            args[0], args, env_vars_p,
                             fdio_actions.size(), fdio_actions.get(),
                             process.reset_and_get_address(), err_msg);
     if (status != ZX_OK) {
@@ -312,6 +365,9 @@ std::unique_ptr<Result> FuchsiaRunTest(const char* argv[],
             fwrite(buf, 1, bytes_read, output_file);
             fwrite(buf, 1, bytes_read, stdout);
         }
+        fflush(stdout);
+        fflush(stderr);
+        fflush(output_file);
         if (fclose(output_file)) {
             fprintf(stderr, "FAILURE:  Could not close %s: %s", output_filename,
                     strerror(errno));

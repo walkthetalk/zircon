@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-object_get_property - Ask for various properties of various kernel objects.
+Ask for various properties of various kernel objects.
 
 ## SYNOPSIS
 
@@ -146,6 +146,19 @@ The value of 1 means the Job and its children will be terminated if the
 system finds itself in a system-wide low memory situation. Called with 0
 (which is the default) opts out the job from being terminated in this
 scenario.
+
+### ZX_PROP_EXCEPTION_STATE
+
+*handle* type: **Exception**
+
+*value* type: `uint32_t`
+
+Allowed operations: **get**, **set**
+
+When set to `ZX_EXCEPTION_STATE_HANDLED`, closing the exception handle will
+finish exception processing and resume the underlying thread.
+`ZX_EXCEPTION_STATE_TRY_NEXT` will instead continue exception processing by
+trying the next handler in order.
 
 ## RIGHTS
 

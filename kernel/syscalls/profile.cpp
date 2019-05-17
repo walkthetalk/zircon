@@ -20,20 +20,23 @@
 
 #include "priv.h"
 
-KCOUNTER(profile_create, "kernel.profile.create");
-KCOUNTER(profile_set,    "kernel.profile.set");
+KCOUNTER(profile_create, "profile.create")
+KCOUNTER(profile_set,    "profile.set")
 
 
 // zx_status_t zx_profile_create
 zx_status_t sys_profile_create(zx_handle_t root_job,
                                user_in_ptr<const zx_profile_info_t> user_profile_info,
                                user_out_handle* out) {
-    // TODO(ZX-3352): check job policy.
-
     auto up = ProcessDispatcher::GetCurrent();
 
+    zx_status_t status = up->EnforceBasicPolicy(ZX_POL_NEW_PROFILE);
+    if (status != ZX_OK) {
+        return status;
+    }
+
     fbl::RefPtr<JobDispatcher> job;
-    auto status = up->GetDispatcherWithRights(root_job, ZX_RIGHT_MANAGE_PROCESS, &job);
+    status = up->GetDispatcherWithRights(root_job, ZX_RIGHT_MANAGE_PROCESS, &job);
     if (status != ZX_OK) {
         return status;
     }
@@ -50,16 +53,16 @@ zx_status_t sys_profile_create(zx_handle_t root_job,
         return status;
     }
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<ProfileDispatcher> handle;
     zx_rights_t rights;
-    status = ProfileDispatcher::Create(profile_info, &dispatcher, &rights);
+    status = ProfileDispatcher::Create(profile_info, &handle, &rights);
     if (status != ZX_OK) {
         return status;
     }
 
     kcounter_add(profile_create, 1);
 
-    return out->make(ktl::move(dispatcher), rights);
+    return out->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_object_set_profile

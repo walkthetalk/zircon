@@ -36,6 +36,7 @@ void Usage() {
            "             [--tables TABLES_PATH]\n"
            "             [--json JSON_PATH]\n"
            "             [--name LIBRARY_NAME]\n"
+           "             [--werror]\n"
            "             [--files [FIDL_FILE...]...]\n"
            "             [--help]\n"
            "\n"
@@ -71,6 +72,8 @@ void Usage() {
            " * `--json-schema`. If present, this flag instructs `fidlc` to output the\n"
            "   JSON schema of the intermediate representation.\n"
            "\n"
+           " * `--werror`. Treats warnings as errors.\n"
+           "\n"
            " * `--help`. Prints this help, and exit immediately.\n"
            "\n"
            "All of the arguments can also be provided via a response file, denoted as\n"
@@ -78,7 +81,7 @@ void Usage() {
            "as a whitespace-delimited list of arguments. Response files cannot be nested,\n"
            "and must be the only argument.\n"
            "\n"
-           "See <https://fuchsia.googlesource.com/zircon/+/master/docs/fidl/compiler.md>\n"
+           "See <https://fuchsia.googlesource.com/fuchsia/+/master/zircon/docs/fidl/compiler.md>\n"
            "for more information.\n";
     std::cout.flush();
 }
@@ -180,8 +183,8 @@ private:
 
 class ResponseFileArguments : public Arguments {
 public:
-    ResponseFileArguments(fidl::StringView filename)
-        : file_(Open(filename, std::ios::in)) {
+    ResponseFileArguments(std::string_view filename)
+        : file_(Open(std::string(filename), std::ios::in)) {
         ConsumeWhitespace();
     }
 
@@ -252,7 +255,7 @@ void Write(std::ostringstream output, std::fstream file) {
 int compile(fidl::ErrorReporter* error_reporter,
             fidl::flat::Typespace* typespace,
             std::string library_name,
-            std::map<Behavior, std::fstream> outputs,
+            std::map<std::pair<Behavior, std::string>, std::fstream> outputs,
             std::vector<fidl::SourceManager> source_managers);
 
 int main(int argc, char* argv[]) {
@@ -277,14 +280,15 @@ int main(int argc, char* argv[]) {
             FailWithUsage("Response files must be the only argument to %s.\n", argv[0]);
         }
         // Drop the leading '@'.
-        fidl::StringView response_file = response.data() + 1;
+        std::string_view response_file = response.data() + 1;
         response_file_args = std::make_unique<ResponseFileArguments>(response_file);
         args = response_file_args.get();
     }
 
     std::string library_name;
 
-    std::map<Behavior, std::fstream> outputs;
+    bool warnings_as_errors = false;
+    std::map<std::pair<Behavior, std::string>, std::fstream> outputs;
     while (args->Remaining()) {
         // Try to parse an output type.
         std::string behavior_argument = args->Claim();
@@ -295,16 +299,23 @@ int main(int argc, char* argv[]) {
         } else if (behavior_argument == "--json-schema") {
             PrintJsonSchema();
             exit(0);
+        } else if (behavior_argument == "--werror") {
+            warnings_as_errors = true;
         } else if (behavior_argument == "--c-header") {
-            outputs.emplace(Behavior::kCHeader, Open(args->Claim(), std::ios::out));
+            std::string path = args->Claim();
+            outputs.emplace(std::make_pair(Behavior::kCHeader, path), Open(path, std::ios::out));
         } else if (behavior_argument == "--c-client") {
-            outputs.emplace(Behavior::kCClient, Open(args->Claim(), std::ios::out));
+            std::string path = args->Claim();
+            outputs.emplace(std::make_pair(Behavior::kCClient, path), Open(path, std::ios::out));
         } else if (behavior_argument == "--c-server") {
-            outputs.emplace(Behavior::kCServer, Open(args->Claim(), std::ios::out));
+            std::string path = args->Claim();
+            outputs.emplace(std::make_pair(Behavior::kCServer, path), Open(path, std::ios::out));
         } else if (behavior_argument == "--tables") {
-            outputs.emplace(Behavior::kTables, Open(args->Claim(), std::ios::out));
+            std::string path = args->Claim();
+            outputs.emplace(std::make_pair(Behavior::kTables, path), Open(path, std::ios::out));
         } else if (behavior_argument == "--json") {
-            outputs.emplace(Behavior::kJSON, Open(args->Claim(), std::ios::out));
+            std::string path = args->Claim();
+            outputs.emplace(std::make_pair(Behavior::kJSON, path), Open(path, std::ios::out));
         } else if (behavior_argument == "--name") {
             library_name = args->Claim();
         } else if (behavior_argument == "--files") {
@@ -318,7 +329,7 @@ int main(int argc, char* argv[]) {
     // Prepare source files.
     std::vector<fidl::SourceManager> source_managers;
     source_managers.push_back(fidl::SourceManager());
-    std::string library_zx_data(fidl::LibraryZX::kData, strlen(fidl::LibraryZX::kData) + 1);
+    std::string library_zx_data = fidl::LibraryZX::kData;
     source_managers.back().AddSourceFile(
         std::make_unique<fidl::SourceFile>(fidl::LibraryZX::kFilename, std::move(library_zx_data)));
     source_managers.push_back(fidl::SourceManager());
@@ -334,8 +345,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Ready. Set. Go.
-    fidl::ErrorReporter error_reporter;
-    auto typespace = fidl::flat::Typespace::RootTypes();
+    fidl::ErrorReporter error_reporter(warnings_as_errors);
+    auto typespace = fidl::flat::Typespace::RootTypes(&error_reporter);
     auto status = compile(&error_reporter,
                           &typespace,
                           library_name,
@@ -348,7 +359,7 @@ int main(int argc, char* argv[]) {
 int compile(fidl::ErrorReporter* error_reporter,
             fidl::flat::Typespace* typespace,
             std::string library_name,
-            std::map<Behavior, std::fstream> outputs,
+            std::map<std::pair<Behavior, std::string>, std::fstream> outputs,
             std::vector<fidl::SourceManager> source_managers) {
     fidl::flat::Libraries all_libraries;
     const fidl::flat::Library* final_library = nullptr;
@@ -368,16 +379,38 @@ int compile(fidl::ErrorReporter* error_reporter,
         final_library = library.get();
         if (!all_libraries.Insert(std::move(library))) {
             const auto& name = library->name();
-            Fail("Mulitple libraries with the same name: '%s'\n",
-                 NameLibrary(name).data());
+            Fail("Multiple libraries with the same name: '%s'\n",
+                 fidl::NameLibrary(name).data());
         }
     }
-    if (final_library == nullptr) {
+    if (!final_library) {
         Fail("No library was produced.\n");
+    }
+    auto unused_libraries_names = all_libraries.Unused(final_library);
+    // Because the sources of library zx are unconditionally included, we filter
+    // out this library here. We can remove this logic when zx is used in source
+    // like other libraries.
+    unused_libraries_names.erase(std::vector<std::string_view>{"zx"});
+    if (unused_libraries_names.size() != 0) {
+        std::string message = "Unused libraries provided via --files: ";
+        bool first = true;
+        for (const auto& name : unused_libraries_names) {
+            if (first) {
+                first = false;
+            } else {
+                message.append(", ");
+            }
+            message.append(fidl::NameLibrary(name));
+        }
+        error_reporter->ReportWarning(nullptr /* location */, message);
+        // TODO(FIDL-600): Turn this into an actual failure, once all builds
+        // have been cleaned up.
+        // message.append("\n");
+        // Fail(message.data());
     }
 
     // Verify that the produced library's name matches the expected name.
-    std::string final_name = NameLibrary(final_library->name());
+    std::string final_name = fidl::NameLibrary(final_library->name());
     if (!library_name.empty() && final_name != library_name) {
         Fail("Generated library '%s' did not match --name argument: %s\n",
              final_name.data(), library_name.data());
@@ -386,7 +419,7 @@ int compile(fidl::ErrorReporter* error_reporter,
     // We recompile dependencies, and only emit output for the final
     // library.
     for (auto& output : outputs) {
-        auto& behavior = output.first;
+        auto& behavior = output.first.first;
         auto& output_file = output.second;
 
         switch (behavior) {

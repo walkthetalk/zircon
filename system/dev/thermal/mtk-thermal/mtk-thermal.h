@@ -8,41 +8,103 @@
 
 #include <ddk/protocol/platform-device-lib.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
-#include <ddktl/protocol/clk.h>
 #include <ddktl/protocol/empty-protocol.h>
+#include <ddktl/protocol/platform/device.h>
 #include <fbl/mutex.h>
+#include <fuchsia/hardware/thermal/c/fidl.h>
+#include <lib/fidl-utils/bind.h>
+#include <lib/mmio/mmio.h>
 #include <lib/zx/interrupt.h>
 #include <lib/zx/port.h>
-#include <zircon/device/thermal.h>
+
+#include "mtk-thermal-reg.h"
 
 namespace thermal {
 
 class MtkThermal;
-using DeviceType = ddk::Device<MtkThermal, ddk::Ioctlable>;
+using DeviceType = ddk::Device<MtkThermal, ddk::Messageable>;
 
 class MtkThermal : public DeviceType, public ddk::EmptyProtocol<ZX_PROTOCOL_THERMAL> {
 public:
+    virtual ~MtkThermal() = default;
+
     static zx_status_t Create(void* ctx, zx_device_t* parent);
 
-    void DdkRelease() { delete this; }
+    void DdkRelease();
 
-    zx_status_t DdkIoctl(uint32_t op, const void* in_buf, size_t in_len, void* out_buf,
-                         size_t out_len, size_t* actual);
+    zx_status_t DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn);
+
+    // Visible for testing.
+    uint16_t get_dvfs_opp() { return current_op_idx_; }
+
+    zx_status_t Init();
+    zx_status_t GetPort(zx::port* port) { return port_.duplicate(ZX_RIGHT_SAME_RIGHTS, port); }
+    zx_status_t StartThread();
+    virtual zx_status_t StopThread();
+
+protected:
+    // Visible for testing.
+    MtkThermal(zx_device_t* parent, ddk::MmioBuffer mmio, ddk::MmioBuffer pll_mmio,
+               ddk::MmioBuffer pmic_mmio, ddk::MmioBuffer infracfg_mmio,
+               const ddk::PDevProtocolClient& pdev, uint32_t clk_count,
+               const fuchsia_hardware_thermal_ThermalDeviceInfo& thermal_info, zx::port port,
+               zx::interrupt irq, TempCalibration0 cal0_fuse, TempCalibration1 cal1_fuse,
+               TempCalibration2 cal2_fuse)
+        : DeviceType(parent), mmio_(std::move(mmio)), pll_mmio_(std::move(pll_mmio)),
+          pmic_mmio_(std::move(pmic_mmio)), infracfg_mmio_(std::move(infracfg_mmio)), pdev_(pdev),
+          clk_count_(clk_count), thermal_info_(thermal_info), port_(std::move(port)),
+          irq_(std::move(irq)), cal0_fuse_(cal0_fuse), cal1_fuse_(cal1_fuse),
+          cal2_fuse_(cal2_fuse) {}
+
+    virtual void PmicWrite(uint16_t data, uint32_t addr);
+
+    virtual uint32_t ReadTemperatureSensors();
+
+    virtual zx_status_t SetDvfsOpp(uint16_t op_idx);
+
+    virtual zx_status_t SetTripPoint(size_t trip_pt);
+
+    virtual zx_status_t WaitForInterrupt();
+
+    int JoinThread() { return thrd_join(thread_, nullptr); }
+
+    ddk::MmioBuffer mmio_;
+    ddk::MmioBuffer pll_mmio_;
+    ddk::MmioBuffer pmic_mmio_;
+    ddk::MmioBuffer infracfg_mmio_;
 
 private:
-    MtkThermal(zx_device_t* parent, ddk::MmioBuffer mmio, ddk::MmioBuffer fuse_mmio,
-               ddk::MmioBuffer pll_mmio, ddk::MmioBuffer pmic_mmio,
-               const ddk::ClkProtocolClient& clk, const pdev_device_info_t& info,
-               const thermal_device_info_t& thermal_info, zx::port port, zx::interrupt irq)
-        : DeviceType(parent), mmio_(std::move(mmio)), fuse_mmio_(std::move(fuse_mmio)),
-          pll_mmio_(std::move(pll_mmio)), pmic_mmio_(std::move(pmic_mmio)), clk_(clk),
-          clk_count_(info.clk_count), thermal_info_(thermal_info), port_(std::move(port)),
-          irq_(std::move(irq)) {}
+    zx_status_t GetInfo(fidl_txn_t* txn);
+    zx_status_t GetDeviceInfo(fidl_txn_t* txn);
+    zx_status_t GetDvfsInfo(fuchsia_hardware_thermal_PowerDomain power_domain, fidl_txn_t* txn);
+    zx_status_t GetTemperature(fidl_txn_t* txn);
+    zx_status_t GetStateChangeEvent(fidl_txn_t* txn);
+    zx_status_t GetStateChangePort(fidl_txn_t* txn);
+    zx_status_t SetTrip(uint32_t id, uint32_t temp, fidl_txn_t* txn);
+    zx_status_t GetDvfsOperatingPoint(fuchsia_hardware_thermal_PowerDomain power_domain,
+                                      fidl_txn_t* txn);
+    zx_status_t SetDvfsOperatingPoint(uint16_t op_idx,
+                                      fuchsia_hardware_thermal_PowerDomain power_domain,
+                                      fidl_txn_t* txn);
+    zx_status_t GetFanLevel(fidl_txn_t* txn);
+    zx_status_t SetFanLevel(uint32_t fan_level, fidl_txn_t* txn);
 
-    uint32_t GetTemperature();
-    zx_status_t SetDvfsOpp(const dvfs_info_t* opp);
-    zx_status_t Init();
+    static constexpr fuchsia_hardware_thermal_Device_ops_t fidl_ops = {
+        .GetInfo = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetInfo>,
+        .GetDeviceInfo = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetDeviceInfo>,
+        .GetDvfsInfo = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetDvfsInfo>,
+        .GetTemperature = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetTemperature>,
+        .GetStateChangeEvent =
+            fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetStateChangeEvent>,
+        .GetStateChangePort = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetStateChangePort>,
+        .SetTrip = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::SetTrip>,
+        .GetDvfsOperatingPoint =
+            fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetDvfsOperatingPoint>,
+        .SetDvfsOperatingPoint =
+            fidl::Binder<MtkThermal>::BindMember<&MtkThermal::SetDvfsOperatingPoint>,
+        .GetFanLevel = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::GetFanLevel>,
+        .SetFanLevel = fidl::Binder<MtkThermal>::BindMember<&MtkThermal::SetFanLevel>,
+    };
 
     uint32_t RawToTemperature(uint32_t raw, uint32_t sensor);
     uint32_t TemperatureToRaw(uint32_t temp, uint32_t sensor);
@@ -50,25 +112,19 @@ private:
     uint32_t GetRawHot(uint32_t temp);
     uint32_t GetRawCold(uint32_t temp);
 
-    zx_status_t SetTripPoint(size_t trip_pt);
-
-    uint16_t PmicRead(uint32_t addr);
-    void PmicWrite(uint16_t data, uint32_t addr);
-
     int Thread();
 
-    ddk::MmioBuffer mmio_;
-    ddk::MmioBuffer fuse_mmio_;
-    ddk::MmioBuffer pll_mmio_;
-    ddk::MmioBuffer pmic_mmio_;
-    ddk::ClkProtocolClient clk_;
+    ddk::PDevProtocolClient pdev_;
     const uint32_t clk_count_;
-    const thermal_device_info_t thermal_info_;
-    uint32_t current_opp_idx_ = 0;
+    const fuchsia_hardware_thermal_ThermalDeviceInfo thermal_info_;
+    uint16_t current_op_idx_ = 0;
     zx::port port_;
     zx::interrupt irq_;
     thrd_t thread_;
     fbl::Mutex dvfs_lock_;
+    const TempCalibration0 cal0_fuse_;
+    const TempCalibration1 cal1_fuse_;
+    const TempCalibration2 cal2_fuse_;
 };
 
 }  // namespace thermal

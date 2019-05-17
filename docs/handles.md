@@ -23,8 +23,12 @@ process. The same number in another process might not map to any
 handle or it might map to a handle pointing to a completely
 different kernel object.
 
-The integer value for a handle is any 32-bit number except
-the value corresponding to ZX_HANDLE_INVALID.
+The integer value for a handle is any 32-bit number except the value
+corresponding to **ZX_HANDLE_INVALID** which will always have the
+value of 0.  In addition to this, the integer value of a valid handle
+will always have two least significant bits of the handle set.  The
+mask representing these bits may be accessed using
+**ZX_HANDLE_FIXED_BITS_MASK**
 
 For kernel-mode, a handle is a C++ object that contains three
 logical fields:
@@ -37,12 +41,134 @@ The '[rights](rights.md)' specify what operations on the kernel object
 are allowed. It is possible for a single process to have two different
 handles to the same kernel object with different rights.
 
+![User-mode versus Kernel-mode](images/handle-creation1.png)
+
+**Figure 1.** A user process starts the creation of a handle.
+
+<!--- handle-creation1.png
+```dot
+digraph Q {
+    node [shape=record];
+    nd_1 [label = "Process"];
+    nd_2 [label = "Event", style = invis];
+
+    subgraph cluster_Userspace {
+        label = "User-mode";
+        nd_1
+    }
+
+    subgraph cluster_Kernel {
+        label = "Kernel-mode";
+        style=filled;
+        nd_2;
+    }
+}
+```
+-->
+
+![User process creates the kernel object](images/handle-creation2.png)
+
+**Figure 2.** The user process creates the kernel object (for example, an
+event) with a system call and holds an integer reference to the object.
+
+<!--- handle-creation2.png
+```dot
+digraph Q {
+    node [shape=record];
+    nd_2 [label = "event"];
+    nd_3 [label = "ev0"];
+    rankdir=LR;
+
+    subgraph cluster_Userspace {
+        label = "User-mode";
+        subgraph cluster_Process {
+            label = "Process";
+            nd_3;
+        }
+    }
+
+    subgraph cluster_Kernel {
+        label = "Kernel-mode";
+        style=filled;
+        nd_2;
+    }
+
+    nd_3->nd_2 [label = "zx_event_create()"];
+}
+```
+-->
+
+![Handles are created with a set of basic rights](images/handle-creation3.png)
+
+**Figure 3.** Handles are created with a set of basic rights and any additional
+rights applicable to the kernel object type.
+
+<!--- handle-creation3.png
+```dot
+digraph Q {
+    node [shape=record];
+    nd_2 [label = "event"];
+    nd_3 [label = "ev0"];
+    rankdir=RL;
+
+    subgraph cluster_Userspace {
+        label = "User-mode";
+        subgraph cluster_Process {
+            label = "Process";
+            nd_3;
+        }
+    }
+
+    subgraph cluster_Kernel {
+        label = "Kernel-mode";
+        style=filled;
+        nd_2;
+    }
+    nd_2->nd_3 [label= "ZX basic rights\n + signalling right"];
+}
+```
+-->
+
+![Handles can be duplicated](images/handle-creation4.png)
+
+**Figure 4.** Handles can be duplicated. Rights can be dropped during this
+process.
+
+<!--- handle-creation4.png
+```dot
+graph Q {
+    node [shape=record];
+    nd_2 [label = "event"];
+    nd_3 [label = "ev0"];
+    nd_4 [label = "ev1"];
+    rankdir=RL;
+
+    subgraph cluster_Userspace {
+        label = "User-mode";
+        subgraph cluster_Process {
+            label = "Process";
+            nd_3;
+            nd_4;
+        }
+    }
+
+    subgraph cluster_Kernel {
+        label = "Kernel-mode";
+        style=filled;
+        nd_2;
+    }
+    nd_2--nd_3 [label= "ZX basic rights\n + signalling right"];
+    nd_4--nd_2 [label= "ZX wait right only"];
+}
+```
+-->
+
 ## Using Handles
 There are many syscalls that create a new kernel object
 and which return a handle to it. To name a few:
-+ [`zx_event_create`](syscalls/event_create.md)
-+ [`zx_process_create`](syscalls/process_create.md)
-+ [`zx_thread_create`](syscalls/thread_create.md)
++ [`zx_event_create()`](syscalls/event_create.md)
++ [`zx_process_create()`](syscalls/process_create.md)
++ [`zx_thread_create()`](syscalls/thread_create.md)
 
 These calls create both the kernel object and the first
 handle pointing to it. The handle is bound to the process that
@@ -52,25 +178,25 @@ that type of kernel object.
 There is only one syscall that can make a copy of a handle,
 which points to the same kernel object and is bound to the same
 process that issued the syscall:
-+ [`zx_handle_duplicate`](syscalls/handle_duplicate.md)
++ [`zx_handle_duplicate()`](syscalls/handle_duplicate.md)
 
 There is one syscall that creates an equivalent handle (possibly
 with fewer rights), invalidating the original handle:
-+ [`zx_handle_replace`](syscalls/handle_replace.md)
++ [`zx_handle_replace()`](syscalls/handle_replace.md)
 
 There is one syscall that just destroys a handle:
-+ [`zx_handle_close`](syscalls/handle_close.md)
++ [`zx_handle_close()`](syscalls/handle_close.md)
 
 There are two syscalls that takes a handle bound to calling
 process and binds it into kernel (puts the handle in-transit):
-+ [`zx_channel_write`](syscalls/channel_write.md)
-+ [`zx_socket_share`](syscalls/socket_share.md)
++ [`zx_channel_write()`](syscalls/channel_write.md)
++ [`zx_socket_share()`](syscalls/socket_share.md)
 
 There are three syscalls that takes an in-transit handle and
 binds it to the calling process:
-+ [`zx_channel_read`](syscalls/channel_read.md)
-+ [`zx_channel_call`](syscalls/channel_call.md)
-+ [`zx_socket_accept`](syscalls/socket_accept.md)
++ [`zx_channel_read()`](syscalls/channel_read.md)
++ [`zx_channel_call()`](syscalls/channel_call.md)
++ [`zx_socket_accept()`](syscalls/socket_accept.md)
 
 The channel and socket syscalls above are used to transfer a handle from
 one process to another. For example it is possible to connect
@@ -81,7 +207,7 @@ process calls `zx_channel_read` on the same channel.
 Finally, there is a single syscall that gives a new process its
 bootstrapping handle, that is, the handle that it can use to
 request other handles:
-+ [`zx_process_start`](syscalls/process_start.md)
++ [`zx_process_start()`](syscalls/process_start.md)
 
 The bootstrapping handle can be of any transferable kernel object but
 the most reasonable case is that it points to one end of a channel

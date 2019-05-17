@@ -8,10 +8,13 @@
 
 #include <fbl/unique_fd.h>
 #include <fs-management/fvm.h>
+#include <fuchsia/device/c/fidl.h>
+#include <fuchsia/hardware/block/c/fidl.h>
 #include <lib/async-loop/cpp/loop.h>
+#include <lib/fdio/unsafe.h>
+#include <lib/fzl/fdio.h>
 #include <lib/memfs/memfs.h>
 #include <unittest/unittest.h>
-#include <zircon/device/device.h>
 
 #include "filesystems.h"
 
@@ -41,10 +44,29 @@ int main(int argc, char** argv) {
             if (!fd) {
                 fprintf(stderr, "[fs] Could not open block device\n");
                 return -1;
-            } else if (ioctl_device_get_topo_path(fd.get(), test_disk_path, PATH_MAX) < 0) {
+            }
+            fzl::FdioCaller caller(std::move(fd));
+
+            zx_status_t status;
+            size_t path_len;
+            zx_status_t io_status = fuchsia_device_ControllerGetTopologicalPath(
+                    caller.borrow_channel(), &status, test_disk_path, PATH_MAX - 1,
+                    &path_len);
+            if (io_status != ZX_OK) {
+                status = io_status;
+            }
+            if (status != ZX_OK) {
                 fprintf(stderr, "[fs] Could not acquire topological path of block device\n");
                 return -1;
-            } else if (ioctl_block_get_info(fd.get(), &test_disk_info) < 0) {
+            }
+            test_disk_path[path_len] = 0;
+            io_status = fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(), &status,
+                                                            &test_disk_info);
+            if (io_status != ZX_OK) {
+                status = io_status;
+            }
+
+            if (status != ZX_OK) {
                 fprintf(stderr, "[fs] Could not read disk info\n");
                 return -1;
             }

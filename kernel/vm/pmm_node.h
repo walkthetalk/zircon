@@ -38,7 +38,6 @@ public:
 
     uint64_t CountFreePages() const;
     uint64_t CountTotalBytes() const;
-    void CountTotalStates(uint64_t state_count[VM_PAGE_STATE_COUNT_]) const;
 
     // printf free and overall state of the internal arenas
     // NOTE: both functions skip mutexes and can be called inside timer or crash context
@@ -56,7 +55,7 @@ public:
     void AddFreePages(list_node* list);
 
 private:
-    void FreePageLocked(vm_page* page) TA_REQ(lock_);
+    void FreePageHelperLocked(vm_page* page) TA_REQ(lock_);
     void FreeListLocked(list_node* list) TA_REQ(lock_);
 
     fbl::Canary<fbl::magic("PNOD")> canary_;

@@ -5,13 +5,15 @@
 #include "astro.h"
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <ddk/metadata.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/gpio.h>
 #include <ddk/protocol/platform/bus.h>
+#include <fuchsia/hardware/thermal/c/fidl.h>
+#include <soc/aml-common/aml-thermal.h>
 #include <soc/aml-meson/g12a-clk.h>
 #include <soc/aml-s905d2/s905d2-gpio.h>
 #include <soc/aml-s905d2/s905d2-hw.h>
-#include <zircon/device/thermal.h>
 
 static const pbus_mmio_t thermal_mmios[] = {
     {
@@ -82,7 +84,7 @@ static const pbus_clk_t thermal_clk_gates[] = {
 
 // NOTE: This is a very trivial policy, no data backing it up
 // As we do more testing this policy can evolve.
-static thermal_device_info_t aml_astro_config = {
+static fuchsia_hardware_thermal_ThermalDeviceInfo aml_astro_config = {
     .active_cooling                     = false,
     .passive_cooling                    = true,
     .gpu_throttling                     = true,
@@ -137,7 +139,7 @@ static thermal_device_info_t aml_astro_config = {
 };
 
 // clang-format on
-static opp_info_t aml_opp_info = {
+static aml_opp_info_t aml_opp_info = {
     .voltage_table = {
         {1022000, 0},
         {1011000, 3},
@@ -232,12 +234,12 @@ static opp_info_t aml_opp_info = {
 
 static const pbus_metadata_t thermal_metadata[] = {
     {
-        .type = THERMAL_CONFIG_METADATA,
+        .type = DEVICE_METADATA_THERMAL_CONFIG,
         .data_buffer = &aml_astro_config,
         .data_size = sizeof(aml_astro_config),
     },
     {
-        .type = VOLTAGE_DUTY_CYCLE_METADATA,
+        .type = DEVICE_METADATA_PRIVATE,
         .data_buffer = &aml_opp_info,
         .data_size = sizeof(aml_opp_info),
     },

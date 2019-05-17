@@ -12,9 +12,9 @@
 #include <dev/interrupt.h>
 #include <dev/pcie_bus_driver.h>
 #include <dev/pcie_platform.h>
-#include <fbl/limits.h>
 #include <inttypes.h>
 #include <kernel/mutex.h>
+#include <ktl/limits.h>
 #include <lk/init.h>
 #include <string.h>
 #include <trace.h>
@@ -57,7 +57,7 @@ static void lockdown_pcie_bus_regions(PcieBusDriver& pcie) {
     res = pcie.SubtractBusRegion(0x0, 0x10000, PciAddrSpace::PIO);
     ASSERT(res == ZX_OK);
 
-    res = pcie.SubtractBusRegion(0x0, fbl::numeric_limits<uint64_t>::max(), PciAddrSpace::MMIO);
+    res = pcie.SubtractBusRegion(0x0, ktl::numeric_limits<uint64_t>::max(), PciAddrSpace::MMIO);
     ASSERT(res == ZX_OK);
 }
 
@@ -138,6 +138,6 @@ static void x86_pcie_init_hook(uint level) {
     }
 }
 
-LK_INIT_HOOK(x86_pcie_init, x86_pcie_init_hook, LK_INIT_LEVEL_PLATFORM);
+LK_INIT_HOOK(x86_pcie_init, x86_pcie_init_hook, LK_INIT_LEVEL_PLATFORM)
 
 #endif // WITH_KERNEL_PCIE

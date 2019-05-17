@@ -13,6 +13,7 @@
 #include <pow2.h>
 #include <trace.h>
 
+#include <lib/counters.h>
 #include <lib/user_copy/user_ptr.h>
 
 #include <vm/vm_aspace.h>
@@ -26,10 +27,13 @@
 
 #define LOCAL_TRACE 0
 
+KCOUNTER(dispatcher_socket_create_count, "dispatcher.socket.create")
+KCOUNTER(dispatcher_socket_destroy_count, "dispatcher.socket.destroy")
+
 // static
 zx_status_t SocketDispatcher::Create(uint32_t flags,
-                                     fbl::RefPtr<Dispatcher>* dispatcher0,
-                                     fbl::RefPtr<Dispatcher>* dispatcher1,
+                                     KernelHandle<SocketDispatcher>* handle0,
+                                     KernelHandle<SocketDispatcher>* handle1,
                                      zx_rights_t* rights) {
     LTRACE_ENTRY;
 
@@ -64,22 +68,24 @@ zx_status_t SocketDispatcher::Create(uint32_t flags,
         return ZX_ERR_NO_MEMORY;
     auto holder1 = holder0;
 
-    auto socket0 = fbl::AdoptRef(new (&ac) SocketDispatcher(ktl::move(holder0), starting_signals,
-                                                            flags, ktl::move(control0)));
+    KernelHandle new_handle0(fbl::AdoptRef(new (&ac) SocketDispatcher(ktl::move(holder0),
+                                                                      starting_signals, flags,
+                                                                      ktl::move(control0))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto socket1 = fbl::AdoptRef(new (&ac) SocketDispatcher(ktl::move(holder1), starting_signals,
-                                                            flags, ktl::move(control1)));
+    KernelHandle new_handle1(fbl::AdoptRef(new (&ac) SocketDispatcher(ktl::move(holder1),
+                                                                      starting_signals, flags,
+                                                                      ktl::move(control1))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    socket0->Init(socket1);
-    socket1->Init(socket0);
+    new_handle0.dispatcher()->Init(new_handle1.dispatcher());
+    new_handle1.dispatcher()->Init(new_handle0.dispatcher());
 
     *rights = default_rights();
-    *dispatcher0 = ktl::move(socket0);
-    *dispatcher1 = ktl::move(socket1);
+    *handle0 = ktl::move(new_handle0);
+    *handle1 = ktl::move(new_handle1);
     return ZX_OK;
 }
 
@@ -93,9 +99,11 @@ SocketDispatcher::SocketDispatcher(fbl::RefPtr<PeerHolder<SocketDispatcher>> hol
       read_threshold_(0),
       write_threshold_(0),
       read_disabled_(false) {
+    kcounter_add(dispatcher_socket_create_count, 1);
 }
 
 SocketDispatcher::~SocketDispatcher() {
+    kcounter_add(dispatcher_socket_destroy_count, 1);
 }
 
 // This is called before either SocketDispatcher is accessible from threads other than the one

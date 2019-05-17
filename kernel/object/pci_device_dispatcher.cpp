@@ -15,15 +15,19 @@
 
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
+#include <lib/counters.h>
 
 #include <assert.h>
 #include <err.h>
 #include <trace.h>
 
-zx_status_t PciDeviceDispatcher::Create(uint32_t                  index,
-                                        zx_pcie_device_info_t*    out_info,
-                                        fbl::RefPtr<Dispatcher>* out_dispatcher,
-                                        zx_rights_t*              out_rights) {
+KCOUNTER(dispatcher_pci_device_create_count, "dispatcher.pci_device.create")
+KCOUNTER(dispatcher_pci_device_destroy_count, "dispatcher.pci_device.destroy")
+
+zx_status_t PciDeviceDispatcher::Create(uint32_t index,
+                                        zx_pcie_device_info_t* out_info,
+                                        KernelHandle<PciDeviceDispatcher>* out_handle,
+                                        zx_rights_t* out_rights) {
     auto bus_drv = PcieBusDriver::GetDriver();
     if (bus_drv == nullptr)
         return ZX_ERR_BAD_STATE;
@@ -33,18 +37,21 @@ zx_status_t PciDeviceDispatcher::Create(uint32_t                  index,
         return ZX_ERR_OUT_OF_RANGE;
 
     fbl::AllocChecker ac;
-    auto disp = new (&ac) PciDeviceDispatcher(ktl::move(device), out_info);
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) PciDeviceDispatcher(ktl::move(device),
+                                                                        out_info)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    *out_dispatcher = fbl::AdoptRef<Dispatcher>(disp);
-    *out_rights     = default_rights();
+    *out_handle = ktl::move(new_handle);
+    *out_rights = default_rights();
     return ZX_OK;
 }
 
 PciDeviceDispatcher::PciDeviceDispatcher(fbl::RefPtr<PcieDevice> device,
                                          zx_pcie_device_info_t* out_info)
     : device_(device) {
+
+    kcounter_add(dispatcher_pci_device_create_count, 1);
 
     out_info->vendor_id         = device_->vendor_id();
     out_info->device_id         = device_->device_id();
@@ -61,6 +68,8 @@ PciDeviceDispatcher::~PciDeviceDispatcher() {
     // Bus mastering and IRQ configuration are two states that should be
     // disabled when the driver using them has been unloaded.
     DEBUG_ASSERT(device_);
+
+    kcounter_add(dispatcher_pci_device_destroy_count, 1);
 
     zx_status_t s = EnableBusMaster(false);
     if (s != ZX_OK) {
@@ -150,7 +159,7 @@ zx_status_t PciDeviceDispatcher::ResetDevice() {
 }
 
 zx_status_t PciDeviceDispatcher::MapInterrupt(int32_t which_irq,
-                                              fbl::RefPtr<Dispatcher>* interrupt_dispatcher,
+                                              KernelHandle<InterruptDispatcher>* interrupt_handle,
                                               zx_rights_t* rights) {
     canary_.Assert();
 
@@ -167,7 +176,7 @@ zx_status_t PciDeviceDispatcher::MapInterrupt(int32_t which_irq,
                                           which_irq,
                                           irqs_maskable_,
                                           rights,
-                                          interrupt_dispatcher);
+                                          interrupt_handle);
 }
 
 static_assert(static_cast<uint>(ZX_PCIE_IRQ_MODE_DISABLED) ==

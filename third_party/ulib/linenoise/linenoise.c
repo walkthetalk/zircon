@@ -103,7 +103,6 @@
  *
  */
 
-#include <assert.h>
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -115,18 +114,17 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <poll.h>
+#include <unistd.h>
+#include "linenoise.h"
 
 #ifdef __Fuchsia__
-#include <zircon/device/pty.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 #include <lib/fdio/io.h>
+#include <lib/fdio/unsafe.h>
 #endif
-
-#include "linenoise.h"
 
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE 4096
-
 static const char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
@@ -135,13 +133,12 @@ static linenoiseFreeHintsCallback *freeHintsCallback = NULL;
 static struct termios orig_termios; /* In order to restore at exit.*/
 static int rawmode = 0; /* For atexit() function to check if restore is needed*/
 static int mlmode = 0;  /* Multi line mode. Default is single line. */
-static int history_max_len = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
-static int history_len = 0;
-static char **history = NULL;
-
 #ifndef __Fuchsia__
 static int atexit_registered = 0; /* Register atexit just 1 time. */
 #endif
+static int history_max_len = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
+static int history_len = 0;
+static char **history = NULL;
 
 /* The linenoiseState structure represents the state during line editing.
  * We pass this state to functions implementing specific editing
@@ -189,7 +186,6 @@ enum KEY_ACTION{
 #ifndef __Fuchsia__
 static void linenoiseAtExit(void);
 #endif
-
 int linenoiseHistoryAdd(const char *line);
 static void refreshLine(struct linenoiseState *l);
 
@@ -229,7 +225,7 @@ static int isUnsupportedTerm(int* uart) {
     if (term == NULL) return 0;
     for (j = 0; unsupported_term[j]; j++)
         if (!strcasecmp(term,unsupported_term[j])) return 1;
-    if (!strcasecmp(term,"uart")) {
+    if (!strcasecmp(term, "uart")) {
         *uart = 1;
         return 1;
     }
@@ -295,12 +291,6 @@ static int getCursorPosition(int ifd, int ofd) {
 
     /* Read the response: ESC [ rows ; cols R */
     while (i < sizeof(buf)-1) {
-        struct pollfd p = {
-            .fd = ifd,
-            .events = POLLIN,
-            .revents = 0,
-        };
-        if (poll(&p, 1, 250) != 1) return -1;
         if (read(ifd,buf+i,1) != 1) break;
         if (buf[i] == 'R') break;
         i++;
@@ -317,19 +307,23 @@ static int getCursorPosition(int ifd, int ofd) {
  * if it fails. */
 static int getColumns(int ifd, int ofd) {
 #ifdef __Fuchsia__
-    pty_window_size_t wsz;
-    ssize_t r = ioctl_pty_get_window_size(0, &wsz);
-    if (r != sizeof(wsz)) {
+    int tty = isatty(STDIN_FILENO);
+    zx_status_t status;
+    zx_status_t call_status;
+    fuchsia_hardware_pty_WindowSize wsz;
+    if (tty) {
+        fdio_t* io = fdio_unsafe_fd_to_io(STDIN_FILENO);
+        call_status = fuchsia_hardware_pty_DeviceGetWindowSize(
+            fdio_unsafe_borrow_channel(io), &status, &wsz);
+        fdio_unsafe_release(io);
+    }
+    if (!tty || call_status != ZX_OK || status != ZX_OK) {
 #else
     struct winsize ws;
 
     if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
 #endif
-        /* ioctl() failed. Try to query the terminal itself.
-         *
-         * Note that this has a potential race condition: If another
-         * process is also writing to the terminal and moves the cursor, we
-         * can get the wrong number of columns here. */
+        /* ioctl() failed. Try to query the terminal itself. */
         int start, cols;
 
         /* Get the initial position so we can restore it later. */
@@ -393,7 +387,7 @@ static void freeCompletions(linenoiseCompletions *lc) {
  *
  * The state of the editing is encapsulated into the pointed linenoiseState
  * structure as described in the structure definition. */
-static int completeLine(struct linenoiseState *ls) {
+static char completeLine(struct linenoiseState *ls) {
     linenoiseCompletions lc = { 0, NULL };
     int nread, nwritten;
     char c = 0;
@@ -422,7 +416,7 @@ static int completeLine(struct linenoiseState *ls) {
             nread = read(ls->ifd,&c,1);
             if (nread <= 0) {
                 freeCompletions(&lc);
-                return -1;
+                return 0;
             }
 
             switch(c) {
@@ -505,7 +499,6 @@ static void abInit(struct abuf *ab) {
 }
 
 static void abAppend(struct abuf *ab, const char *s, int len) {
-    assert(len >= 0);
     char *new = realloc(ab->b,ab->len+len);
 
     if (new == NULL) return;
@@ -532,6 +525,8 @@ void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int plen) {
             if (bold == 1 && color == -1) color = 37;
             if (color != -1 || bold != 0)
                 snprintf(seq,64,"\033[%d;%d;49m",bold,color);
+            else
+                seq[0] = '\0';
             abAppend(ab,seq,strlen(seq));
             abAppend(ab,hint,hintlen);
             if (color != -1 || bold != 0)
@@ -555,22 +550,12 @@ static void refreshSingleLine(struct linenoiseState *l) {
     size_t pos = l->pos;
     struct abuf ab;
 
-    /* If the prompt is too wide to fit on a single line of the terminal,
-     * truncate it. */
-    if (plen > l->cols) {
-        plen = l->cols;
-    }
-
-    /* Scroll the buffer to keep the cursor visible on the single line.
-     * Drop characters to the left of the visible part. */
-    while ((plen+pos) >= l->cols && len > 0) {
+    while((plen+pos) >= l->cols) {
         buf++;
         len--;
         pos--;
     }
-    /* Drop characters to the right of the visible part. */
     while (plen+len > l->cols) {
-        assert(len > 0);
         len--;
     }
 
@@ -579,7 +564,7 @@ static void refreshSingleLine(struct linenoiseState *l) {
     snprintf(seq,64,"\r");
     abAppend(&ab,seq,strlen(seq));
     /* Write the prompt and the current buffer content */
-    abAppend(&ab,l->prompt,plen);
+    abAppend(&ab,l->prompt,strlen(l->prompt));
     abAppend(&ab,buf,len);
     /* Show hits if any. */
     refreshShowHints(&ab,l,plen);
@@ -861,12 +846,9 @@ static int linenoiseEdit(int stdin_fd, int stdout_fd, char *buf, size_t buflen, 
          * there was an error reading from fd. Otherwise it will return the
          * character that should be handled next. */
         if (c == 9 && completionCallback != NULL) {
-            int r = completeLine(&l);
-            /* Return on errors */
-            if (r < 0) return l.len;
+            c = completeLine(&l);
             /* Read next character when 0 */
-            if (r == 0) continue;
-            c = r;
+            if (c == 0) continue;
         }
 
         switch(c) {
@@ -1120,7 +1102,6 @@ char *linenoise(const char *prompt) {
                 ch = getchar();
                 if (ch == EOF) return NULL;
                 if (ch == '\r') continue;
-
                 // map delete to backspace
                 if (ch == 127) ch = '\b';
                 if (ch == '\b' && i > 0) {

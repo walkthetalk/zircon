@@ -241,7 +241,7 @@ zx_status_t AmlTSensor::InitPdev(zx_device_t* parent) {
         return status;
     }
 
-    // Map amlogic temperature sensopr peripheral control registers.
+    // Map amlogic temperature sensor peripheral control registers.
     mmio_buffer_t mmio;
     status = pdev_map_mmio_buffer(&pdev_, kPllMmio, ZX_CACHE_POLICY_UNCACHED_DEVICE,
                                   &mmio);
@@ -268,7 +268,7 @@ zx_status_t AmlTSensor::InitPdev(zx_device_t* parent) {
     hiu_mmio_ = ddk::MmioBuffer(mmio);
 
     // Map tsensor interrupt.
-    status = pdev_map_interrupt(&pdev_, 0, tsensor_irq_.reset_and_get_address());
+    status = pdev_get_interrupt(&pdev_, 0, 0, tsensor_irq_.reset_and_get_address());
     if (status != ZX_OK) {
         zxlogf(ERROR, "aml-tsensor: could not map tsensor interrupt\n");
         return status;
@@ -363,14 +363,15 @@ zx_status_t AmlTSensor::GetStateChangePort(zx_handle_t* port) {
     return zx_handle_duplicate(port_, ZX_RIGHT_SAME_RIGHTS, port);
 }
 
-zx_status_t AmlTSensor::InitSensor(zx_device_t* parent, thermal_device_info_t thermal_config) {
+zx_status_t AmlTSensor::InitSensor(zx_device_t* parent,
+                                   fuchsia_hardware_thermal_ThermalDeviceInfo thermal_config) {
     zx_status_t status = InitPdev(parent);
     if (status != ZX_OK) {
         return status;
     }
 
     // Copy the thermal_config
-    memcpy(&thermal_config_, &thermal_config, sizeof(thermal_device_info_t));
+    memcpy(&thermal_config_, &thermal_config, sizeof(fuchsia_hardware_thermal_ThermalDeviceInfo));
 
     // Get the trim info.
     trim_info_ = ao_mmio_->Read32(AML_TRIM_INFO);

@@ -26,13 +26,7 @@ constexpr uint8_t kRegDigitalClipper1     = 0x11;
 // clang-format on
 
 // static
-fbl::unique_ptr<Tas5720> Tas5720::Create(ddk::PDev pdev, uint32_t index) {
-    auto i2c = pdev.GetI2c(index);
-    if (i2c.is_valid()) {
-        zxlogf(ERROR, "%s pdev_get_protocol failed\n", __FUNCTION__);
-        return nullptr;
-    }
-
+fbl::unique_ptr<Tas5720> Tas5720::Create(ddk::I2cChannel i2c) {
     fbl::AllocChecker ac;
     auto ptr = fbl::make_unique_checked<Tas5720>(&ac, i2c);
     if (!ac.check()) {
@@ -58,14 +52,17 @@ zx_status_t Tas5720::SetGain(float gain) {
     return status;
 }
 
-bool Tas5720::ValidGain(float gain) {
+bool Tas5720::ValidGain(float gain) const {
     return (gain <= kMaxGain) && (gain >= kMinGain);
 }
 
-zx_status_t Tas5720::Init(uint8_t slot) {
+zx_status_t Tas5720::Init(std::optional<uint8_t> slot) {
     Standby();
     WriteReg(kRegDigitalControl1, 0x45);        // Use Slot, Stereo Left Justified.
-    WriteReg(kRegDigitalControl2, slot & 0x07); // Slot.
+    if (!slot.has_value() || slot.value() >= 8) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+    WriteReg(kRegDigitalControl2, slot.value());
     WriteReg(kRegAnalogControl, 0x55);          // PWM rate 16 x lrclk, gain 20.7 dBV.
     WriteReg(kRegDigitalClipper2, 0xFF);        // Disabled.
     WriteReg(kRegDigitalClipper1, 0xFC);        // Disabled.

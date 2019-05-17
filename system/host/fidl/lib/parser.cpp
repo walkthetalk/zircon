@@ -69,12 +69,12 @@ Parser::Parser(Lexer* lexer, ErrorReporter* error_reporter)
 }
 
 bool Parser::LookupHandleSubtype(const raw::Identifier* identifier,
-                                 types::HandleSubtype* subtype_out) {
+                                 std::optional<types::HandleSubtype>* out_handle_subtype) {
     auto lookup = handle_subtype_table_.find(identifier->location().data());
     if (lookup == handle_subtype_table_.end()) {
         return false;
     }
-    *subtype_out = lookup->second;
+    *out_handle_subtype = lookup->second;
     return true;
 }
 
@@ -82,7 +82,7 @@ decltype(nullptr) Parser::Fail() {
     return Fail("found unexpected token");
 }
 
-decltype(nullptr) Parser::Fail(StringView message) {
+decltype(nullptr) Parser::Fail(std::string_view message) {
     if (Ok()) {
         error_reporter_->ReportError(last_token_, std::move(message));
     }
@@ -146,14 +146,8 @@ std::unique_ptr<raw::NumericLiteral> Parser::ParseNumericLiteral() {
     return std::make_unique<raw::NumericLiteral>(scope.GetSourceElement());
 }
 
-std::unique_ptr<raw::Ordinal> Parser::MaybeParseOrdinal() {
+std::unique_ptr<raw::Ordinal> Parser::ParseOrdinal() {
     ASTScope scope(this);
-
-    if (Peek().kind() != Token::Kind::kNumericLiteral) {
-        // Ordinals are currently optional.  If there is none, generate it later
-        // (once we've figured out the method name and signature).
-        return nullptr;
-    }
 
     ConsumeToken(OfKind(Token::Kind::kNumericLiteral));
     if (!Ok())
@@ -238,10 +232,10 @@ std::unique_ptr<raw::Attribute> Parser::ParseAttribute() {
     return std::make_unique<raw::Attribute>(scope.GetSourceElement(), str_name, str_value);
 }
 
-std::unique_ptr<raw::AttributeList> Parser::ParseAttributeList(std::unique_ptr<raw::Attribute>&& doc_comment, ASTScope& scope) {
+std::unique_ptr<raw::AttributeList> Parser::ParseAttributeList(std::unique_ptr<raw::Attribute> doc_comment, ASTScope& scope) {
     AttributesBuilder attributes_builder(error_reporter_);
     if (doc_comment) {
-        if (!attributes_builder.Insert(std::move(doc_comment)))
+        if (!attributes_builder.Insert(std::move(*doc_comment.get())))
             return Fail();
     }
     ConsumeToken(OfKind(Token::Kind::kLeftSquare));
@@ -251,7 +245,7 @@ std::unique_ptr<raw::AttributeList> Parser::ParseAttributeList(std::unique_ptr<r
         auto attribute = ParseAttribute();
         if (!Ok())
             return Fail();
-        if (!attributes_builder.Insert(std::move(attribute)))
+        if (!attributes_builder.Insert(std::move(*attribute.get())))
             return Fail();
         if (!MaybeConsumeToken(OfKind(Token::Kind::kComma)))
             break;
@@ -289,7 +283,7 @@ std::unique_ptr<raw::AttributeList> Parser::MaybeParseAttributeList() {
     // no generic attributes, start the attribute list
     if (doc_comment) {
         AttributesBuilder attributes_builder(error_reporter_);
-        if (!attributes_builder.Insert(std::move(doc_comment)))
+        if (!attributes_builder.Insert(std::move(*doc_comment.get())))
             return Fail();
         return std::make_unique<raw::AttributeList>(scope.GetSourceElement(), attributes_builder.Done());
     }
@@ -327,7 +321,7 @@ std::unique_ptr<raw::Using> Parser::ParseUsing() {
         return Fail();
 
     std::unique_ptr<raw::Identifier> maybe_alias;
-    std::unique_ptr<raw::IdentifierType> maybe_type;
+    std::unique_ptr<raw::TypeConstructor> maybe_type_ctor;
 
     if (MaybeConsumeToken(IdentifierOfSubkind(Token::Subkind::kAs))) {
         if (!Ok())
@@ -338,206 +332,138 @@ std::unique_ptr<raw::Using> Parser::ParseUsing() {
     } else if (MaybeConsumeToken(OfKind(Token::Kind::kEqual))) {
         if (!Ok() || using_path->components.size() != 1u)
             return Fail();
-        maybe_type = ParseIdentifierType();
+        maybe_type_ctor = ParseTypeConstructor();
         if (!Ok())
             return Fail();
     }
 
-    return std::make_unique<raw::Using>(scope.GetSourceElement(), std::move(using_path), std::move(maybe_alias), std::move(maybe_type));
+    return std::make_unique<raw::Using>(
+        scope.GetSourceElement(), std::move(using_path),
+        std::move(maybe_alias), std::move(maybe_type_ctor));
 }
 
-std::unique_ptr<raw::IdentifierType> Parser::ParseIdentifierType() {
+std::unique_ptr<raw::TypeConstructor> Parser::ParseTypeConstructor() {
     ASTScope scope(this);
     auto identifier = ParseCompoundIdentifier();
     if (!Ok())
         return Fail();
-    auto nullability = types::Nullability::kNonnullable;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kQuestion))) {
-        if (!Ok())
-            return Fail();
-        nullability = types::Nullability::kNullable;
-    }
-    return std::make_unique<raw::IdentifierType>(scope.GetSourceElement(), std::move(identifier), nullability);
-}
-
-std::unique_ptr<raw::ArrayType> Parser::ParseArrayType() {
-    ASTScope scope(this);
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kArray));
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kLeftAngle));
-    if (!Ok())
-        return Fail();
-    auto element_type = ParseType();
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kRightAngle));
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kColon));
-    if (!Ok())
-        return Fail();
-    auto element_count = ParseConstant();
-    if (!Ok())
-        return Fail();
-
-    return std::make_unique<raw::ArrayType>(scope.GetSourceElement(), std::move(element_type), std::move(element_count));
-}
-
-std::unique_ptr<raw::VectorType> Parser::ParseVectorType() {
-    ASTScope scope(this);
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kVector));
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kLeftAngle));
-    if (!Ok())
-        return Fail();
-    auto element_type = ParseType();
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kRightAngle));
-    if (!Ok())
-        return Fail();
-
-    std::unique_ptr<raw::Constant> maybe_element_count;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
-        if (!Ok())
-            return Fail();
-        maybe_element_count = ParseConstant();
-        if (!Ok())
-            return Fail();
-    }
-
-    auto nullability = types::Nullability::kNonnullable;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kQuestion))) {
-        nullability = types::Nullability::kNullable;
-    }
-
-    return std::make_unique<raw::VectorType>(scope.GetSourceElement(), std::move(element_type),
-                                             std::move(maybe_element_count), nullability);
-}
-
-std::unique_ptr<raw::StringType> Parser::ParseStringType() {
-    ASTScope scope(this);
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kString));
-    if (!Ok())
-        return Fail();
-
-    std::unique_ptr<raw::Constant> maybe_element_count;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
-        if (!Ok())
-            return Fail();
-        maybe_element_count = ParseConstant();
-        if (!Ok())
-            return Fail();
-    }
-
-    auto nullability = types::Nullability::kNonnullable;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kQuestion))) {
-        nullability = types::Nullability::kNullable;
-    }
-
-    return std::make_unique<raw::StringType>(scope.GetSourceElement(), std::move(maybe_element_count), nullability);
-}
-
-std::unique_ptr<raw::HandleType> Parser::ParseHandleType() {
-    ASTScope scope(this);
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kHandle));
-    if (!Ok())
-        return Fail();
-
-    auto subtype = types::HandleSubtype::kHandle;
+    std::unique_ptr<raw::TypeConstructor> maybe_arg_type_ctor;
+    std::optional<types::HandleSubtype> handle_subtype;
     if (MaybeConsumeToken(OfKind(Token::Kind::kLeftAngle))) {
         if (!Ok())
             return Fail();
-        auto identifier = ParseIdentifier(true);
-        if (!Ok())
-            return Fail();
-        if (!LookupHandleSubtype(identifier.get(), &subtype))
-            return Fail();
+        bool is_handle_identifier = identifier->components.size() == 1 &&
+                                    identifier->components[0]->location().data() == "handle";
+        if (is_handle_identifier) {
+            auto identifier = ParseIdentifier(true);
+            if (!Ok())
+                return Fail();
+            if (!LookupHandleSubtype(identifier.get(), &handle_subtype))
+                return Fail();
+        } else {
+            maybe_arg_type_ctor = ParseTypeConstructor();
+            if (!Ok())
+                return Fail();
+        }
         ConsumeToken(OfKind(Token::Kind::kRightAngle));
         if (!Ok())
             return Fail();
     }
-
+    std::unique_ptr<raw::Constant> maybe_size;
+    if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
+        if (!Ok())
+            return Fail();
+        maybe_size = ParseConstant();
+        if (!Ok())
+            return Fail();
+    }
     auto nullability = types::Nullability::kNonnullable;
     if (MaybeConsumeToken(OfKind(Token::Kind::kQuestion))) {
+        if (!Ok())
+            return Fail();
         nullability = types::Nullability::kNullable;
     }
 
-    return std::make_unique<raw::HandleType>(scope.GetSourceElement(), subtype, nullability);
+    return std::make_unique<raw::TypeConstructor>(
+        scope.GetSourceElement(),
+        std::move(identifier),
+        std::move(maybe_arg_type_ctor),
+        handle_subtype,
+        std::move(maybe_size),
+        nullability);
 }
 
-std::unique_ptr<raw::RequestHandleType> Parser::ParseRequestHandleType() {
+std::unique_ptr<raw::BitsMember> Parser::ParseBitsMember() {
     ASTScope scope(this);
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kRequest));
+    auto attributes = MaybeParseAttributeList();
     if (!Ok())
         return Fail();
-    ConsumeToken(OfKind(Token::Kind::kLeftAngle));
-    if (!Ok())
-        return Fail();
-    auto identifier = ParseCompoundIdentifier();
-    if (!Ok())
-        return Fail();
-    ConsumeToken(OfKind(Token::Kind::kRightAngle));
+    auto identifier = ParseIdentifier();
     if (!Ok())
         return Fail();
 
-    auto nullability = types::Nullability::kNonnullable;
-    if (MaybeConsumeToken(OfKind(Token::Kind::kQuestion))) {
-        nullability = types::Nullability::kNullable;
-    }
+    ConsumeToken(OfKind(Token::Kind::kEqual));
+    if (!Ok())
+        return Fail();
 
-    return std::make_unique<raw::RequestHandleType>(scope.GetSourceElement(), std::move(identifier), nullability);
+    auto member_value = ParseConstant();
+    if (!Ok())
+        return Fail();
+
+    return std::make_unique<raw::BitsMember>(scope.GetSourceElement(), std::move(identifier),
+                                             std::move(member_value), std::move(attributes));
 }
 
-std::unique_ptr<raw::Type> Parser::ParseType() {
-    switch (Peek().combined()) {
-    case CASE_TOKEN(Token::Kind::kIdentifier): {
-        auto type = ParseIdentifierType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    case CASE_IDENTIFIER(Token::Subkind::kArray): {
-        auto type = ParseArrayType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    case CASE_IDENTIFIER(Token::Subkind::kVector): {
-        auto type = ParseVectorType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    case CASE_IDENTIFIER(Token::Subkind::kString): {
-        auto type = ParseStringType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    case CASE_IDENTIFIER(Token::Subkind::kHandle): {
-        auto type = ParseHandleType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    case CASE_IDENTIFIER(Token::Subkind::kRequest): {
-        auto type = ParseRequestHandleType();
-        if (!Ok())
-            return Fail();
-        return type;
-    }
-
-    default:
+std::unique_ptr<raw::BitsDeclaration>
+Parser::ParseBitsDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope) {
+    std::vector<std::unique_ptr<raw::BitsMember>> members;
+    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kBits));
+    if (!Ok())
         return Fail();
+
+    auto identifier = ParseIdentifier();
+    if (!Ok())
+        return Fail();
+
+    std::unique_ptr<raw::TypeConstructor> maybe_type_ctor;
+    if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
+        if (!Ok())
+            return Fail();
+        maybe_type_ctor = ParseTypeConstructor();
+        if (!Ok())
+            return Fail();
     }
+
+    ConsumeToken(OfKind(Token::Kind::kLeftCurly));
+    if (!Ok())
+        return Fail();
+
+    auto parse_member = [&members, this]() {
+        if (Peek().kind() == Token::Kind::kRightCurly) {
+          ConsumeToken(OfKind(Token::Kind::kRightCurly));
+          return Done;
+        } else {
+          members.emplace_back(ParseBitsMember());
+          return More;
+        }
+    };
+
+    while (parse_member() == More) {
+        if (!Ok())
+            Fail();
+        ConsumeToken(OfKind(Token::Kind::kSemicolon));
+        if (!Ok())
+            return Fail();
+    }
+    if (!Ok())
+        Fail();
+
+    if (members.empty())
+        return Fail("must have at least one bits member");
+
+    return std::make_unique<raw::BitsDeclaration>(scope.GetSourceElement(),
+                                                  std::move(attributes), std::move(identifier),
+                                                  std::move(maybe_type_ctor), std::move(members));
 }
 
 std::unique_ptr<raw::ConstDeclaration>
@@ -546,7 +472,7 @@ Parser::ParseConstDeclaration(std::unique_ptr<raw::AttributeList> attributes, AS
 
     if (!Ok())
         return Fail();
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
     auto identifier = ParseIdentifier();
@@ -559,8 +485,9 @@ Parser::ParseConstDeclaration(std::unique_ptr<raw::AttributeList> attributes, AS
     if (!Ok())
         return Fail();
 
-    return std::make_unique<raw::ConstDeclaration>(scope.GetSourceElement(), std::move(attributes), std::move(type),
-                                                   std::move(identifier), std::move(constant));
+    return std::make_unique<raw::ConstDeclaration>(
+        scope.GetSourceElement(), std::move(attributes), std::move(type_ctor),
+        std::move(identifier), std::move(constant));
 }
 
 std::unique_ptr<raw::EnumMember> Parser::ParseEnumMember() {
@@ -580,42 +507,41 @@ std::unique_ptr<raw::EnumMember> Parser::ParseEnumMember() {
     if (!Ok())
         return Fail();
 
-    return std::make_unique<raw::EnumMember>(scope.GetSourceElement(), std::move(identifier), std::move(member_value), std::move(attributes));
+    return std::make_unique<raw::EnumMember>(scope.GetSourceElement(), std::move(identifier),
+                                             std::move(member_value), std::move(attributes));
 }
 
 std::unique_ptr<raw::EnumDeclaration>
 Parser::ParseEnumDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope) {
     std::vector<std::unique_ptr<raw::EnumMember>> members;
     ConsumeToken(IdentifierOfSubkind(Token::Subkind::kEnum));
-
     if (!Ok())
         return Fail();
+
     auto identifier = ParseIdentifier();
     if (!Ok())
         return Fail();
-    std::unique_ptr<raw::IdentifierType> maybe_subtype;
+
+    std::unique_ptr<raw::TypeConstructor> maybe_type_ctor;
     if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
         if (!Ok())
             return Fail();
-        maybe_subtype = ParseIdentifierType();
+        maybe_type_ctor = ParseTypeConstructor();
         if (!Ok())
             return Fail();
     }
+
     ConsumeToken(OfKind(Token::Kind::kLeftCurly));
     if (!Ok())
         return Fail();
 
     auto parse_member = [&members, this]() {
-        switch (Peek().combined()) {
-        default:
-            ConsumeToken(OfKind(Token::Kind::kRightCurly));
-            return Done;
-
-        TOKEN_ATTR_CASES:
-            // intentional fallthrough for attribute parsing
-        TOKEN_TYPE_CASES:
-            members.emplace_back(ParseEnumMember());
-            return More;
+        if (Peek().kind() == Token::Kind::kRightCurly) {
+          ConsumeToken(OfKind(Token::Kind::kRightCurly));
+          return Done;
+        } else {
+          members.emplace_back(ParseEnumMember());
+          return More;
         }
     };
 
@@ -634,30 +560,27 @@ Parser::ParseEnumDeclaration(std::unique_ptr<raw::AttributeList> attributes, AST
 
     return std::make_unique<raw::EnumDeclaration>(scope.GetSourceElement(),
                                                   std::move(attributes), std::move(identifier),
-                                                  std::move(maybe_subtype), std::move(members));
+                                                  std::move(maybe_type_ctor), std::move(members));
 }
 
 std::unique_ptr<raw::Parameter> Parser::ParseParameter() {
     ASTScope scope(this);
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
     auto identifier = ParseIdentifier();
     if (!Ok())
         return Fail();
 
-    return std::make_unique<raw::Parameter>(scope.GetSourceElement(), std::move(type), std::move(identifier));
+    return std::make_unique<raw::Parameter>(scope.GetSourceElement(), std::move(type_ctor),
+                                            std::move(identifier));
 }
 
 std::unique_ptr<raw::ParameterList> Parser::ParseParameterList() {
     ASTScope scope(this);
     std::vector<std::unique_ptr<raw::Parameter>> parameter_list;
 
-    switch (Peek().combined()) {
-    default:
-        break;
-
-    TOKEN_TYPE_CASES:
+    if (Peek().kind() != Token::Kind::kRightParen) {
         auto parameter = ParseParameter();
         parameter_list.emplace_back(std::move(parameter));
         if (!Ok())
@@ -666,31 +589,26 @@ std::unique_ptr<raw::ParameterList> Parser::ParseParameterList() {
             ConsumeToken(OfKind(Token::Kind::kComma));
             if (!Ok())
                 return Fail();
-            switch (Peek().combined()) {
-            TOKEN_TYPE_CASES:
-                parameter_list.emplace_back(ParseParameter());
-                if (!Ok())
-                    return Fail();
-                break;
-
-            default:
+            parameter_list.emplace_back(ParseParameter());
+            if (!Ok())
                 return Fail();
-            }
         }
     }
 
     return std::make_unique<raw::ParameterList>(scope.GetSourceElement(), std::move(parameter_list));
 }
 
-std::unique_ptr<raw::InterfaceMethod> Parser::ParseInterfaceMethod(std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope) {
-    auto ordinal = MaybeParseOrdinal();
+std::unique_ptr<raw::InterfaceMethod> Parser::ParseProtocolEvent(
+    std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+    std::unique_ptr<raw::Ordinal> ordinal) {
+
+    ConsumeToken(OfKind(Token::Kind::kArrow));
     if (!Ok())
         return Fail();
 
-    std::unique_ptr<raw::Identifier> method_name;
-    std::unique_ptr<raw::ParameterList> maybe_request;
-    std::unique_ptr<raw::ParameterList> maybe_response;
-    std::unique_ptr<raw::Type> maybe_error;
+    auto method_name = ParseIdentifier();
+    if (!Ok())
+        return Fail();
 
     auto parse_params = [this](std::unique_ptr<raw::ParameterList>* params_out) {
         ConsumeToken(OfKind(Token::Kind::kLeftParen));
@@ -705,51 +623,125 @@ std::unique_ptr<raw::InterfaceMethod> Parser::ParseInterfaceMethod(std::unique_p
         return true;
     };
 
-    if (MaybeConsumeToken(OfKind(Token::Kind::kArrow))) {
-        method_name = ParseIdentifier();
-        if (!Ok())
-            return Fail();
-        if (!parse_params(&maybe_response))
-            return Fail();
-    } else {
-        method_name = ParseIdentifier();
-        if (!Ok())
-            return Fail();
-        if (!parse_params(&maybe_request))
-            return Fail();
+    std::unique_ptr<raw::ParameterList> response;
+    if (!parse_params(&response))
+        return Fail();
 
-        if (MaybeConsumeToken(OfKind(Token::Kind::kArrow))) {
-            if (!Ok())
-                return Fail();
-            if (!parse_params(&maybe_response))
-                return Fail();
-            if (MaybeConsumeToken(IdentifierOfSubkind(Token::Subkind::kError))) {
-                maybe_error = ParseType();
-                if (!Ok())
-                    return Fail();
-            }
-        }
+    std::unique_ptr<raw::TypeConstructor> maybe_error;
+    if (MaybeConsumeToken(IdentifierOfSubkind(Token::Subkind::kError))) {
+        maybe_error = ParseTypeConstructor();
+        if (!Ok())
+            return Fail();
     }
 
     assert(method_name);
-    assert(maybe_request || maybe_response);
+    assert(response);
 
     return std::make_unique<raw::InterfaceMethod>(scope.GetSourceElement(),
                                                   std::move(attributes),
                                                   std::move(ordinal),
                                                   std::move(method_name),
-                                                  std::move(maybe_request),
+                                                  nullptr /* maybe_request */,
+                                                  std::move(response),
+                                                  std::move(maybe_error));
+}
+
+std::unique_ptr<raw::InterfaceMethod> Parser::ParseProtocolMethod(
+    std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+    std::unique_ptr<raw::Ordinal> ordinal,
+    std::unique_ptr<raw::Identifier> method_name) {
+
+    auto parse_params = [this](std::unique_ptr<raw::ParameterList>* params_out) {
+        ConsumeToken(OfKind(Token::Kind::kLeftParen));
+        if (!Ok())
+            return false;
+        *params_out = ParseParameterList();
+        if (!Ok())
+            return false;
+        ConsumeToken(OfKind(Token::Kind::kRightParen));
+        if (!Ok())
+            return false;
+        return true;
+    };
+
+    std::unique_ptr<raw::ParameterList> request;
+    if (!parse_params(&request))
+        return Fail();
+
+    std::unique_ptr<raw::ParameterList> maybe_response;
+    std::unique_ptr<raw::TypeConstructor> maybe_error;
+    if (MaybeConsumeToken(OfKind(Token::Kind::kArrow))) {
+        if (!Ok())
+            return Fail();
+        if (!parse_params(&maybe_response))
+            return Fail();
+        if (MaybeConsumeToken(IdentifierOfSubkind(Token::Subkind::kError))) {
+            maybe_error = ParseTypeConstructor();
+            if (!Ok())
+                return Fail();
+        }
+    }
+
+    assert(method_name);
+    assert(request);
+
+    return std::make_unique<raw::InterfaceMethod>(scope.GetSourceElement(),
+                                                  std::move(attributes),
+                                                  std::move(ordinal),
+                                                  std::move(method_name),
+                                                  std::move(request),
                                                   std::move(maybe_response),
                                                   std::move(maybe_error));
 }
 
+void Parser::ParseProtocolMember(
+    std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+    std::vector<std::unique_ptr<raw::ComposeProtocol>>* composed_protocols,
+    std::vector<std::unique_ptr<raw::InterfaceMethod>>* methods) {
+
+    switch (Peek().kind()) {
+        case Token::Kind::kArrow: {
+            auto event = ParseProtocolEvent(std::move(attributes), scope, nullptr /* ordinal */);
+            methods->push_back(std::move(event));
+            break;
+        }
+        case Token::Kind::kIdentifier: {
+            auto identifier = ParseIdentifier();
+            if (!Ok())
+                break;
+            if (Peek().kind() == Token::Kind::kLeftParen) {
+                auto method = ParseProtocolMethod(
+                    std::move(attributes), scope, nullptr /* ordinal */, std::move(identifier));
+                methods->push_back(std::move(method));
+                break;
+            } else if (identifier->location().data() == "compose") {
+                if (attributes) {
+                    Fail("Cannot attach attributes to compose stanza");
+                    break;
+                }
+                auto protocol_name = ParseCompoundIdentifier();
+                if (!Ok())
+                    break;
+                composed_protocols->push_back(std::make_unique<raw::ComposeProtocol>(
+                    raw::SourceElement(identifier->start_, protocol_name->end_),
+                    std::move(protocol_name)));
+                break;
+            } else {
+                Fail("unrecognized protocol member");
+                break;
+            }
+        }
+        default:
+            break;
+    }
+}
+
 std::unique_ptr<raw::InterfaceDeclaration>
-Parser::ParseInterfaceDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope) {
-    std::vector<std::unique_ptr<raw::CompoundIdentifier>> superinterfaces;
+Parser::ParseProtocolDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope) {
+    std::vector<std::unique_ptr<raw::ComposeProtocol>> composed_protocols;
     std::vector<std::unique_ptr<raw::InterfaceMethod>> methods;
 
-    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kInterface));
-
+    ConsumeToken(IdentifierOfSubkind(Token::Subkind::kProtocol));
     if (!Ok())
         return Fail();
 
@@ -757,21 +749,11 @@ Parser::ParseInterfaceDeclaration(std::unique_ptr<raw::AttributeList> attributes
     if (!Ok())
         return Fail();
 
-    if (MaybeConsumeToken(OfKind(Token::Kind::kColon))) {
-        for (;;) {
-            superinterfaces.emplace_back(ParseCompoundIdentifier());
-            if (!Ok())
-                return Fail();
-            if (!MaybeConsumeToken(OfKind(Token::Kind::kComma)))
-                break;
-        }
-    }
-
     ConsumeToken(OfKind(Token::Kind::kLeftCurly));
     if (!Ok())
         return Fail();
 
-    auto parse_member = [&methods, this]() {
+    auto parse_member = [&composed_protocols, &methods, this]() {
         ASTScope scope(this);
         std::unique_ptr<raw::AttributeList> attributes = MaybeParseAttributeList();
         if (!Ok())
@@ -782,10 +764,10 @@ Parser::ParseInterfaceDeclaration(std::unique_ptr<raw::AttributeList> attributes
             ConsumeToken(OfKind(Token::Kind::kRightCurly));
             return Done;
 
-        case Token::Kind::kNumericLiteral:
         case Token::Kind::kArrow:
         case Token::Kind::kIdentifier:
-            methods.emplace_back(ParseInterfaceMethod(std::move(attributes), scope));
+            ParseProtocolMember(std::move(attributes), scope,
+                                &composed_protocols, &methods);
             return More;
         }
     };
@@ -801,9 +783,9 @@ Parser::ParseInterfaceDeclaration(std::unique_ptr<raw::AttributeList> attributes
         Fail();
 
     return std::make_unique<raw::InterfaceDeclaration>(scope.GetSourceElement(),
-                                                       std::move(attributes), std::move(identifier),
-                                                       std::move(superinterfaces),
-                                                       std::move(methods));
+                                                    std::move(attributes), std::move(identifier),
+                                                    std::move(composed_protocols),
+                                                    std::move(methods));
 }
 
 std::unique_ptr<raw::StructMember> Parser::ParseStructMember() {
@@ -811,7 +793,7 @@ std::unique_ptr<raw::StructMember> Parser::ParseStructMember() {
     auto attributes = MaybeParseAttributeList();
     if (!Ok())
         return Fail();
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
     auto identifier = ParseIdentifier();
@@ -827,9 +809,9 @@ std::unique_ptr<raw::StructMember> Parser::ParseStructMember() {
             return Fail();
     }
 
-    return std::make_unique<raw::StructMember>(scope.GetSourceElement(),
-                                               std::move(type), std::move(identifier),
-                                               std::move(maybe_default_value), std::move(attributes));
+    return std::make_unique<raw::StructMember>(
+        scope.GetSourceElement(), std::move(type_ctor), std::move(identifier),
+        std::move(maybe_default_value), std::move(attributes));
 }
 
 std::unique_ptr<raw::StructDeclaration>
@@ -847,16 +829,12 @@ Parser::ParseStructDeclaration(std::unique_ptr<raw::AttributeList> attributes, A
         return Fail();
 
     auto parse_member = [&members, this]() {
-        switch (Peek().combined()) {
-        default:
-            ConsumeToken(OfKind(Token::Kind::kRightCurly));
-            return Done;
-
-        TOKEN_ATTR_CASES:
-            // intentional fallthrough for attribute parsing
-        TOKEN_TYPE_CASES:
-            members.emplace_back(ParseStructMember());
-            return More;
+        if (Peek().kind() == Token::Kind::kRightCurly) {
+          ConsumeToken(OfKind(Token::Kind::kRightCurly));
+          return Done;
+        } else {
+          members.emplace_back(ParseStructMember());
+          return More;
         }
     };
 
@@ -882,7 +860,7 @@ Parser::ParseTableMember() {
     if (!Ok())
         return Fail();
 
-    auto ordinal = MaybeParseOrdinal();
+    auto ordinal = ParseOrdinal();
     if (!Ok())
         return Fail();
 
@@ -894,7 +872,7 @@ Parser::ParseTableMember() {
         return std::make_unique<raw::TableMember>(scope.GetSourceElement(), std::move(ordinal));
     }
 
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
     auto identifier = ParseIdentifier();
@@ -910,9 +888,10 @@ Parser::ParseTableMember() {
             return Fail();
     }
 
-    return std::make_unique<raw::TableMember>(scope.GetSourceElement(), std::move(ordinal), std::move(type),
-                                              std::move(identifier),
-                                              std::move(maybe_default_value), std::move(attributes));
+    return std::make_unique<raw::TableMember>(
+        scope.GetSourceElement(), std::move(ordinal), std::move(type_ctor),
+        std::move(identifier),
+        std::move(maybe_default_value), std::move(attributes));
 }
 
 std::unique_ptr<raw::TableDeclaration>
@@ -931,7 +910,7 @@ Parser::ParseTableDeclaration(std::unique_ptr<raw::AttributeList> attributes, AS
 
     auto parse_member = [&members, this]() {
         switch (Peek().combined()) {
-        default:
+        case CASE_TOKEN(Token::Kind::kRightCurly):
             ConsumeToken(OfKind(Token::Kind::kRightCurly));
             return Done;
 
@@ -939,6 +918,12 @@ Parser::ParseTableDeclaration(std::unique_ptr<raw::AttributeList> attributes, AS
         TOKEN_ATTR_CASES:
             members.emplace_back(ParseTableMember());
             return More;
+
+        default:
+            std::string msg = "Expected one of ordinal or '}', found ";
+            msg.append(Token::Name(Peek()));
+            Fail(msg);
+            return Done;
         }
     };
 
@@ -962,14 +947,16 @@ std::unique_ptr<raw::UnionMember> Parser::ParseUnionMember() {
     auto attributes = MaybeParseAttributeList();
     if (!Ok())
         return Fail();
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
     auto identifier = ParseIdentifier();
     if (!Ok())
         return Fail();
 
-    return std::make_unique<raw::UnionMember>(scope.GetSourceElement(), std::move(type), std::move(identifier), std::move(attributes));
+    return std::make_unique<raw::UnionMember>(
+        scope.GetSourceElement(), std::move(type_ctor), std::move(identifier),
+        std::move(attributes));
 }
 
 std::unique_ptr<raw::UnionDeclaration>
@@ -987,16 +974,12 @@ Parser::ParseUnionDeclaration(std::unique_ptr<raw::AttributeList> attributes, AS
         return Fail();
 
     auto parse_member = [&members, this]() {
-        switch (Peek().combined()) {
-        default:
-            ConsumeToken(OfKind(Token::Kind::kRightCurly));
-            return Done;
-
-        TOKEN_ATTR_CASES:
-            // intentional fallthrough for attribute parsing
-        TOKEN_TYPE_CASES:
-            members.emplace_back(ParseUnionMember());
-            return More;
+        if (Peek().kind() == Token::Kind::kRightCurly) {
+          ConsumeToken(OfKind(Token::Kind::kRightCurly));
+          return Done;
+        } else {
+          members.emplace_back(ParseUnionMember());
+          return More;
         }
     };
 
@@ -1025,7 +1008,7 @@ std::unique_ptr<raw::XUnionMember> Parser::ParseXUnionMember() {
     if (!Ok())
         return Fail();
 
-    auto type = ParseType();
+    auto type_ctor = ParseTypeConstructor();
     if (!Ok())
         return Fail();
 
@@ -1034,7 +1017,7 @@ std::unique_ptr<raw::XUnionMember> Parser::ParseXUnionMember() {
         return Fail();
 
     return std::make_unique<raw::XUnionMember>(scope.GetSourceElement(),
-                                               std::move(type),
+                                               std::move(type_ctor),
                                                std::move(identifier),
                                                std::move(attributes));
 }
@@ -1056,17 +1039,12 @@ Parser::ParseXUnionDeclaration(std::unique_ptr<raw::AttributeList> attributes, A
         return Fail();
 
     auto parse_member = [&]() {
-        switch (Peek().combined()) {
-        default:
-            ConsumeToken(OfKind(Token::Kind::kRightCurly));
-            return Done;
-
-        case Token::Kind::kNumericLiteral: // Ordinal
-        TOKEN_ATTR_CASES:
-            // intentional fallthrough for attribute parsing
-        TOKEN_TYPE_CASES:
-            members.emplace_back(ParseXUnionMember());
-            return More;
+        if (Peek().kind() == Token::Kind::kRightCurly) {
+          ConsumeToken(OfKind(Token::Kind::kRightCurly));
+          return Done;
+        } else {
+          members.emplace_back(ParseXUnionMember());
+          return More;
         }
     };
 
@@ -1089,7 +1067,9 @@ Parser::ParseXUnionDeclaration(std::unique_ptr<raw::AttributeList> attributes, A
 
 std::unique_ptr<raw::File> Parser::ParseFile() {
     ASTScope scope(this);
+    bool done_with_library_imports = false;
     std::vector<std::unique_ptr<raw::Using>> using_list;
+    std::vector<std::unique_ptr<raw::BitsDeclaration>> bits_declaration_list;
     std::vector<std::unique_ptr<raw::ConstDeclaration>> const_declaration_list;
     std::vector<std::unique_ptr<raw::EnumDeclaration>> enum_declaration_list;
     std::vector<std::unique_ptr<raw::InterfaceDeclaration>> interface_declaration_list;
@@ -1111,27 +1091,9 @@ std::unique_ptr<raw::File> Parser::ParseFile() {
     if (!Ok())
         return Fail();
 
-    auto parse_using = [&using_list, this]() {
-        switch (Peek().combined()) {
-        default:
-            return Done;
-
-        case CASE_IDENTIFIER(Token::Subkind::kUsing):
-            using_list.emplace_back(ParseUsing());
-            return More;
-        }
-    };
-
-    while (parse_using() == More) {
-        if (!Ok())
-            return Fail();
-        ConsumeToken(OfKind(Token::Kind::kSemicolon));
-        if (!Ok())
-            return Fail();
-    }
-
-    auto parse_declaration = [&const_declaration_list, &enum_declaration_list,
+    auto parse_declaration = [&bits_declaration_list, &const_declaration_list, &enum_declaration_list,
                               &interface_declaration_list, &struct_declaration_list,
+                              &done_with_library_imports, &using_list,
                               &table_declaration_list, &union_declaration_list, &xunion_declaration_list, this]() {
         ASTScope scope(this);
         std::unique_ptr<raw::AttributeList> attributes = MaybeParseAttributeList();
@@ -1142,26 +1104,51 @@ std::unique_ptr<raw::File> Parser::ParseFile() {
         default:
             return Done;
 
+        case CASE_IDENTIFIER(Token::Subkind::kBits):
+            done_with_library_imports = true;
+            bits_declaration_list.emplace_back(ParseBitsDeclaration(std::move(attributes), scope));
+            return More;
+
         case CASE_IDENTIFIER(Token::Subkind::kConst):
+            done_with_library_imports = true;
             const_declaration_list.emplace_back(ParseConstDeclaration(std::move(attributes), scope));
             return More;
 
         case CASE_IDENTIFIER(Token::Subkind::kEnum):
+            done_with_library_imports = true;
             enum_declaration_list.emplace_back(ParseEnumDeclaration(std::move(attributes), scope));
             return More;
 
-        case CASE_IDENTIFIER(Token::Subkind::kInterface):
+        case CASE_IDENTIFIER(Token::Subkind::kProtocol):
+            done_with_library_imports = true;
             interface_declaration_list.emplace_back(
-                ParseInterfaceDeclaration(std::move(attributes), scope));
+                ParseProtocolDeclaration(std::move(attributes), scope));
             return More;
 
         case CASE_IDENTIFIER(Token::Subkind::kStruct):
+            done_with_library_imports = true;
             struct_declaration_list.emplace_back(ParseStructDeclaration(std::move(attributes), scope));
             return More;
 
         case CASE_IDENTIFIER(Token::Subkind::kTable):
+            done_with_library_imports = true;
             table_declaration_list.emplace_back(ParseTableDeclaration(std::move(attributes), scope));
             return More;
+
+        case CASE_IDENTIFIER(Token::Subkind::kUsing): {
+            auto using_decl = ParseUsing();
+            if (using_decl->maybe_type_ctor) {
+                done_with_library_imports = true;
+            } else if (done_with_library_imports) {
+                // TODO(FIDL-582): Give one week warning, then turn this into
+                // an error.
+                error_reporter_->ReportWarning(
+                    using_decl->location(),
+                    "library imports must be grouped at top-of-file");
+            }
+            using_list.emplace_back(std::move(using_decl));
+            return More;
+        }
 
         case CASE_IDENTIFIER(Token::Subkind::kUnion):
             union_declaration_list.emplace_back(ParseUnionDeclaration(std::move(attributes), scope));
@@ -1187,8 +1174,8 @@ std::unique_ptr<raw::File> Parser::ParseFile() {
 
     return std::make_unique<raw::File>(
         scope.GetSourceElement(), end,
-        std::move(attributes), std::move(library_name), std::move(using_list), std::move(const_declaration_list),
-        std::move(enum_declaration_list), std::move(interface_declaration_list),
+        std::move(attributes), std::move(library_name), std::move(using_list), std::move(bits_declaration_list),
+        std::move(const_declaration_list), std::move(enum_declaration_list), std::move(interface_declaration_list),
         std::move(struct_declaration_list), std::move(table_declaration_list), std::move(union_declaration_list), std::move(xunion_declaration_list));
 }
 

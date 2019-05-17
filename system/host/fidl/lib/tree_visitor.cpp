@@ -13,6 +13,10 @@ namespace raw {
 void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
     OnSourceElementStart(*element);
 
+    if (element->attributes != nullptr) {
+        OnAttributeList(element->attributes);
+    }
+
     OnCompoundIdentifier(element->library_name);
     for (auto i = element->using_list.begin();
          i != element->using_list.end();
@@ -20,6 +24,7 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
         OnUsing(*i);
     }
 
+    auto bits_decls_it = element->bits_declaration_list.begin();
     auto const_decls_it = element->const_declaration_list.begin();
     auto enum_decls_it = element->enum_declaration_list.begin();
     auto interface_decls_it = element->interface_declaration_list.begin();
@@ -29,6 +34,7 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
     auto xunion_decls_it = element->xunion_declaration_list.begin();
 
     enum Next {
+        bits_t,
         const_t,
         enum_t,
         interface_t,
@@ -39,7 +45,7 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
     };
 
     std::map<const char*, Next> m;
-    do {
+    for (;;) {
         // We want to visit these in declaration order, rather than grouped
         // by type of declaration.  std::map is sorted by key.  For each of
         // these lists of declarations, we make a map where the key is "the
@@ -48,6 +54,9 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
         // put earliest in the map.  That will be the earliest declaration
         // in the file.  We then visit the declaration accordingly.
         m.clear();
+        if (bits_decls_it != element->bits_declaration_list.end()) {
+            m[(*bits_decls_it)->start_.previous_end().data().data()] = bits_t;
+        }
         if (const_decls_it != element->const_declaration_list.end()) {
             m[(*const_decls_it)->start_.previous_end().data().data()] = const_t;
         }
@@ -79,6 +88,10 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
 
         // And the earliest top level declaration is...
         switch (m.begin()->second) {
+        case bits_t:
+            OnBitsDeclaration(*bits_decls_it);
+            ++bits_decls_it;
+            break;
         case const_t:
             OnConstDeclaration(*const_decls_it);
             ++const_decls_it;
@@ -108,8 +121,52 @@ void DeclarationOrderTreeVisitor::OnFile(std::unique_ptr<File> const& element) {
             ++xunion_decls_it;
             break;
         }
-    } while (1);
+    }
     OnSourceElementEnd(*element);
+}
+
+void DeclarationOrderTreeVisitor::OnInterfaceDeclaration(
+    std::unique_ptr<InterfaceDeclaration> const& element) {
+
+    SourceElementMark sem(this, *element);
+    if (element->attributes != nullptr) {
+        OnAttributeList(element->attributes);
+    }
+    OnIdentifier(element->identifier);
+
+    auto compose_it = element->superinterfaces.begin();
+    auto methods_it = element->methods.begin();
+
+    enum Next {
+        compose_t,
+        method_t,
+    };
+
+    std::map<const char*, Next> m;
+    for (;;) {
+        // Sort in declaration order.
+        m.clear();
+        if (compose_it != element->superinterfaces.end()) {
+            m[(*compose_it)->start_.previous_end().data().data()] = compose_t;
+        }
+        if (methods_it != element->methods.end()) {
+            m[(*methods_it)->start_.previous_end().data().data()] = method_t;
+        }
+        if (m.size() == 0)
+            return;
+
+        // And the earliest declaration is...
+        switch (m.begin()->second) {
+        case compose_t:
+            OnComposeProtocol(*compose_it);
+            ++compose_it;
+            break;
+        case method_t:
+            OnInterfaceMethod(*methods_it);
+            ++methods_it;
+            break;
+        }
+    }
 }
 
 } // namespace raw

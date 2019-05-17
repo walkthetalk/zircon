@@ -4,7 +4,9 @@
 
 #include <cobalt-client/cpp/collector-internal.h>
 #include <fuchsia/cobalt/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/directory.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
 #include <lib/fidl/coding.h>
 #include <lib/fidl/cpp/vector_view.h>
 
@@ -35,7 +37,7 @@ zx_status_t SendLoggerSimpleCreateRequest(zx::channel* logger_factory_client,
     request->logger = logger_svc->release();
 
     request->profile.release_stage =
-        static_cast<fbl::underlying_type<ReleaseStage>::type>(release_stage);
+        static_cast<std::underlying_type<ReleaseStage>::type>(release_stage);
     request->profile.config.size = config_size;
     request->profile.config.vmo = config->release();
     zx_handle_t handles[ZX_CHANNEL_MAX_MSG_HANDLES];
@@ -50,24 +52,32 @@ zx_status_t SendLoggerSimpleCreateRequest(zx::channel* logger_factory_client,
 }
 
 zx_status_t SendLoggerSimpleCreateRequest(zx::channel* logger_factory_client,
-                                          zx::channel* logger_svc, int64_t project_id,
+                                          zx::channel* logger_svc, const fbl::String& project_name,
                                           ReleaseStage release_stage) {
-    uint32_t msg_size = sizeof(fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectIdRequest);
+    uint32_t msg_size = static_cast<uint32_t>(sizeof(
+                            fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameRequest)) +
+                        FIDL_ALIGN(static_cast<uint32_t>(project_name.length()));
     FIDL_ALIGNDECL uint8_t msg[msg_size];
     memset(msg, 0, sizeof(msg));
-    fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectIdRequest* request =
-        reinterpret_cast<fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectIdRequest*>(msg);
+    fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameRequest* request =
+        reinterpret_cast<fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameRequest*>(
+            msg);
     request->hdr.txid = kFactoryRequestTxnId;
-    request->hdr.ordinal = fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectIdOrdinal;
+    request->hdr.ordinal = fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameOrdinal;
     request->logger = logger_svc->release();
-    request->project_id = static_cast<uint32_t>(project_id);
+    // Writing the message wont edit data.
+    request->project_name.data = reinterpret_cast<char*>(
+        msg + sizeof(fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameRequest));
+    memcpy(request->project_name.data, project_name.c_str(), project_name.length());
+    request->project_name.size = static_cast<uint64_t>(project_name.length());
 
-    request->release_stage = static_cast<fbl::underlying_type<ReleaseStage>::type>(release_stage);
+    request->release_stage = static_cast<std::underlying_type<ReleaseStage>::type>(release_stage);
     zx_handle_t handles[ZX_CHANNEL_MAX_MSG_HANDLES];
     uint32_t num_handles = 0;
+    const char* err = nullptr;
     zx_status_t result =
-        fidl_encode(&fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectIdRequestTable, msg,
-                    msg_size, handles, ZX_CHANNEL_MAX_MSG_HANDLES, &num_handles, nullptr);
+        fidl_encode(&fuchsia_cobalt_LoggerFactoryCreateLoggerSimpleFromProjectNameRequestTable, msg,
+                    msg_size, handles, ZX_CHANNEL_MAX_MSG_HANDLES, &num_handles, &err);
     if (result != ZX_OK) {
         return result;
     }
@@ -78,7 +88,7 @@ zx_status_t ReadLoggerSimpleCreateResponse(zx::channel* logger, fuchsia_cobalt_S
     uint32_t msg_size = sizeof(fuchsia_cobalt_LoggerSimpleLogIntHistogramResponse);
     FIDL_ALIGNDECL uint8_t msg[msg_size];
     uint32_t read_bytes = 0;
-    zx_status_t result = logger->read(0l, &msg, msg_size, &read_bytes, nullptr, 0, nullptr);
+    zx_status_t result = logger->read(0l, &msg, nullptr, msg_size, 0, &read_bytes, nullptr);
     if (result != ZX_OK) {
         return result;
     }
@@ -201,9 +211,9 @@ bool CobaltLogger::TrySendLoggerRequest() {
                                                  config_size, options_.release_stage)) != ZX_OK) {
             return false;
         }
-    } else if (options_.project_id >= 0) {
+    } else if (!options_.project_name.empty()) {
         if ((res = SendLoggerSimpleCreateRequest(&logger_factory_client, &logger_service,
-                                                 options_.project_id, options_.release_stage)) !=
+                                                 options_.project_name, options_.release_stage)) !=
             ZX_OK) {
             return false;
         }

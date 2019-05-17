@@ -48,6 +48,8 @@
 // More than enough
 #define MAX_TRANSFER_SIZE (UINT16_MAX - 1)
 
+#define INTEL_DESIGNWARE_COMP_TYPE 0x44570140
+
 // Implement the functionality of the i2c bus device.
 
 static void intel_i2c_transact(void* ctx, const i2c_op_t ops[], size_t cnt,
@@ -107,6 +109,14 @@ static void intel_i2c_transact(void* ctx, const i2c_op_t ops[], size_t cnt,
 static zx_status_t intel_i2c_get_max_transfer_size(void* ctx, size_t* out_size) {
     *out_size = MAX_TRANSFER_SIZE;
     return ZX_OK;
+}
+
+static uint32_t intel_i2c_extract_tx_fifo_depth_from_param(uint32_t param) {
+        return ((param >> 16) & 0xff) + 1;
+}
+
+static uint32_t intel_i2c_extract_rx_fifo_depth_from_param(uint32_t param) {
+        return ((param >> 8)  & 0xff) + 1;
 }
 
 static zx_status_t intel_i2c_get_interrupt(void* ctx, uint32_t flags, zx_handle_t* out_handle) {
@@ -201,7 +211,7 @@ static zx_status_t intel_serialio_i2c_add_slave(intel_serialio_i2c_device_t* dev
     }
     props[count++] = (zx_device_prop_t){BIND_PCI_VID, 0, vendor_id};
     props[count++] = (zx_device_prop_t){BIND_PCI_DID, 0, device_id};
-    props[count++] = (zx_device_prop_t){BIND_I2C_ADDR, 0, address};
+    props[count++] = (zx_device_prop_t){BIND_TOPO_I2C, 0, BIND_TOPO_I2C_PACK(address)};
     memcpy(&props[count], moreprops, sizeof(zx_device_prop_t) * propcount);
     count += propcount;
 
@@ -525,24 +535,21 @@ zx_status_t intel_serialio_i2c_issue_rx(
     return ZX_OK;
 }
 
+zx_status_t intel_serialio_i2c_flush_rx_full_irq(
+    intel_serialio_i2c_device_t* controller) {
+
+    mtx_lock(&controller->irq_mask_mutex);
+    zx_status_t status = zx_object_signal(controller->event_handle, RX_FULL_SIGNAL, 0);
+    RMWREG32(&controller->regs->intr_mask, INTR_RX_FULL, 1, 1);
+    mtx_unlock(&controller->irq_mask_mutex);
+    return status;
+}
+
 zx_status_t intel_serialio_i2c_read_rx(
     intel_serialio_i2c_device_t* controller,
     uint8_t* data) {
 
     *data = readl(&controller->regs->data_cmd);
-
-    uint32_t rx_tl;
-    intel_serialio_i2c_get_rx_fifo_threshold(controller, &rx_tl);
-    const uint32_t rxflr = readl(&controller->regs->rxflr) & 0x1ff;
-    // If we've dropped the RX queue level below the threshold, clear the signal
-    // and unmask the interrupt.
-    if (rxflr < rx_tl) {
-        mtx_lock(&controller->irq_mask_mutex);
-        zx_status_t status = zx_object_signal(controller->event_handle, RX_FULL_SIGNAL, 0);
-        RMWREG32(&controller->regs->intr_mask, INTR_RX_FULL, 1, 1);
-        mtx_unlock(&controller->irq_mask_mutex);
-        return status;
-    }
     return ZX_OK;
 }
 
@@ -699,6 +706,15 @@ zx_status_t intel_serialio_i2c_reset_controller(
     mtx_lock(&device->irq_mask_mutex);
     // Mask all interrupts
     writel(0, &device->regs->intr_mask);
+
+    if (readl(&device->regs->comp_type) == INTEL_DESIGNWARE_COMP_TYPE) {
+        uint32_t param = readl(&device->regs->comp_param1);
+        device->tx_fifo_depth = intel_i2c_extract_tx_fifo_depth_from_param(param);
+        device->rx_fifo_depth = intel_i2c_extract_rx_fifo_depth_from_param(param);
+    } else {
+        device->tx_fifo_depth = 8;
+        device->rx_fifo_depth = 8;
+    }
 
     status = intel_serialio_i2c_set_rx_fifo_threshold(device, DEFAULT_RX_FIFO_TRIGGER_LEVEL);
     if (status != ZX_OK) {

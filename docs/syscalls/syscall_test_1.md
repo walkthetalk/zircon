@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-syscall_test_1 - TODO(ZX-3106)
+TODO(ZX-3106)
 
 ## SYNOPSIS
 
@@ -13,7 +13,7 @@ syscall_test_1 - TODO(ZX-3106)
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_syscall_test_1(int a);
+zx_status_t zx_syscall_test_1(int32_t a);
 ```
 
 ## DESCRIPTION

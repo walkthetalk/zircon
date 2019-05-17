@@ -15,6 +15,7 @@
 #include <zircon/status.h>
 #include <zircon/syscalls/port.h>
 #include <zircon/types.h>
+#include <zxcrypt/ddk-volume.h>
 #include <zxcrypt/volume.h>
 
 #include <utility>
@@ -26,12 +27,14 @@
 
 namespace zxcrypt {
 
-Worker::Worker() : device_(nullptr) {
+Worker::Worker()
+    : device_(nullptr), started_(false) {
     LOG_ENTRY();
 }
 
 Worker::~Worker() {
     LOG_ENTRY();
+    ZX_DEBUG_ASSERT(!started_.load());
 }
 
 void Worker::MakeRequest(zx_port_packet_t* packet, uint64_t op, void* arg) {
@@ -44,7 +47,7 @@ void Worker::MakeRequest(zx_port_packet_t* packet, uint64_t op, void* arg) {
     packet->user.u64[1] = reinterpret_cast<uint64_t>(arg);
 }
 
-zx_status_t Worker::Start(Device* device, const Volume& volume, zx::port&& port) {
+zx_status_t Worker::Start(Device* device, const DdkVolume& volume, zx::port&& port) {
     LOG_ENTRY_ARGS("device=%p, volume=%p, port=%p", device, &volume, &port);
     zx_status_t rc;
 
@@ -67,6 +70,7 @@ zx_status_t Worker::Start(Device* device, const Volume& volume, zx::port&& port)
         return ZX_ERR_INTERNAL;
     }
 
+    started_.store(true);
     return ZX_OK;
 }
 
@@ -186,6 +190,10 @@ zx_status_t Worker::Stop() {
     LOG_ENTRY();
     zx_status_t rc;
 
+    // Only join once per call to |Start|.
+    if (!started_.exchange(false)) {
+        return ZX_OK;
+    }
     thrd_join(thrd_, &rc);
 
     if (rc != ZX_OK) {

@@ -33,10 +33,10 @@ public:
     using ResourceList = fbl::DoublyLinkedList<ResourceDispatcher*>;
     using RefPtr = fbl::RefPtr<ResourceDispatcher>;
 
-    // Creates ResourceDispatcher object representing access rights ta
+    // Creates ResourceDispatcher object representing access rights to a
     // given region of address space from a particular address space allocator, or a root resource
     // granted full access permissions. Only one instance of the root resource is created at boot.
-    static zx_status_t Create(ResourceDispatcher::RefPtr* dispatcher,
+    static zx_status_t Create(KernelHandle<ResourceDispatcher>* handle,
                               zx_rights_t* rights,
                               uint32_t kind,
                               uint64_t base,
@@ -56,7 +56,7 @@ public:
     template <typename T>
     static zx_status_t ForEachResource(T func, ResourceList* resource_list = &static_resource_list_)
         TA_EXCL(ResourcesLock::Get()) {
-        Guard<fbl::Mutex> guard{ResourcesLock::Get()};
+        Guard<Mutex> guard{ResourcesLock::Get()};
         return ForEachResourceLocked(func, resource_list);
     }
 
@@ -81,8 +81,6 @@ public:
     ~ResourceDispatcher();
 
 private:
-    fbl::Canary<fbl::magic("RSRD")> canary_;
-
     ResourceDispatcher(uint32_t kind,
                        uint64_t base,
                        size_t size,

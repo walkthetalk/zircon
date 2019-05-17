@@ -34,8 +34,8 @@ public:
         kPeek
     };
 
-    static zx_status_t Create(uint32_t flags, fbl::RefPtr<Dispatcher>* dispatcher0,
-                              fbl::RefPtr<Dispatcher>* dispatcher1, zx_rights_t* rights);
+    static zx_status_t Create(uint32_t flags, KernelHandle<SocketDispatcher>* handle0,
+                              KernelHandle<SocketDispatcher>* handle1, zx_rights_t* rights);
 
     ~SocketDispatcher() final;
 
@@ -96,8 +96,6 @@ private:
 
     bool is_full() const TA_REQ(get_lock()) { return data_.is_full(); }
     bool is_empty() const TA_REQ(get_lock()) { return data_.is_empty(); }
-
-    fbl::Canary<fbl::magic("SOCK")> canary_;
 
     const uint32_t flags_;
 

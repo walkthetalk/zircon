@@ -17,6 +17,7 @@
 #include <fbl/mutex.h>
 #include <fbl/unique_ptr.h>
 #include <hid/ft3x27.h>
+#include <hid/ft5726.h>
 #include <hid/ft6336.h>
 
 #include <lib/zx/interrupt.h>
@@ -65,7 +66,7 @@ class FtDevice : public ddk::Device<FtDevice, ddk::Unbindable>,
 public:
     FtDevice(zx_device_t* device);
 
-    static zx_status_t Create(zx_device_t* device);
+    static zx_status_t Create(void* ctx, zx_device_t* device);
 
     void DdkRelease();
     void DdkUnbind() __TA_EXCLUDES(client_lock_);
@@ -81,7 +82,7 @@ public:
     zx_status_t HidbusSetIdle(uint8_t rpt_id, uint8_t duration);
     zx_status_t HidbusGetProtocol(uint8_t* protocol);
     zx_status_t HidbusSetProtocol(uint8_t protocol);
-    zx_status_t HidbusStart(const hidbus_ifc_t* ifc) __TA_EXCLUDES(client_lock_);
+    zx_status_t HidbusStart(const hidbus_ifc_protocol_t* ifc) __TA_EXCLUDES(client_lock_);
     zx_status_t HidbusQuery(uint32_t options, hid_info_t* info) __TA_EXCLUDES(client_lock_);
 
 private:
@@ -99,7 +100,7 @@ private:
 
     static constexpr size_t kMaxI2cTransferLength = 8;
 
-    zx_status_t InitPdev();
+    zx_status_t Init();
     zx_status_t ShutDown() __TA_EXCLUDES(client_lock_);
 
     uint8_t Read(uint8_t addr);
@@ -118,7 +119,7 @@ private:
     std::atomic<bool> running_;
 
     fbl::Mutex client_lock_;
-    ddk::HidbusIfcClient client_ __TA_GUARDED(client_lock_);
+    ddk::HidbusIfcProtocolClient client_ __TA_GUARDED(client_lock_);
 
     const uint8_t* descriptor_ = nullptr;
     size_t descriptor_len_ = 0;

@@ -8,7 +8,9 @@
 #include <stdint.h>
 
 #include <fuchsia/logger/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fidl/cpp/message_buffer.h>
 #include <lib/zx/channel.h>
 #include <zircon/status.h>
@@ -48,7 +50,7 @@ LogExporter::~LogExporter() {
     if (output_file_ != nullptr) {
         fclose(output_file_);
     }
-};
+}
 
 zx_status_t LogExporter::StartThread() {
     return loop_.StartThread();
@@ -98,14 +100,17 @@ zx_status_t LogExporter::ReadAndDispatchMessage(fidl::MessageBuffer* buffer) {
     if (!message.has_header()) {
         return ZX_ERR_INVALID_ARGS;
     }
-    switch (message.ordinal()) {
-    case fuchsia_logger_LogListenerLogGenOrdinal:
-    case fuchsia_logger_LogListenerLogOrdinal:
+
+    // This is an if statement because, depending on the state of the ordinal
+    // migration, GenOrdinal and Ordinal may be the same value.  See FIDL-372
+    uint32_t ordinal = message.ordinal();
+    if (ordinal == fuchsia_logger_LogListenerLogGenOrdinal ||
+        ordinal == fuchsia_logger_LogListenerLogOrdinal) {
         return Log(std::move(message));
-    case fuchsia_logger_LogListenerLogManyGenOrdinal:
-    case fuchsia_logger_LogListenerLogManyOrdinal:
+    } else if (ordinal == fuchsia_logger_LogListenerLogManyGenOrdinal ||
+               ordinal == fuchsia_logger_LogListenerLogManyOrdinal) {
         return LogMany(std::move(message));
-    default:
+    } else {
         return ZX_ERR_NOT_SUPPORTED;
     }
 }

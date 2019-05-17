@@ -23,9 +23,9 @@
 
 #include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
-#include <fbl/limits.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_free_ptr.h>
+#include <ktl/limits.h>
 #include <ktl/unique_ptr.h>
 #include <zircon/syscalls/pci.h>
 
@@ -303,7 +303,7 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
         }
 
         // TODO(johngro): Update the syscall to pass a paddr_t for base instead of a uint64_t
-        ASSERT(arg->addr_windows[0].base < fbl::numeric_limits<paddr_t>::max());
+        ASSERT(arg->addr_windows[0].base < ktl::numeric_limits<paddr_t>::max());
 
         fbl::AllocChecker ac;
         auto addr_provider = ktl::make_unique<MmioPcieAddressProvider>(&ac);
@@ -441,10 +441,10 @@ zx_status_t sys_pci_get_nth_device(zx_handle_t hrsrc,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<PciDeviceDispatcher> handle;
     zx_rights_t rights;
     zx_pcie_device_info_t info;
-    status = PciDeviceDispatcher::Create(index, &info, &dispatcher, &rights);
+    status = PciDeviceDispatcher::Create(index, &info, &handle, &rights);
     if (status != ZX_OK) {
         return status;
     }
@@ -454,7 +454,7 @@ zx_status_t sys_pci_get_nth_device(zx_handle_t hrsrc,
     if (status != ZX_OK)
         return status;
 
-    return out_handle->make(ktl::move(dispatcher), rights);
+    return out_handle->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_pci_config_read
@@ -699,13 +699,13 @@ zx_status_t sys_pci_map_interrupt(zx_handle_t dev_handle,
     if (status != ZX_OK)
         return status;
 
-    fbl::RefPtr<Dispatcher> interrupt_dispatcher;
+    KernelHandle<InterruptDispatcher> interrupt_handle;
     zx_rights_t rights;
-    zx_status_t result = pci_device->MapInterrupt(which_irq, &interrupt_dispatcher, &rights);
+    zx_status_t result = pci_device->MapInterrupt(which_irq, &interrupt_handle, &rights);
     if (result != ZX_OK)
         return result;
 
-    return out_handle->make(ktl::move(interrupt_dispatcher), rights);
+    return out_handle->make(ktl::move(interrupt_handle), rights);
 }
 
 /**

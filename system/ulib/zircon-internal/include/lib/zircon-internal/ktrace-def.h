@@ -28,10 +28,93 @@ KTRACE_DEF(0x033,16B,SYSCALL_EXIT,IRQ) // (n << 8) | cpu
 KTRACE_DEF(0x034,32B,PAGE_FAULT,IRQ) // virtual_address_hi, virtual_address_lo, flags, cpu
 KTRACE_DEF(0x035,32B,PAGE_FAULT_EXIT,IRQ) // virtual_address_hi, virtual_address_lo, flags, cpu
 
-// to-tid, (new_thread_prioriy<<24) | (old_thread_priority<<16) | (old_thread_state<<8) | cpu), from-kt, to-kt
+// to-tid, ((new_thread_prioriy<<24) | (old_thread_priority<<16) | (old_thread_state<<8) | cpu), from-kt, to-kt
 KTRACE_DEF(0x040,32B,CONTEXT_SWITCH,SCHEDULER)
 
-// events from 0x100 on all share the tag/tid/ts common header
+// Word 0: inherit event ID
+// Word 1: 0
+// Word 2: 0
+// Word 3: bits [0, 7] CPU ID
+KTRACE_DEF(0x041,32B,INHERIT_PRIORITY_START,SCHEDULER)
+
+// Word 0: inherit event ID.
+// Word 1: Target thread TID.
+// Word 2: bits [ 0,  7] : old effective priority as an int8_t
+//       : bits [ 8, 15] : new effective priority as an int8_t
+//       : bits [16, 23] : old inherited priority as an int8_t
+//       : bits [24, 31] : new inherited priority as an int8_t
+// Word 3: bits [ 0,  7] : CPU ID
+//       : bit 8         : Kernel TID flag.
+//       : bit 9         : Final event flag.
+//
+// Note: Target thread TID is one of two things.  Either, the lower 32
+// bits of the KOID for a user mode thread dispatcher object, or the
+// lower 32 bits of a kernel mode thread structure's kernel address.
+// The Kernel TID flag in word #3 can be used to tell the difference
+// (1 => kernel TID, 0 => user mode TID)
+//
+KTRACE_DEF(0x042,32B,INHERIT_PRIORITY,SCHEDULER)
+
+// Word 0: futex ID bits [0..31]
+// Word 1: futex ID bits [32..63]
+// Word 2: new owner user-mode TID, or 0 for no owner
+// Word 3: bits [0..7] CPU ID
+KTRACE_DEF(0x043,32B,FUTEX_WAIT,SCHEDULER)
+
+// Word 0: futex ID bits [0..31]
+// Word 1: futex ID bits [32..63]
+// Word 2: zx_status_t result of the wait operation.
+// Word 3: bits [0..7] CPU ID
+KTRACE_DEF(0x044,32B,FUTEX_WOKE,SCHEDULER)
+
+// Word 0: futex ID bits [0..31]
+// Word 1: futex ID bits [32..63]
+// Word 2: assigned owner user-mode TID, or 0 for no owner
+// Word 3: bits [0..7] CPU ID
+// Word 3: bits [8..15] Low 8 bits of count
+//                      [0, 0xFE) => count
+//                      0xFE      => count was >= 0xFE
+//                      0xFF      => count was unlimited
+// Word 3: bit 30; 1 => requeue operation, 0 => wake operation
+// Word 3: bit 31; 1 => futex was active, 0 => it was not.
+KTRACE_DEF(0x045,32B,FUTEX_WAKE,SCHEDULER)
+
+// Word 0: requeue target futex ID bits [0..31]
+// Word 1: requeue target futex ID bits [32..63]
+// Word 2: assigned owner user-mode TID, or 0 for no owner
+// Word 3: bits [0..7] CPU ID
+// Word 3: bits [8..15] Low 8 bits of count
+//                      [0, 0xFE) => count
+//                      0xFE      => count was >= 0xFE
+//                      0xFF      => count was unlimited
+// Word 3: bit 31; 1 => futex was active, 0 => it was not.
+KTRACE_DEF(0x046,32B,FUTEX_REQUEUE,SCHEDULER)
+
+// Trace events logged when a thread interacts with a kernel mutex.  Three
+// operations are defined, Acquire, release and block, but the meaning of the
+// parameters vary slightly from operation to operation.
+//
+// Acquire operations are only logged in the case that a mutex is obtained while
+// uncontested.  There will never be a TID specified, and the number of waiters
+// will always be 0.
+//
+// Release operations will only log a TID in the case that the mutex is being
+// granted atomically to a specific waiter, and the TID will specify the waiter
+// that the mutex is being release to.  In the case that an uncontested mutex is
+// being released, the TID will be 0.
+//
+// Block operations will log a TID indicating the TID of the thread which
+// current owns the mutex and is blocking them.
+//
+// Word 0: low 32 bits of kernel mutex address
+// Word 1: TID
+// Word 2: The number of threads blocked on this mutex
+// Word 3: bits [0..7] CPU ID
+// Word 3: bit 31: 1 => word 1 TID is user mode
+//                 0 => word 1 TID is kernel mode
+KTRACE_DEF(0x047,32B,KERNEL_MUTEX_ACQUIRE,SCHEDULER)
+KTRACE_DEF(0x048,32B,KERNEL_MUTEX_RELEASE,SCHEDULER)
+KTRACE_DEF(0x049,32B,KERNEL_MUTEX_BLOCK,SCHEDULER)
 
 KTRACE_DEF(0x100,32B,OBJECT_DELETE,LIFECYCLE) // id
 

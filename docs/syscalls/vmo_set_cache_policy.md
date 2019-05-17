@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-vmo_set_cache_policy - set the caching policy for pages held by a VMO.
+Set the caching policy for pages held by a VMO.
 
 ## SYNOPSIS
 
@@ -26,7 +26,7 @@ regular memory backed VMO with similar limitations and uses.
 
 A handle must have the **ZX_RIGHT_MAP** right for this call to be
 permitted. Additionally, the VMO must not presently be mapped by any process,
-be cloned, be a clone itself, or have any memory committed.
+have any children, be a child itself, or have any memory committed.
 
 *cache_policy* cache flags to use:
 
@@ -65,7 +65,7 @@ above, or *cache_policy* contains an invalid mix of cache policy flags.
 physical memory.
 
 **ZX_ERR_BAD_STATE** Cache policy cannot be changed because the VMO is presently
-mapped, cloned, a clone itself, or have any memory committed.
+mapped, has children, is a child itself, or have any memory committed.
 
 ## SEE ALSO
 

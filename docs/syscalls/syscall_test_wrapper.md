@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-syscall_test_wrapper - TODO(ZX-3106)
+TODO(ZX-3106)
 
 ## SYNOPSIS
 
@@ -13,7 +13,7 @@ syscall_test_wrapper - TODO(ZX-3106)
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_syscall_test_wrapper(int a, int b, int c);
+zx_status_t zx_syscall_test_wrapper(int32_t a, int32_t b, int32_t c);
 ```
 
 ## DESCRIPTION

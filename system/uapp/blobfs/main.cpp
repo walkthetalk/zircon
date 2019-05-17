@@ -13,8 +13,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <lib/async-loop/cpp/loop.h>
-#include <lib/zx/channel.h>
 #include <blobfs/blobfs.h>
 #include <blobfs/fsck.h>
 #include <fbl/auto_call.h>
@@ -23,6 +21,11 @@
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
 #include <fs/vfs.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <lib/async-loop/cpp/loop.h>
+#include <lib/fdio/fd.h>
+#include <lib/fzl/fdio.h>
+#include <lib/zx/channel.h>
 #include <trace-provider/provider.h>
 #include <zircon/process.h>
 #include <zircon/processargs.h>
@@ -32,28 +35,41 @@
 namespace {
 
 int Mount(fbl::unique_fd fd, blobfs::MountOptions* options) {
-    if (!options->readonly) {
-        block_info_t block_info;
-        zx_status_t status = static_cast<zx_status_t>(ioctl_block_get_info(fd.get(), &block_info));
-        if (status < ZX_OK) {
+    if (options->writability == blobfs::Writability::Writable) {
+        fzl::UnownedFdioCaller caller(fd.get());
+
+        fuchsia_hardware_block_BlockInfo block_info;
+        zx_status_t status;
+        zx_status_t io_status = fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(),
+                                                                    &status, &block_info);
+        if (io_status != ZX_OK) {
+            status = io_status;
+        }
+        if (status != ZX_OK) {
             FS_TRACE_ERROR("blobfs: Unable to query block device, fd: %d status: 0x%x\n",
                            fd.get(), status);
             return -1;
         }
-        options->readonly = block_info.flags & BLOCK_FLAG_READONLY;
+        if (block_info.flags & BLOCK_FLAG_READONLY) {
+            FS_TRACE_WARN("blobfs: Mounting as read-only. WARNING: Journal will not be applied\n");
+            options->writability = blobfs::Writability::ReadOnlyDisk;
+        }
     }
 
-    zx::channel root = zx::channel(zx_take_startup_handle(PA_HND(PA_USER0, 0)));
-    if (!root.is_valid()) {
+    zx::channel root_server = zx::channel(zx_take_startup_handle(FS_HANDLE_ROOT_ID));
+    if (!root_server.is_valid()) {
         FS_TRACE_ERROR("blobfs: Could not access startup handle to mount point\n");
         return -1;
     }
 
     async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
     trace::TraceProvider provider(loop.dispatcher());
-    auto loop_quit = [&loop]() { loop.Quit(); };
-    if (blobfs::Mount(loop.dispatcher(), std::move(fd), *options,
-                            std::move(root), std::move(loop_quit)) != ZX_OK) {
+    auto loop_quit = [&loop]() {
+        loop.Quit();
+        FS_TRACE_WARN("blobfs: Unmounted\n");
+    };
+    if (blobfs::Mount(loop.dispatcher(), std::move(fd), *options, std::move(root_server),
+                      std::move(loop_quit)) != ZX_OK) {
         return -1;
     }
     loop.Run();
@@ -76,7 +92,7 @@ int Fsck(fbl::unique_fd fd, blobfs::MountOptions* options) {
         return -1;
     }
 
-    return blobfs::Fsck(std::move(blobfs));
+    return blobfs::Fsck(std::move(blobfs), options->journal);
 }
 
 typedef int (*CommandFunction)(fbl::unique_fd fd, blobfs::MountOptions* options);
@@ -99,6 +115,8 @@ int usage() {
             "\n"
             "options: -r|--readonly  Mount filesystem read-only\n"
             "         -m|--metrics   Collect filesystem metrics\n"
+            "         -j|--journal   Utilize the blobfs journal\n"
+            "                        For fsck, the journal is replayed before verification\n"
             "         -h|--help      Display this message\n"
             "\n"
             "On Fuchsia, blobfs takes the block device argument by handle.\n"
@@ -110,11 +128,11 @@ int usage() {
                 kCmds[n].name, kCmds[n].help);
     }
     fprintf(stderr, "\n");
-    return -1;
+    return ZX_ERR_INVALID_ARGS;
 }
 
-// Process options/commands and return open fd to device
-int ProcessArgs(int argc, char** argv, CommandFunction* func, blobfs::MountOptions* options) {
+zx_status_t ProcessArgs(int argc, char** argv, CommandFunction* func,
+                        blobfs::MountOptions* options) {
     while (1) {
         static struct option opts[] = {
             {"readonly", no_argument, nullptr, 'r'},
@@ -130,7 +148,7 @@ int ProcessArgs(int argc, char** argv, CommandFunction* func, blobfs::MountOptio
         }
         switch (c) {
         case 'r':
-            options->readonly = true;
+            options->writability = blobfs::Writability::ReadOnlyFilesystem;
             break;
         case 'm':
             options->metrics = true;
@@ -164,19 +182,24 @@ int ProcessArgs(int argc, char** argv, CommandFunction* func, blobfs::MountOptio
         return usage();
     }
 
-    // Block device passed by handle
-    return FS_FD_BLOCKDEVICE;
+    return ZX_OK;
 }
 } // namespace
 
 int main(int argc, char** argv) {
     CommandFunction func = nullptr;
     blobfs::MountOptions options;
-    fbl::unique_fd fd(ProcessArgs(argc, argv, &func, &options));
-
-    if (!fd) {
+    zx_status_t status = ProcessArgs(argc, argv, &func, &options);
+    if (status != ZX_OK) {
         return -1;
     }
 
-    return func(std::move(fd), &options);
+    zx::channel device = zx::channel(zx_take_startup_handle(FS_HANDLE_BLOCK_DEVICE_ID));
+    int device_fd = -1;
+    status = fdio_fd_create(device.release(), &device_fd);
+    if (status != ZX_OK) {
+        fprintf(stderr, "blobfs: Could not access block device\n");
+        return -1;
+    }
+    return func(fbl::unique_fd(device_fd), &options);
 }

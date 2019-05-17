@@ -8,6 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <fuchsia/device/c/fidl.h>
+#include <fuchsia/hardware/block/partition/c/fidl.h>
+#include <lib/fdio/unsafe.h>
 #include <lib/fdio/watcher.h>
 
 // for guid printing
@@ -17,7 +20,6 @@
 #include <zircon/syscalls.h>
 
 #include <zircon/device/block.h>
-#include <zircon/device/device.h>
 
 void usage(void) {
     fprintf(stderr,
@@ -106,17 +108,27 @@ zx_status_t watchcb(int dirfd, int event, const char* fn, void* cookie) {
 
 zx_status_t expr_topo(const char* arg, int fd) {
     char topo[1024+1];
-    int r = ioctl_device_get_topo_path(fd, topo, sizeof(topo) - 1);
-    if (r < 0) {
+
+    fdio_t* io = fdio_unsafe_fd_to_io(fd);
+    if (io == NULL) {
+        return ZX_ERR_NEXT;
+    }
+    zx_status_t call_status;
+    size_t path_len;
+    zx_status_t status = fuchsia_device_ControllerGetTopologicalPath(
+            fdio_unsafe_borrow_channel(io), &call_status, topo, sizeof(topo) - 1, &path_len);
+    fdio_unsafe_release(io);
+    if (status != ZX_OK || call_status != ZX_OK) {
         fprintf(stderr, "waitfor: warning: cannot read topo path\n");
         return ZX_ERR_NEXT;
     }
-    topo[r] = 0;
+    topo[path_len] = 0;
+
     if (verbose) {
         fprintf(stderr, "waitfor: topo='%s'\n", topo);
     }
-    int len = strlen(arg);
-    if ((r < len) || strncmp(arg, topo, len)) {
+    size_t len = strlen(arg);
+    if ((path_len < len) || strncmp(arg, topo, len)) {
         return ZX_ERR_NEXT;
     } else {
         return ZX_OK;
@@ -124,13 +136,21 @@ zx_status_t expr_topo(const char* arg, int fd) {
 }
 
 zx_status_t expr_part_guid(const char* arg, int fd) {
-    uint8_t guid[GPT_GUID_LEN];
-    if (ioctl_block_get_partition_guid(fd, guid, sizeof(guid)) != sizeof(guid)) {
+    fdio_t* io = fdio_unsafe_fd_to_io(fd);
+    if (io == NULL) {
+        return ZX_ERR_NEXT;
+    }
+    fuchsia_hardware_block_partition_GUID guid;
+    zx_status_t status;
+    zx_status_t io_status = fuchsia_hardware_block_partition_PartitionGetInstanceGuid(
+            fdio_unsafe_borrow_channel(io), &status, &guid);
+    fdio_unsafe_release(io);
+    if (io_status != ZX_OK || status != ZX_OK) {
         fprintf(stderr, "waitfor: warning: cannot read partition guid\n");
         return ZX_ERR_NEXT;
     }
     char text[GPT_GUID_STRLEN];
-    uint8_to_guid_string(text, guid);
+    uint8_to_guid_string(text, guid.value);
     if (verbose) {
         fprintf(stderr, "waitfor: part.guid='%s'\n", text);
     }
@@ -142,13 +162,21 @@ zx_status_t expr_part_guid(const char* arg, int fd) {
 }
 
 zx_status_t expr_part_type_guid(const char* arg, int fd) {
-    uint8_t guid[GPT_GUID_LEN];
-    if (ioctl_block_get_type_guid(fd, guid, sizeof(guid)) != sizeof(guid)) {
-        fprintf(stderr, "waitfor: warning: cannot read partition type guid\n");
+    fdio_t* io = fdio_unsafe_fd_to_io(fd);
+    if (io == NULL) {
+        return ZX_ERR_NEXT;
+    }
+    fuchsia_hardware_block_partition_GUID guid;
+    zx_status_t status;
+    zx_status_t io_status = fuchsia_hardware_block_partition_PartitionGetTypeGuid(
+            fdio_unsafe_borrow_channel(io), &status, &guid);
+    fdio_unsafe_release(io);
+    if (io_status != ZX_OK || status != ZX_OK) {
+        fprintf(stderr, "waitfor: warning: cannot read type guid\n");
         return ZX_ERR_NEXT;
     }
     char text[GPT_GUID_STRLEN];
-    uint8_to_guid_string(text, guid);
+    uint8_to_guid_string(text, guid.value);
     if (verbose) {
         fprintf(stderr, "waitfor: part.type.guid='%s'\n", text);
     }
@@ -160,13 +188,22 @@ zx_status_t expr_part_type_guid(const char* arg, int fd) {
 }
 
 zx_status_t expr_part_name(const char* arg, int fd) {
-    char name[256 + 1];
-    int r = ioctl_block_get_name(fd, name, sizeof(name) - 1);
-    if (r < 0) {
+    char name[NAME_MAX + 1];
+
+    fdio_t* io = fdio_unsafe_fd_to_io(fd);
+    if (io == NULL) {
+        return ZX_ERR_NEXT;
+    }
+    zx_status_t status;
+    size_t actual;
+    zx_status_t io_status =
+            fuchsia_hardware_block_partition_PartitionGetName(fdio_unsafe_borrow_channel(io),
+                                                              &status, name, sizeof(name), &actual);
+    fdio_unsafe_release(io);
+    if (io_status != ZX_OK || status != ZX_OK) {
         fprintf(stderr, "waitfor: warning: cannot read partition name\n");
         return ZX_ERR_NEXT;
     }
-    name[r] = 0;
     if (verbose) {
         fprintf(stderr, "waitfor: part.name='%s'\n", name);
     }

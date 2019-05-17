@@ -41,21 +41,28 @@ zx_status_t Mt8167::GpuInit() {
     const pbus_irq_t gpu_irqs[] = {
         {
             .irq = MT8167_IRQ_RGX,
-            .mode = ZX_INTERRUPT_MODE_LEVEL_LOW,
+            .mode = ZX_INTERRUPT_MODE_LEVEL_HIGH,
         }};
 
     const pbus_clk_t gpu_clks[] = {
         {
-            .clk = kClkSlowMfg,
+            .clk = kClkRgSlowMfg,
         },
         {
-            .clk = kClkAxiMfg,
+            .clk = kClkRgAxiMfg,
         },
         {
             .clk = kClkMfgMm,
         }};
+
+    const pbus_bti_t gpu_btis[] ={
+        {
+            .iommu_index = 0,
+            .bti_id = BTI_GPU,
+        },
+    };
     pbus_dev_t gpu_dev = {};
-    gpu_dev.name = "gpio";
+    gpu_dev.name = "mt8167s_gpu";
     gpu_dev.vid = PDEV_VID_MEDIATEK;
     gpu_dev.did = PDEV_DID_MEDIATEK_GPU;
     gpu_dev.mmio_list = gpu_mmios;
@@ -64,10 +71,12 @@ zx_status_t Mt8167::GpuInit() {
     gpu_dev.irq_count = countof(gpu_irqs);
     gpu_dev.clk_list = gpu_clks;
     gpu_dev.clk_count = countof(gpu_clks);
+    gpu_dev.bti_list = gpu_btis;
+    gpu_dev.bti_count = countof(gpu_btis);
 
     zx_status_t status = pbus_.DeviceAdd(&gpu_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: ProtocolDeviceAdd failed %d\n", __FUNCTION__, status);
+        zxlogf(ERROR, "%s: DeviceAdd failed %d\n", __FUNCTION__, status);
         return status;
     }
 

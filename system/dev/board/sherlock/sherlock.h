@@ -33,6 +33,7 @@ enum {
     BTI_AUDIO_OUT,
     BTI_AUDIO_IN,
     BTI_SYSMEM,
+    BTI_THERMAL,
 };
 
 // MAC address metadata indices
@@ -47,6 +48,13 @@ enum {
     SHERLOCK_I2C_2,
     SHERLOCK_I2C_3,
 };
+
+// From the schematic.
+constexpr uint8_t BOARD_REV_P2 = 0x0B;
+constexpr uint8_t BOARD_REV_REWORK = 0x0C;
+constexpr uint8_t BOARD_REV_P21 = 0x0D;
+constexpr uint8_t BOARD_REV_EVT1 = 0x0E;
+constexpr uint8_t BOARD_REV_EVT2 = 0x0F;
 
 class Sherlock;
 using SherlockType = ddk::Device<Sherlock>;
@@ -68,6 +76,7 @@ private:
     zx_status_t Start();
     zx_status_t SysmemInit();
     zx_status_t GpioInit();
+    zx_status_t BoardInit();
     zx_status_t CanvasInit();
     zx_status_t I2cInit();
     zx_status_t UsbInit();
@@ -79,10 +88,11 @@ private:
     zx_status_t CameraInit();
     zx_status_t MaliInit();
     zx_status_t VideoInit();
-    zx_status_t BacklightInit();
     zx_status_t ButtonsInit();
     zx_status_t DisplayInit();
     zx_status_t AudioInit();
+    zx_status_t ThermalInit();
+    zx_status_t TouchInit();
     int Thread();
 
     ddk::PBusProtocolClient pbus_;

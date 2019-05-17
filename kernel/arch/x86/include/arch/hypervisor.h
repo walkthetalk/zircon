@@ -10,7 +10,6 @@
 #include <arch/x86/interrupts.h>
 #include <arch/x86/vmx_state.h>
 #include <fbl/ref_ptr.h>
-#include <ktl/unique_ptr.h>
 #include <hypervisor/guest_physical_address_space.h>
 #include <hypervisor/id_allocator.h>
 #include <hypervisor/interrupt_tracker.h>
@@ -19,6 +18,8 @@
 #include <kernel/event.h>
 #include <kernel/spinlock.h>
 #include <kernel/timer.h>
+#include <ktl/unique_ptr.h>
+#include <zircon/compiler.h>
 #include <zircon/types.h>
 
 struct VmxInfo;
@@ -53,7 +54,7 @@ private:
     hypervisor::TrapMap traps_;
     VmxPage msr_bitmaps_page_;
 
-    fbl::Mutex vcpu_mutex_;
+    DECLARE_MUTEX(Guest) vcpu_mutex_;
     // TODO(alexlegg): Find a good place for this constant to live (max VCPUs).
     hypervisor::IdAllocator<uint16_t, 64> TA_GUARDED(vcpu_mutex_) vpid_allocator_;
 
@@ -99,13 +100,17 @@ private:
     Guest* guest_;
     const uint16_t vpid_;
     const thread_t* thread_;
-    fbl::atomic_bool running_;
+    ktl::atomic<bool> running_;
     LocalApicState local_apic_state_;
     PvClockState pvclock_state_;
     VmxState vmx_state_;
     VmxPage host_msr_page_;
     VmxPage guest_msr_page_;
     VmxPage vmcs_page_;
+    ktl::unique_ptr<uint8_t[]> guest_extended_registers_;
 
     Vcpu(Guest* guest, uint16_t vpid, const thread_t* thread);
+
+    void SaveGuestExtendedRegisters(uint64_t cr4);
+    void RestoreGuestExtendedRegisters(uint64_t cr4);
 };

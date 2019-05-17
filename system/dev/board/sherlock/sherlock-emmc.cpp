@@ -7,7 +7,7 @@
 #include <ddk/metadata.h>
 #include <ddk/metadata/gpt.h>
 #include <ddk/platform-defs.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <hw/reg.h>
 #include <lib/zx/handle.h>
 
@@ -57,6 +57,7 @@ static aml_sd_emmc_config_t config = {
 
 static const guid_map_t guid_map[] = {
     { "boot", GUID_ZIRCON_A_VALUE },
+    { "system", GUID_ZIRCON_B_VALUE },
     { "recovery", GUID_ZIRCON_R_VALUE },
     { "cache", GUID_FVM_VALUE }
 };
@@ -64,7 +65,7 @@ static_assert(sizeof(guid_map) / sizeof(guid_map[0]) <= DEVICE_METADATA_GUID_MAP
 
 static const pbus_metadata_t emmc_metadata[] = {
     {
-        .type       = DEVICE_METADATA_PRIVATE,
+        .type       = DEVICE_METADATA_EMMC_CONFIG,
         .data_buffer       = &config,
         .data_size        = sizeof(config),
     },
@@ -87,7 +88,7 @@ static pbus_dev_t emmc_dev = [](){
     dev.name = "sherlock-emmc";
     dev.vid = PDEV_VID_AMLOGIC;
     dev.pid = PDEV_PID_GENERIC;
-    dev.did = PDEV_DID_AMLOGIC_SD_EMMC;
+    dev.did = PDEV_DID_AMLOGIC_SD_EMMC_C;
     dev.mmio_list = emmc_mmios;
     dev.mmio_count = countof(emmc_mmios);
     dev.irq_list = emmc_irqs;

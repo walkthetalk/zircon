@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,6 +21,8 @@
 #include <fbl/unique_fd.h>
 #include <fs-test-utils/fixture.h>
 #include <fs-test-utils/unittest.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <fuchsia/hardware/block/volume/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/fzl/fdio.h>
 #include <unittest/unittest.h>
@@ -28,7 +31,7 @@
 #include <zircon/syscalls.h>
 
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
+#include <ramdevice-client/ramdisk.h>
 
 #include <utility>
 
@@ -76,7 +79,7 @@ bool MountUnmountShared(size_t block_size) {
     ramdisk_client_t* ramdisk = nullptr;
     const char* mount_path = "/tmp/mount_unmount";
 
-    ASSERT_EQ(create_ramdisk(block_size, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(block_size, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -111,7 +114,7 @@ bool MountMkdirUnmount() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -133,7 +136,7 @@ bool FmountFunmount() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -163,7 +166,7 @@ bool FmountFunmount() {
 bool DoMountEvil(const char* parentfs_name, const char* mount_path) {
     BEGIN_HELPER;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -270,7 +273,7 @@ bool MountEvilMemfs() {
 bool MountEvilMinfs() {
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -301,7 +304,7 @@ bool UmountTestEvil() {
 
     // Create a ramdisk, mount minfs
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -351,7 +354,7 @@ bool DoubleMountRoot() {
 
     // Create a ramdisk, mount minfs
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -366,7 +369,7 @@ bool DoubleMountRoot() {
     // Create ANOTHER ramdisk, ready to be mounted...
     // Try mounting again on top Minfs' remote root.
     ramdisk_client_t* ramdisk2;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk2), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk2), ZX_OK);
     const char* ramdisk_path2 = ramdisk_get_path(ramdisk2);
     ASSERT_EQ(mkfs(ramdisk_path2, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -403,7 +406,7 @@ bool MountRemount() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -428,7 +431,7 @@ bool MountFsck() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -451,7 +454,7 @@ bool MountGetDevice() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -556,7 +559,7 @@ bool MountReadonly() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_TRUE(CreateTestFile(ramdisk_path, mount_path, file_name));
 
@@ -602,7 +605,7 @@ bool MountBlockReadonly() {
     BEGIN_TEST;
 
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_TRUE(CreateTestFile(ramdisk_path, mount_path, file_name));
 
@@ -636,7 +639,7 @@ bool StatfsTest() {
 
     BEGIN_TEST;
     ramdisk_client_t* ramdisk = nullptr;
-    ASSERT_EQ(create_ramdisk(512, 1 << 16, &ramdisk), ZX_OK);
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
     const char* ramdisk_path = ramdisk_get_path(ramdisk);
     ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
               ZX_OK);
@@ -669,84 +672,71 @@ bool StatfsTest() {
     END_TEST;
 }
 
-// Verifies that the values in stats match the other parameters
-bool CheckStats(block_stats_t stats, size_t total_ops, size_t total_blocks, size_t total_reads,
-                size_t total_blocks_read, size_t total_writes, size_t total_blocks_written) {
-    BEGIN_HELPER;
-    ASSERT_EQ(stats.total_ops, total_ops);
-    ASSERT_EQ(stats.total_blocks, total_blocks);
-    ASSERT_EQ(stats.total_reads, total_reads);
-    ASSERT_EQ(stats.total_blocks_read, total_blocks_read);
-    ASSERT_EQ(stats.total_writes, total_writes);
-    ASSERT_EQ(stats.total_blocks_written, total_blocks_written);
-    END_HELPER;
-}
-
-// Tests functionality of IOCTL_BLOCK_GET_STATS
-bool GetStatsTest(fs_test_utils::Fixture* fixture) {
-    fbl::StringBuffer<512> test_data;
-    test_data.Resize(512, 'c');
-    char test_read[512];
+bool StatvfsTest() {
+    const char* mount_path = "/tmp/mount_unmount";
 
     BEGIN_TEST;
-    fbl::unique_fd ram_fd(open(fixture->block_device_path().c_str(), O_RDONLY));
-    ASSERT_TRUE(ram_fd);
-    block_stats_t block_stats;
-    bool clear = true;
-    // Clear stats from creating ramdisk
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    // Retrieve cleared stats
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    ASSERT_TRUE(CheckStats(block_stats, 0, 0, 0, 0, 0, 0));
+    ramdisk_client_t* ramdisk = nullptr;
+    ASSERT_EQ(ramdisk_create(512, 1 << 16, &ramdisk), ZX_OK);
+    const char* ramdisk_path = ramdisk_get_path(ramdisk);
+    ASSERT_EQ(mkfs(ramdisk_path, DISK_FORMAT_MINFS, launch_stdio_sync, &default_mkfs_options),
+              ZX_OK);
+    ASSERT_EQ(mkdir(mount_path, 0666), 0);
+    int fd = open(ramdisk_path, O_RDWR);
+    ASSERT_GT(fd, 0);
+    ASSERT_EQ(mount(fd, mount_path, DISK_FORMAT_MINFS, &default_mount_options, launch_stdio_async),
+              ZX_OK);
 
-    fbl::StringBuffer<fs_test_utils::kPathSize> myfile;
-    myfile.AppendPrintf("%s/my_file.txt", fixture->fs_path().c_str());
-    fbl::unique_fd file_to_create(open(myfile.c_str(), O_RDWR | O_CREAT));
-    fsync(file_to_create.get());
+    struct statvfs stats;
+    int rc = statvfs("", &stats);
+    int err = errno;
+    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(err, ENOENT);
 
-    // Clear stats from creating file
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    ASSERT_EQ(write(file_to_create.get(), test_data.data(), 512), 512);
-    fsync(file_to_create.get());
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    // 5 ops total, 4 for the write and 1 for the sync, 64 blocks written by 4 16 block writes
-    ASSERT_TRUE(CheckStats(block_stats, 5, 64, 0, 0, 4, 64));
-    ASSERT_EQ(lseek(file_to_create.get(), 0, SEEK_SET), 0);
-    // Reset file to clear it from the cache
-    file_to_create.reset();
-    fixture->Remount();
-    file_to_create.reset(open(myfile.c_str(), O_RDONLY));
-    // Clear the stats from reseting the file
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    ASSERT_EQ(read(file_to_create.get(), test_read, 512), 512);
-    ASSERT_GE(ioctl_block_get_stats(ram_fd.get(), &clear, &block_stats), ZX_OK);
-    // 1 op for reading 16 blocks, no writes
-    ASSERT_TRUE(CheckStats(block_stats, 1, 16, 1, 16, 0, 0));
+    rc = statvfs(mount_path, &stats);
+    ASSERT_EQ(rc, 0);
+
+    // Verify that at least some values make sense, without making the test too brittle.
+    ASSERT_NE(stats.f_fsid, 0);
+    ASSERT_EQ(stats.f_bsize, 8192u);
+    ASSERT_EQ(stats.f_frsize, 8192u);
+    ASSERT_EQ(stats.f_namemax, 255u);
+    ASSERT_GT(stats.f_bavail, 0u);
+    ASSERT_GT(stats.f_ffree, 0u);
+    ASSERT_GT(stats.f_favail, 0u);
+
+    ASSERT_EQ(umount(mount_path), ZX_OK);
+    ASSERT_EQ(ramdisk_destroy(ramdisk), 0);
+    ASSERT_EQ(unlink(mount_path), 0);
     END_TEST;
 }
 
-bool GetPartitionSliceCount(int partition_fd, size_t* out_count) {
+bool GetPartitionSliceCount(const zx::unowned_channel& channel, size_t* out_count) {
     BEGIN_HELPER;
 
-    fvm_info_t fvm_info;
-    ASSERT_GE(ioctl_block_fvm_query(partition_fd, &fvm_info), ZX_OK);
-
-    query_request_t request;
-    query_response_t response;
-    memset(&request, 0, sizeof(request));
-    memset(&response, 0, sizeof(response));
-    request.count = 1;
+    fuchsia_hardware_block_volume_VolumeInfo fvm_info;
+    zx_status_t status;
+    ASSERT_OK(fuchsia_hardware_block_volume_VolumeQuery(channel->get(), &status, &fvm_info));
+    ASSERT_OK(status);
 
     size_t allocated_slices = 0;
-    size_t end = 0;
-    for (size_t curr_slice = 0; curr_slice < fvm_info.vslice_count; curr_slice = end) {
-        request.vslice_start[0] = curr_slice;
-        ASSERT_GE(ioctl_block_fvm_vslice_query(partition_fd, &request, &response), ZX_OK);
-        end = curr_slice + response.vslice_range[0].count;
-        if (response.vslice_range[0].allocated) {
-            allocated_slices += response.vslice_range[0].count;
+    uint64_t start_slices[1];
+    start_slices[0] = 0;
+    while (start_slices[0] < fvm_info.vslice_count) {
+        fuchsia_hardware_block_volume_VsliceRange
+            ranges[fuchsia_hardware_block_volume_MAX_SLICE_REQUESTS];
+        size_t actual_ranges_count;
+        ASSERT_OK(fuchsia_hardware_block_volume_VolumeQuerySlices(
+                    channel->get(), start_slices, fbl::count_of(start_slices), &status,
+                    ranges, &actual_ranges_count));
+        ASSERT_OK(status);
+        ASSERT_EQ(1, actual_ranges_count);
+        start_slices[0] += ranges[0].count;
+        if (ranges[0].allocated) {
+            allocated_slices += ranges[0].count;
         }
     }
+
     *out_count = allocated_slices;
     END_HELPER;
 }
@@ -762,15 +752,15 @@ bool MkfsMinfsWithMinFvmSlices(fs_test_utils::Fixture* fixture) {
              &default_mkfs_options));
     fbl::unique_fd partition_fd(open(fixture->partition_path().c_str(), O_RDONLY));
     ASSERT_TRUE(partition_fd);
-    ASSERT_TRUE(GetPartitionSliceCount(partition_fd.get(), &base_slices));
+    fzl::UnownedFdioCaller caller(partition_fd.get());
+    ASSERT_TRUE(GetPartitionSliceCount(zx::unowned_channel(caller.borrow_channel()), &base_slices));
     options.fvm_data_slices += 10;
-
-    ASSERT_TRUE(partition_fd);
 
     ASSERT_OK(
         mkfs(fixture->partition_path().c_str(), DISK_FORMAT_MINFS, launch_stdio_sync, &options));
     size_t allocated_slices = 0;
-    ASSERT_TRUE(GetPartitionSliceCount(partition_fd.get(), &allocated_slices));
+    ASSERT_TRUE(GetPartitionSliceCount(zx::unowned_channel(caller.borrow_channel()),
+                                       &allocated_slices));
     EXPECT_GE(allocated_slices, base_slices + 10);
 
     disk_format_t actual_format = detect_disk_format(partition_fd.get());
@@ -795,11 +785,8 @@ RUN_TEST_MEDIUM(MountGetDevice)
 RUN_TEST_MEDIUM(MountReadonly)
 RUN_TEST_MEDIUM(MountBlockReadonly)
 RUN_TEST_MEDIUM(StatfsTest)
+RUN_TEST_MEDIUM(StatvfsTest)
 END_TEST_CASE(fs_management_tests)
-
-BEGIN_FS_TEST_CASE(fs_management_get_stats, MinfsRamdiskOptions)
-RUN_FS_TEST_F(GetStatsTest)
-END_FS_TEST_CASE(fs_management_get_stats, MinfsRamdiskOptions)
 
 BEGIN_FS_TEST_CASE(fs_management_mkfs_tests, PartitionOverFvmWithRamdisk)
 RUN_FS_TEST_F(MkfsMinfsWithMinFvmSlices)

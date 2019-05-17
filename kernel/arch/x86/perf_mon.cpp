@@ -4,20 +4,9 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-// A note on the distribution of code between us and the userspace driver:
-// The default location for code is the userspace driver. Reasons for
-// putting code here are: implementation requirement (need ring zero to write
-// MSRs), stability, and performance. The device driver should do as much
-// error checking as possible before calling us.
-// Note that we do a lot of verification of the input configuration:
-// We don't want to be compromised if the userspace driver gets compromised.
-
-// A note on terminology: "events" vs "counters": A "counter" is an
-// "event", but some events are not counters. Internally, we use the
-// term "counter" when we know the event is a counter.
-
 // This file contains the lower part of Intel Performance Monitor support that
 // must be done in the kernel (so that we can read/write msrs).
+// The common code is in kernel/lib/perfmon/perfmon.cpp.
 // The userspace driver is in system/dev/misc/cpu-trace/intel-pm.c.
 
 // TODO(dje): See Intel Vol 3 18.2.3.1 for hypervisor recommendations.
@@ -56,9 +45,7 @@
 #include <ktl/move.h>
 #include <lib/ktrace.h>
 #include <lib/pci/pio.h>
-#include <lib/zircon-internal/device/cpu-trace/cpu-perf.h>
-#include <lib/zircon-internal/device/cpu-trace/intel-pm.h>
-#include <lib/zircon-internal/ktrace.h>
+#include <lib/perfmon.h>
 #include <lib/zircon-internal/mtrace.h>
 #include <lk/init.h>
 #include <new>
@@ -74,6 +61,8 @@
 
 #define LOCAL_TRACE 0
 
+static void x86_perfmon_reset_task(void* raw_context);
+
 // TODO(cja): Sort out headers so the kernel can include these sorts of definitions
 // without needing DDK access
 #define PCI_CONFIG_VENDOR_ID        0x00
@@ -83,7 +72,7 @@
 // so handle them directly.
 typedef enum {
 #define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
-    symbol ## _ID = CPUPERF_MAKE_EVENT_ID(CPUPERF_GROUP_MISC, id),
+    symbol ## _ID = perfmon::MakeEventId(perfmon::kGroupMisc, id),
 #include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
 } misc_event_id_t;
 
@@ -100,7 +89,7 @@ typedef enum {
 
 // At a minimum we require Performance Monitoring version 4.
 // KISS: Skylake supports version 4.
-#define MINIMUM_PERFMON_VERSION 4
+#define MINIMUM_INTEL_PERFMON_VERSION 4
 
 // MSRs
 
@@ -173,10 +162,6 @@ static_assert(1
 static uint64_t kGlobalCtrlWritableBits;
 static uint64_t kFixedCounterCtrlWritableBits;
 
-// While the last-branch record is far larger, it is not emitted for each
-// event.
-static constexpr size_t kMaxEventRecordSize = sizeof(cpuperf_pc_record_t);
-
 // Commented out values represent currently unsupported features.
 // They remain present for documentation purposes.
 // Note: Making this const assumes at least PM version >= 2 (e.g.,
@@ -217,13 +202,20 @@ enum LbrFormat {
     LBR_FORMAT_INFO = 0b101,
 };
 
-static bool supports_perfmon = false;
+static bool perfmon_hw_initialized = false;
 
 static uint16_t perfmon_version = 0;
+
+// The maximum number of programmable counters that can be simultaneously
+// handled, and their maximum width;
 static uint16_t perfmon_num_programmable_counters = 0;
 static uint16_t perfmon_programmable_counter_width = 0;
+
+// The maximum number of fixed counters that can be simultaneously
+// handled, and their maximum width;
 static uint16_t perfmon_num_fixed_counters = 0;
 static uint16_t perfmon_fixed_counter_width = 0;
+
 static uint32_t perfmon_unsupported_events = 0;
 static uint32_t perfmon_capabilities = 0;
 
@@ -241,23 +233,11 @@ static uint64_t perfmon_counter_status_bits = 0;
 // registers. These registers are accessible via mmio.
 static uint32_t perfmon_mchbar_bar = 0;
 
-// The number of "miscellaneous" events we can handle at once.
+// The maximum number of "miscellaneous" events we can handle at once
+// and their width. This is mostly for information purposes, there may be
+// additional constraints which depend on the counters in question.
 static uint16_t perfmon_num_misc_events = 0;
-
-struct PerfmonCpuData {
-    // The trace buffer, passed in from userspace.
-    fbl::RefPtr<VmObject> buffer_vmo;
-    size_t buffer_size = 0;
-
-    // The trace buffer when mapped into kernel space.
-    // This is only done while the trace is running.
-    fbl::RefPtr<VmMapping> buffer_mapping;
-    cpuperf_buffer_header_t* buffer_start = 0;
-    void* buffer_end = 0;
-
-    // The next record to fill.
-    cpuperf_record_header_t* buffer_next = nullptr;
-} __CPU_ALIGN;
+static uint16_t perfmon_misc_counter_width = 64;
 
 struct MemoryControllerHubData {
     // Where the regs are mapped.
@@ -286,10 +266,9 @@ struct MemoryControllerHubData {
     } last_mem;
 };
 
-struct PerfmonState {
+struct PerfmonState : public PerfmonStateBase {
     static zx_status_t Create(unsigned n_cpus, ktl::unique_ptr<PerfmonState>* out_state);
     explicit PerfmonState(unsigned n_cpus);
-    ~PerfmonState();
 
     // IA32_PERF_GLOBAL_CTRL
     uint64_t global_ctrl = 0;
@@ -303,8 +282,8 @@ struct PerfmonState {
     // True if MCHBAR perf regs need to be mapped in.
     bool need_mchbar = false;
 
-    // See intel-pm.h:zx_x86_pmu_config_t.
-    cpuperf_event_id_t timebase_id = CPUPERF_EVENT_ID_NONE;
+    // See intel-pm.h:X86PmuConfig.
+    PmuEventId timebase_event = perfmon::kEventIdNone;
 
     // The number of each kind of event in use, so we don't have to iterate
     // over the entire arrays.
@@ -315,52 +294,50 @@ struct PerfmonState {
     // True if last branch records have been requested.
     bool request_lbr_record = false;
 
-    // Number of entries in |cpu_data|.
-    const unsigned num_cpus;
-
-    // An array with one entry for each cpu.
-    // TODO(dje): Ideally this would be something like
-    // ktl::unique_ptr<PerfmonCpuData[]> cpu_data;
-    // but that will need to wait for a "new" that handles aligned allocs.
-    PerfmonCpuData* cpu_data = nullptr;
-
     MemoryControllerHubData mchbar_data;
 
     // |fixed_hw_map[i]| is the h/w fixed counter number.
     // This is used to only look at fixed counters that are used.
     unsigned fixed_hw_map[IPM_MAX_FIXED_COUNTERS] = {};
 
+    // The ids for each of the in-use events, or zero if not used.
+    // These are passed in from the driver and then written to the buffer,
+    // but otherwise have no meaning to us.
+    // All in-use entries appear consecutively.
+    PmuEventId fixed_events[IPM_MAX_FIXED_COUNTERS] = {};
+    PmuEventId programmable_events[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
+    PmuEventId misc_events[IPM_MAX_MISC_EVENTS] = {};
+
     // The counters are reset to this at the start.
     // And again for those that are reset on overflow.
     uint64_t fixed_initial_value[IPM_MAX_FIXED_COUNTERS] = {};
     uint64_t programmable_initial_value[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
 
-    // Flags for each event/counter, IPM_CONFIG_FLAG_*.
+    // Flags for each event/counter, perfmon::kPmuConfigFlag*.
     uint32_t fixed_flags[IPM_MAX_FIXED_COUNTERS] = {};
     uint32_t programmable_flags[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
     uint32_t misc_flags[IPM_MAX_MISC_EVENTS] = {};
 
-    // The ids for each of the in-use events, or zero if not used.
-    // These are passed in from the driver and then written to the buffer,
-    // but otherwise have no meaning to us.
-    // All in-use entries appear consecutively.
-    cpuperf_event_id_t fixed_ids[IPM_MAX_FIXED_COUNTERS] = {};
-    cpuperf_event_id_t programmable_ids[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
-    cpuperf_event_id_t misc_ids[IPM_MAX_MISC_EVENTS] = {};
-
     // IA32_PERFEVTSEL_*
-    uint64_t events[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
+    uint64_t programmable_hw_events[IPM_MAX_PROGRAMMABLE_COUNTERS] = {};
 };
 
-static fbl::Mutex perfmon_lock;
+namespace {
+DECLARE_SINGLETON_MUTEX(PerfmonLock);
+}  // namespace
 
-static ktl::unique_ptr<PerfmonState> perfmon_state TA_GUARDED(perfmon_lock);
-
-// This is accessed atomically as it is also accessed by the PMI handler.
-static int perfmon_active = false;
+static ktl::unique_ptr<PerfmonState> perfmon_state TA_GUARDED(PerfmonLock::Get());
 
 static inline bool x86_perfmon_lbr_is_supported() {
     return perfmon_lbr_stack_size > 0;
+}
+
+static inline void enable_counters(PerfmonState* state) {
+    write_msr(IA32_PERF_GLOBAL_CTRL, state->global_ctrl);
+}
+
+static inline void disable_counters() {
+    write_msr(IA32_PERF_GLOBAL_CTRL, 0);
 }
 
 zx_status_t PerfmonState::Create(unsigned n_cpus, ktl::unique_ptr<PerfmonState>* out_state) {
@@ -369,34 +346,16 @@ zx_status_t PerfmonState::Create(unsigned n_cpus, ktl::unique_ptr<PerfmonState>*
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    size_t space_needed = sizeof(PerfmonCpuData) * n_cpus;
-    auto cpu_data = reinterpret_cast<PerfmonCpuData*>(
-        memalign(alignof(PerfmonCpuData), space_needed));
-    if (!cpu_data)
+    if (!state->AllocatePerCpuData()) {
         return ZX_ERR_NO_MEMORY;
-
-    for (unsigned cpu = 0; cpu < n_cpus; ++cpu) {
-        new (&cpu_data[cpu]) PerfmonCpuData();
     }
 
-    state->cpu_data = cpu_data;
     *out_state = ktl::move(state);
     return ZX_OK;
 }
 
 PerfmonState::PerfmonState(unsigned n_cpus)
-        : num_cpus(n_cpus) { }
-
-PerfmonState::~PerfmonState() {
-    DEBUG_ASSERT(!atomic_load(&perfmon_active));
-    if (cpu_data) {
-        for (unsigned cpu = 0; cpu < num_cpus; ++cpu) {
-            auto data = &cpu_data[cpu];
-            data->~PerfmonCpuData();
-        }
-        free(cpu_data);
-    }
-}
+        : PerfmonStateBase(n_cpus) {}
 
 static bool x86_perfmon_have_mchbar_data() {
     uint32_t vendor_id, device_id;
@@ -434,7 +393,7 @@ static void x86_perfmon_init_mchbar() {
         // See PCI spec 6.2.5.1.
         perfmon_mchbar_bar = bar & ~15u;
         perfmon_num_misc_events =
-            static_cast<uint32_t>(fbl::count_of(static_cast<zx_x86_pmu_config_t*>(nullptr)->misc_ids));
+            static_cast<uint32_t>(fbl::count_of(static_cast<ArchPmuConfig*>(nullptr)->misc_events));
     } else {
         TRACEF("perfmon: error %d reading mchbar\n", status);
     }
@@ -529,7 +488,7 @@ static void x86_perfmon_init_once(uint level)
             (1ul << perfmon_fixed_counter_width) - 1;
     }
 
-    supports_perfmon = perfmon_version >= MINIMUM_PERFMON_VERSION;
+    perfmon_supported = perfmon_version >= MINIMUM_INTEL_PERFMON_VERSION;
 
     if (x86_feature_test(X86_FEATURE_PDCM)) {
         perfmon_capabilities = static_cast<uint32_t>(read_msr(IA32_PERF_CAPABILITIES));
@@ -560,10 +519,10 @@ static void x86_perfmon_init_once(uint level)
     unsigned lbr_stack_size = x86_perfmon_lbr_stack_size();
     if (lbr_stack_size != 0) {
         // Don't crash if the h/w supports more than we do, just clip it.
-        if (lbr_stack_size > CPUPERF_MAX_NUM_LAST_BRANCH) {
+        if (lbr_stack_size > perfmon::LastBranchRecord::kMaxNumLastBranch) {
             TRACEF("WARNING: H/W LBR stack size is %u, clipping to %u\n",
-                   lbr_stack_size, CPUPERF_MAX_NUM_LAST_BRANCH);
-            lbr_stack_size = CPUPERF_MAX_NUM_LAST_BRANCH;
+                   lbr_stack_size, perfmon::LastBranchRecord::kMaxNumLastBranch);
+            lbr_stack_size = perfmon::LastBranchRecord::kMaxNumLastBranch;
         }
         x86_perfmon_init_lbr(lbr_stack_size);
     }
@@ -571,7 +530,7 @@ static void x86_perfmon_init_once(uint level)
     printf("PMU: version %u\n", perfmon_version);
 }
 
-LK_INIT_HOOK(x86_perfmon, x86_perfmon_init_once, LK_INIT_LEVEL_ARCH);
+LK_INIT_HOOK(x86_perfmon, x86_perfmon_init_once, LK_INIT_LEVEL_ARCH)
 
 static void x86_perfmon_clear_overflow_indicators() {
     uint64_t value = (IA32_PERF_GLOBAL_OVF_CTRL_CLR_COND_CHGD_MASK |
@@ -592,10 +551,10 @@ static void x86_perfmon_clear_overflow_indicators() {
 
 // Return the h/w register number for fixed event id |id|
 // or IPM_MAX_FIXED_COUNTERS if not found.
-static unsigned x86_perfmon_lookup_fixed_counter(cpuperf_event_id_t id) {
-    if (CPUPERF_EVENT_ID_GROUP(id) != CPUPERF_GROUP_FIXED)
+static unsigned x86_perfmon_lookup_fixed_counter(PmuEventId id) {
+    if (perfmon::GetEventIdGroup(id) != perfmon::kGroupFixed)
         return IPM_MAX_FIXED_COUNTERS;
-    switch (CPUPERF_EVENT_ID_EVENT(id)) {
+    switch (perfmon::GetEventIdEvent(id)) {
 #define DEF_FIXED_EVENT(symbol, event_name, id, regnum, flags, readable_name, description) \
     case id: return regnum;
 #include <lib/zircon-internal/device/cpu-trace/intel-pm-events.inc>
@@ -607,92 +566,37 @@ size_t get_max_space_needed_for_all_records(PerfmonState* state) {
     size_t num_events = (state->num_used_programmable +
                          state->num_used_fixed +
                          state->num_used_misc);
-    size_t space_needed = (sizeof(cpuperf_time_record_t) +
+    size_t space_needed = (sizeof(perfmon::TimeRecord) +
                            num_events * kMaxEventRecordSize);
     if (state->request_lbr_record)
-        space_needed += sizeof(cpuperf_last_branch_record_t);
+        space_needed += sizeof(perfmon::LastBranchRecord);
     return space_needed;
 }
 
-static void x86_perfmon_write_header(cpuperf_record_header_t* hdr,
-                                     cpuperf_record_type_t type,
-                                     cpuperf_event_id_t event) {
-    hdr->type = type;
-    hdr->reserved_flags = 0;
-    hdr->event = event;
-}
+zx_status_t arch_perfmon_get_properties(ArchPmuProperties* props) {
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-static cpuperf_record_header_t* x86_perfmon_write_time_record(
-        cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t event, zx_time_t time) {
-    auto rec = reinterpret_cast<cpuperf_time_record_t*>(hdr);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_TIME, event);
-    rec->time = time;
-    ++rec;
-    return reinterpret_cast<cpuperf_record_header_t*>(rec);
-}
-
-static cpuperf_record_header_t* x86_perfmon_write_tick_record(
-        cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t event) {
-    auto rec = reinterpret_cast<cpuperf_tick_record_t*>(hdr);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_TICK, event);
-    ++rec;
-    return reinterpret_cast<cpuperf_record_header_t*>(rec);
-}
-
-static cpuperf_record_header_t* x86_perfmon_write_count_record(
-        cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t event, uint64_t count) {
-    auto rec = reinterpret_cast<cpuperf_count_record_t*>(hdr);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_COUNT, event);
-    rec->count = count;
-    ++rec;
-    return reinterpret_cast<cpuperf_record_header_t*>(rec);
-}
-
-static cpuperf_record_header_t* x86_perfmon_write_value_record(
-        cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t event, uint64_t value) {
-    auto rec = reinterpret_cast<cpuperf_value_record_t*>(hdr);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_VALUE, event);
-    rec->value = value;
-    ++rec;
-    return reinterpret_cast<cpuperf_record_header_t*>(rec);
-}
-
-static cpuperf_record_header_t* x86_perfmon_write_pc_record(
-        cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t event, uint64_t cr3, uint64_t pc) {
-    auto rec = reinterpret_cast<cpuperf_pc_record_t*>(hdr);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_PC, event);
-    rec->aspace = cr3;
-    rec->pc = pc;
-    ++rec;
-    return reinterpret_cast<cpuperf_record_header_t*>(rec);
-}
-
-zx_status_t arch_perfmon_get_properties(zx_x86_pmu_properties_t* props) {
-    fbl::AutoLock al(&perfmon_lock);
-
-    if (!supports_perfmon)
+    if (!perfmon_supported)
         return ZX_ERR_NOT_SUPPORTED;
-    memset(props, 0, sizeof(*props));
+
+    *props = {};
     props->pm_version = perfmon_version;
-    props->num_fixed_events = perfmon_num_fixed_counters;
-    props->num_programmable_events = perfmon_num_programmable_counters;
-    props->num_misc_events = perfmon_num_misc_events;
-    props->fixed_counter_width = perfmon_fixed_counter_width;
-    props->programmable_counter_width = perfmon_programmable_counter_width;
+    props->max_num_fixed_events = perfmon_num_fixed_counters;
+    props->max_num_programmable_events = perfmon_num_programmable_counters;
+    props->max_num_misc_events = perfmon_num_misc_events;
+    props->max_fixed_counter_width = perfmon_fixed_counter_width;
+    props->max_programmable_counter_width = perfmon_programmable_counter_width;
+    props->max_misc_counter_width = perfmon_misc_counter_width;
     props->perf_capabilities = perfmon_capabilities;
     props->lbr_stack_size = perfmon_lbr_stack_size;
+
     return ZX_OK;
 }
 
 zx_status_t arch_perfmon_init() {
-    fbl::AutoLock al(&perfmon_lock);
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-    if (!supports_perfmon)
+    if (!perfmon_supported)
         return ZX_ERR_NOT_SUPPORTED;
     if (atomic_load(&perfmon_active))
         return ZX_ERR_BAD_STATE;
@@ -709,9 +613,9 @@ zx_status_t arch_perfmon_init() {
 }
 
 zx_status_t arch_perfmon_assign_buffer(uint32_t cpu, fbl::RefPtr<VmObject> vmo) {
-    fbl::AutoLock al(&perfmon_lock);
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-    if (!supports_perfmon)
+    if (!perfmon_supported)
         return ZX_ERR_NOT_SUPPORTED;
     if (atomic_load(&perfmon_active))
         return ZX_ERR_BAD_STATE;
@@ -721,9 +625,9 @@ zx_status_t arch_perfmon_assign_buffer(uint32_t cpu, fbl::RefPtr<VmObject> vmo) 
         return ZX_ERR_INVALID_ARGS;
 
     // A simple safe approximation of the minimum size needed.
-    size_t min_size_needed = sizeof(cpuperf_buffer_header_t);
-    min_size_needed += sizeof(cpuperf_time_record_t);
-    min_size_needed += CPUPERF_MAX_EVENTS * kMaxEventRecordSize;
+    size_t min_size_needed = sizeof(perfmon::BufferHeader);
+    min_size_needed += sizeof(perfmon::TimeRecord);
+    min_size_needed += perfmon::kMaxNumEvents * kMaxEventRecordSize;
     if (vmo->size() < min_size_needed)
         return ZX_ERR_INVALID_ARGS;
 
@@ -736,7 +640,7 @@ zx_status_t arch_perfmon_assign_buffer(uint32_t cpu, fbl::RefPtr<VmObject> vmo) 
 }
 
 static zx_status_t x86_perfmon_verify_control_config(
-        const zx_x86_pmu_config_t* config) {
+        const ArchPmuConfig* config) {
 #if TRY_FREEZE_ON_PMI
     if (!(config->debug_ctrl & IA32_DEBUGCTL_FREEZE_PERFMON_ON_PMI_MASK)) {
         // IWBN to pass back a hint, instead of either nothing or
@@ -768,11 +672,11 @@ static zx_status_t x86_perfmon_verify_control_config(
 }
 
 static zx_status_t x86_perfmon_verify_fixed_config(
-        const zx_x86_pmu_config_t* config, unsigned* out_num_used) {
+        const ArchPmuConfig* config, unsigned* out_num_used) {
     bool seen_last = false;
     unsigned num_used = perfmon_num_fixed_counters;
     for (unsigned i = 0; i < perfmon_num_fixed_counters; ++i) {
-        cpuperf_event_id_t id = config->fixed_ids[i];
+        PmuEventId id = config->fixed_events[i];
         if (id != 0 && seen_last) {
             TRACEF("Active fixed events not front-filled\n");
             return ZX_ERR_INVALID_ARGS;
@@ -800,24 +704,24 @@ static zx_status_t x86_perfmon_verify_fixed_config(
                 TRACEF("Initial value too large for |fixed_initial_value[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
-            if (config->fixed_flags[i] & ~IPM_CONFIG_FLAG_MASK) {
+            if (config->fixed_flags[i] & ~perfmon::kPmuConfigFlagMask) {
                 TRACEF("Unused bits set in |fixed_flags[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             if (!x86_perfmon_lbr_is_supported() &&
-                (config->fixed_flags[i] & IPM_CONFIG_FLAG_LBR) != 0) {
+                (config->fixed_flags[i] & perfmon::kPmuConfigFlagLastBranch) != 0) {
                 TRACEF("Last branch records requested for |fixed_flags[%u]|,"
                        " but not supported\n", i);
                 return ZX_ERR_NOT_SUPPORTED;
             }
-            if ((config->fixed_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
-                    config->timebase_id == CPUPERF_EVENT_ID_NONE) {
+            if ((config->fixed_flags[i] & perfmon::kPmuConfigFlagUsesTimebase) &&
+                    config->timebase_event == perfmon::kEventIdNone) {
                 TRACEF("Timebase requested for |fixed_flags[%u]|, but not provided\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             unsigned hw_regnum = x86_perfmon_lookup_fixed_counter(id);
             if (hw_regnum == IPM_MAX_FIXED_COUNTERS) {
-                TRACEF("Invalid fixed counter id |fixed_ids[%u]|\n", i);
+                TRACEF("Invalid fixed counter id |fixed_events[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
         }
@@ -828,11 +732,11 @@ static zx_status_t x86_perfmon_verify_fixed_config(
 }
 
 static zx_status_t x86_perfmon_verify_programmable_config(
-        const zx_x86_pmu_config_t* config, unsigned* out_num_used) {
+        const ArchPmuConfig* config, unsigned* out_num_used) {
     bool seen_last = false;
     unsigned num_used = perfmon_num_programmable_counters;
     for (unsigned i = 0; i < perfmon_num_programmable_counters; ++i) {
-        cpuperf_event_id_t id = config->programmable_ids[i];
+        PmuEventId id = config->programmable_events[i];
         if (id != 0 && seen_last) {
             TRACEF("Active programmable events not front-filled\n");
             return ZX_ERR_INVALID_ARGS;
@@ -847,8 +751,8 @@ static zx_status_t x86_perfmon_verify_programmable_config(
             seen_last = true;
         }
         if (seen_last) {
-            if (config->programmable_events[i] != 0) {
-                TRACEF("Unused |programmable_events[%u]| not zero\n", i);
+            if (config->programmable_hw_events[i] != 0) {
+                TRACEF("Unused |programmable_hw_events[%u]| not zero\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             if (config->programmable_initial_value[i] != 0) {
@@ -860,26 +764,26 @@ static zx_status_t x86_perfmon_verify_programmable_config(
                 return ZX_ERR_INVALID_ARGS;
             }
         } else {
-            if (config->programmable_events[i] & ~kEventSelectWritableBits) {
-                TRACEF("Non writable bits set in |programmable_events[%u]|\n", i);
+            if (config->programmable_hw_events[i] & ~kEventSelectWritableBits) {
+                TRACEF("Non writable bits set in |programmable_hw_events[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             if (config->programmable_initial_value[i] > perfmon_max_programmable_counter_value) {
                 TRACEF("Initial value too large for |programmable_initial_value[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
-            if (config->programmable_flags[i] & ~IPM_CONFIG_FLAG_MASK) {
+            if (config->programmable_flags[i] & ~perfmon::kPmuConfigFlagMask) {
                 TRACEF("Unused bits set in |programmable_flags[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             if (!x86_perfmon_lbr_is_supported() &&
-                (config->programmable_flags[i] & IPM_CONFIG_FLAG_LBR) != 0) {
+                (config->programmable_flags[i] & perfmon::kPmuConfigFlagLastBranch) != 0) {
                 TRACEF("Last branch records requested for |programmable_flags[%u]|,"
                        " but not supported\n", i);
                 return ZX_ERR_NOT_SUPPORTED;
             }
-            if ((config->programmable_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
-                    config->timebase_id == CPUPERF_EVENT_ID_NONE) {
+            if ((config->programmable_flags[i] & perfmon::kPmuConfigFlagUsesTimebase) &&
+                    config->timebase_event == perfmon::kEventIdNone) {
                 TRACEF("Timebase requested for |programmable_flags[%u]|, but not provided\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
@@ -891,13 +795,13 @@ static zx_status_t x86_perfmon_verify_programmable_config(
 }
 
 static zx_status_t x86_perfmon_verify_misc_config(
-        const zx_x86_pmu_config_t* config,
+        const ArchPmuConfig* config,
         unsigned* out_num_used) {
     bool seen_last = false;
-    size_t max_num_used = fbl::count_of(config->misc_ids);
+    size_t max_num_used = fbl::count_of(config->misc_events);
     size_t num_used = max_num_used;
     for (size_t i = 0; i < max_num_used; ++i) {
-        cpuperf_event_id_t id = config->misc_ids[i];
+        PmuEventId id = config->misc_events[i];
         if (id != 0 && seen_last) {
             TRACEF("Active misc events not front-filled\n");
             return ZX_ERR_INVALID_ARGS;
@@ -913,28 +817,29 @@ static zx_status_t x86_perfmon_verify_misc_config(
                 return ZX_ERR_INVALID_ARGS;
             }
         } else {
-            if (config->misc_flags[i] & ~IPM_CONFIG_FLAG_MASK) {
+            if (config->misc_flags[i] & ~perfmon::kPmuConfigFlagMask) {
                 TRACEF("Unused bits set in |misc_flags[%zu]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             // Currently we only support the MCHBAR events.
             // They cannot provide pc. We ignore the OS/USER bits.
-            if (config->misc_flags[i] & (IPM_CONFIG_FLAG_PC | IPM_CONFIG_FLAG_LBR)) {
+            if (config->misc_flags[i] & (perfmon::kPmuConfigFlagPc |
+                                         perfmon::kPmuConfigFlagLastBranch)) {
                 TRACEF("Invalid bits (0x%x) in |misc_flags[%zu]|\n",
                        config->misc_flags[i], i);
                 return ZX_ERR_INVALID_ARGS;
             }
-            if ((config->misc_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
-                    config->timebase_id == CPUPERF_EVENT_ID_NONE) {
+            if ((config->misc_flags[i] & perfmon::kPmuConfigFlagUsesTimebase) &&
+                    config->timebase_event == perfmon::kEventIdNone) {
                 TRACEF("Timebase requested for |misc_flags[%zu]|, but not provided\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
-            switch (CPUPERF_EVENT_ID_EVENT(id)) {
+            switch (perfmon::GetEventIdEvent(id)) {
 #define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
             case id: break;
 #include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
             default:
-                TRACEF("Invalid misc event id |misc_ids[%zu]|\n", i);
+                TRACEF("Invalid misc event id |misc_events[%zu]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
         }
@@ -945,33 +850,33 @@ static zx_status_t x86_perfmon_verify_misc_config(
 }
 
 static zx_status_t x86_perfmon_verify_timebase_config(
-        zx_x86_pmu_config_t* config,
+        ArchPmuConfig* config,
         unsigned num_fixed, unsigned num_programmable) {
-    if (config->timebase_id == CPUPERF_EVENT_ID_NONE) {
+    if (config->timebase_event == perfmon::kEventIdNone) {
         return ZX_OK;
     }
 
     for (unsigned i = 0; i < num_fixed; ++i) {
-        if (config->fixed_ids[i] == config->timebase_id) {
+        if (config->fixed_events[i] == config->timebase_event) {
             // The PMI code is simpler if this is the case.
-            config->fixed_flags[i] &= ~IPM_CONFIG_FLAG_TIMEBASE;
+            config->fixed_flags[i] &= ~perfmon::kPmuConfigFlagUsesTimebase;
             return ZX_OK;
         }
     }
 
     for (unsigned i = 0; i < num_programmable; ++i) {
-        if (config->programmable_ids[i] == config->timebase_id) {
+        if (config->programmable_events[i] == config->timebase_event) {
             // The PMI code is simpler if this is the case.
-            config->programmable_flags[i] &= ~IPM_CONFIG_FLAG_TIMEBASE;
+            config->programmable_flags[i] &= ~perfmon::kPmuConfigFlagUsesTimebase;
             return ZX_OK;
         }
     }
 
-    TRACEF("Timebase 0x%x requested but not present\n", config->timebase_id);
+    TRACEF("Timebase 0x%x requested but not present\n", config->timebase_event);
     return ZX_ERR_INVALID_ARGS;
 }
 
-static zx_status_t x86_perfmon_verify_config(zx_x86_pmu_config_t* config,
+static zx_status_t x86_perfmon_verify_config(ArchPmuConfig* config,
                                              PerfmonState* state) {
     auto status = x86_perfmon_verify_control_config(config);
     if (status != ZX_OK)
@@ -1004,12 +909,12 @@ static zx_status_t x86_perfmon_verify_config(zx_x86_pmu_config_t* config,
     return ZX_OK;
 }
 
-static void x86_perfmon_stage_fixed_config(const zx_x86_pmu_config_t* config,
+static void x86_perfmon_stage_fixed_config(const ArchPmuConfig* config,
                                            PerfmonState* state) {
-    static_assert(sizeof(state->fixed_ids) ==
-                  sizeof(config->fixed_ids), "");
-    memcpy(state->fixed_ids, config->fixed_ids,
-           sizeof(state->fixed_ids));
+    static_assert(sizeof(state->fixed_events) ==
+                  sizeof(config->fixed_events), "");
+    memcpy(state->fixed_events, config->fixed_events,
+           sizeof(state->fixed_events));
 
     static_assert(sizeof(state->fixed_initial_value) ==
                   sizeof(config->fixed_initial_value), "");
@@ -1022,16 +927,16 @@ static void x86_perfmon_stage_fixed_config(const zx_x86_pmu_config_t* config,
            sizeof(state->fixed_flags));
 
     for (unsigned i = 0; i < fbl::count_of(state->fixed_hw_map); ++i) {
-        state->fixed_hw_map[i] = x86_perfmon_lookup_fixed_counter(config->fixed_ids[i]);
+        state->fixed_hw_map[i] = x86_perfmon_lookup_fixed_counter(config->fixed_events[i]);
     }
 }
 
 static void x86_perfmon_stage_programmable_config(
-        const zx_x86_pmu_config_t* config, PerfmonState* state) {
-    static_assert(sizeof(state->programmable_ids) ==
-                  sizeof(config->programmable_ids), "");
-    memcpy(state->programmable_ids, config->programmable_ids,
-           sizeof(state->programmable_ids));
+        const ArchPmuConfig* config, PerfmonState* state) {
+    static_assert(sizeof(state->programmable_events) ==
+                  sizeof(config->programmable_events), "");
+    memcpy(state->programmable_events, config->programmable_events,
+           sizeof(state->programmable_events));
 
     static_assert(sizeof(state->programmable_initial_value) ==
                   sizeof(config->programmable_initial_value), "");
@@ -1043,17 +948,18 @@ static void x86_perfmon_stage_programmable_config(
     memcpy(state->programmable_flags, config->programmable_flags,
            sizeof(state->programmable_flags));
 
-    static_assert(sizeof(state->events) ==
-                  sizeof(config->programmable_events), "");
-    memcpy(state->events, config->programmable_events, sizeof(state->events));
+    static_assert(sizeof(state->programmable_hw_events) ==
+                  sizeof(config->programmable_hw_events), "");
+    memcpy(state->programmable_hw_events, config->programmable_hw_events,
+           sizeof(state->programmable_hw_events));
 }
 
-static void x86_perfmon_stage_misc_config(const zx_x86_pmu_config_t* config,
+static void x86_perfmon_stage_misc_config(const ArchPmuConfig* config,
                                           PerfmonState* state) {
-    static_assert(sizeof(state->misc_ids) ==
-                  sizeof(config->misc_ids), "");
-    memcpy(state->misc_ids, config->misc_ids,
-           sizeof(state->misc_ids));
+    static_assert(sizeof(state->misc_events) ==
+                  sizeof(config->misc_events), "");
+    memcpy(state->misc_events, config->misc_events,
+           sizeof(state->misc_events));
 
     static_assert(sizeof(state->misc_flags) ==
                   sizeof(config->misc_flags), "");
@@ -1064,7 +970,7 @@ static void x86_perfmon_stage_misc_config(const zx_x86_pmu_config_t* config,
     for (unsigned i = 0; i < state->num_used_misc; ++i) {
         // All misc events currently come from MCHBAR.
         // When needed we can add a flag to the event to denote origin.
-        switch (CPUPERF_EVENT_ID_EVENT(state->misc_ids[i])) {
+        switch (perfmon::GetEventIdEvent(state->misc_events[i])) {
 #define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
         case id:
 #include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
@@ -1084,10 +990,10 @@ static void x86_perfmon_stage_misc_config(const zx_x86_pmu_config_t* config,
 // Stage the configuration for later activation by START.
 // One of the main goals of this function is to verify the provided config
 // is ok, e.g., it won't cause us to crash.
-zx_status_t arch_perfmon_stage_config(zx_x86_pmu_config_t* config) {
-    fbl::AutoLock al(&perfmon_lock);
+zx_status_t arch_perfmon_stage_config(ArchPmuConfig* config) {
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-    if (!supports_perfmon)
+    if (!perfmon_supported)
         return ZX_ERR_NOT_SUPPORTED;
     if (atomic_load(&perfmon_active))
         return ZX_ERR_BAD_STATE;
@@ -1107,7 +1013,7 @@ zx_status_t arch_perfmon_stage_config(zx_x86_pmu_config_t* config) {
     state->global_ctrl = config->global_ctrl;
     state->fixed_ctrl = config->fixed_ctrl;
     state->debug_ctrl = config->debug_ctrl;
-    state->timebase_id = config->timebase_id;
+    state->timebase_event = config->timebase_event;
 
     if (state->debug_ctrl & IA32_DEBUGCTL_LBR_MASK) {
         if (!x86_perfmon_lbr_is_supported()) {
@@ -1134,8 +1040,8 @@ zx_status_t arch_perfmon_stage_config(zx_x86_pmu_config_t* config) {
 struct ReadMiscResult {
     // The value of the register.
     uint64_t value;
-    // The record type to use, either CPUPERF_RECORD_COUNT or
-    // CPUPERF_RECORD_VALUE.
+    // The record type to use, either |perfmon::kRecordTypeCount| or
+    // |perfmon::kRecordTypeValue|.
     uint8_t type;
 };
 
@@ -1182,18 +1088,18 @@ static uint32_t read_mc_value32(volatile uint32_t* addr) {
 static ReadMiscResult read_mc_typed_counter32(volatile uint32_t* addr,
                                               uint32_t* last_value_addr) {
     return ReadMiscResult{
-        read_mc_counter32(addr, last_value_addr), CPUPERF_RECORD_COUNT};
+        read_mc_counter32(addr, last_value_addr), perfmon::kRecordTypeCount};
 }
 
 static ReadMiscResult read_mc_typed_counter64(volatile uint64_t* addr,
                                               uint64_t* last_value_addr) {
     return ReadMiscResult{
-        read_mc_counter64(addr, last_value_addr), CPUPERF_RECORD_COUNT};
+        read_mc_counter64(addr, last_value_addr), perfmon::kRecordTypeCount};
 }
 
 static ReadMiscResult read_mc_typed_value32(volatile uint32_t* addr) {
     return ReadMiscResult{
-        read_mc_value32(addr), CPUPERF_RECORD_VALUE};
+        read_mc_value32(addr), perfmon::kRecordTypeValue};
 }
 
 static volatile uint32_t* get_mc_addr32(PerfmonState* state,
@@ -1216,7 +1122,7 @@ static ReadMiscResult read_mc_bytes_read(PerfmonState* state) {
         &state->mchbar_data.last_mem.bytes_read);
     // Return the value in bytes, easier for human readers of the
     // resulting report.
-    return ReadMiscResult{value * 64ul, CPUPERF_RECORD_COUNT};
+    return ReadMiscResult{value * 64ul, perfmon::kRecordTypeCount};
 }
 
 static ReadMiscResult read_mc_bytes_written(PerfmonState* state) {
@@ -1225,7 +1131,7 @@ static ReadMiscResult read_mc_bytes_written(PerfmonState* state) {
         &state->mchbar_data.last_mem.bytes_written);
     // Return the value in bytes, easier for human readers of the
     // resulting report.
-    return ReadMiscResult{value * 64ul, CPUPERF_RECORD_COUNT};
+    return ReadMiscResult{value * 64ul, perfmon::kRecordTypeCount};
 }
 
 static ReadMiscResult read_mc_gt_requests(PerfmonState* state) {
@@ -1285,7 +1191,7 @@ static ReadMiscResult read_mc_active_gt_engine_cycles(PerfmonState* state) {
 static ReadMiscResult read_mc_peci_therm_margin(PerfmonState* state) {
     uint32_t value = read_mc_value32(
                 get_mc_addr32(state, MISC_PKG_PECI_THERM_MARGIN_OFFSET));
-    return ReadMiscResult{value & 0xffff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xffff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_rapl_perf_status(PerfmonState* state) {
@@ -1301,7 +1207,7 @@ static ReadMiscResult read_mc_ia_freq_clamping_reasons(PerfmonState* state) {
         (1u << 15) | (1u << 14) | (1u << 9)  | (1u << 3)  | (1u << 2);
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_IA_FREQ_CLAMPING_REASONS_OFFSET));
-    return ReadMiscResult{value & ~kReserved, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & ~kReserved, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_gt_freq_clamping_reasons(PerfmonState* state) {
@@ -1313,7 +1219,7 @@ static ReadMiscResult read_mc_gt_freq_clamping_reasons(PerfmonState* state) {
         (1u << 9)  | (1u << 4)  | (1u << 3)  | (1u << 2);
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_GT_FREQ_CLAMPING_REASONS_OFFSET));
-    return ReadMiscResult{value & ~kReserved, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & ~kReserved, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_rp_slice_freq(PerfmonState* state) {
@@ -1323,7 +1229,7 @@ static ReadMiscResult read_mc_rp_slice_freq(PerfmonState* state) {
     // Convert the value to Mhz.
     // We can't do floating point, and this doesn't have to be perfect.
     uint64_t scaled_value = value * 16667ul / 1000 /*16.667*/;
-    return ReadMiscResult{scaled_value, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{scaled_value, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_rp_unslice_freq(PerfmonState* state) {
@@ -1333,41 +1239,41 @@ static ReadMiscResult read_mc_rp_unslice_freq(PerfmonState* state) {
     // Convert the value to Mhz.
     // We can't do floating point, and this doesn't have to be perfect.
     uint64_t scaled_value = value * 16667ul / 1000 /*16.667*/;
-    return ReadMiscResult{scaled_value, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{scaled_value, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_rp_gt_volt(PerfmonState* state) {
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_RP_GT_VOLT_OFFSET));
-    return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_edram_temp(PerfmonState* state) {
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_EDRAM_TEMP_OFFSET));
-    return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_pkg_temp(PerfmonState* state) {
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_PKG_TEMP_OFFSET));
-    return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_ia_temp(PerfmonState* state) {
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_IA_TEMP_OFFSET));
-    return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_mc_gt_temp(PerfmonState* state) {
     uint32_t value = read_mc_value32(
         get_mc_addr32(state, MISC_PKG_GT_TEMP_OFFSET));
-    return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
+    return ReadMiscResult{value & 0xff, perfmon::kRecordTypeValue};
 }
 
 static ReadMiscResult read_misc_event(PerfmonState* state,
-                                      cpuperf_event_id_t id) {
+                                      PmuEventId id) {
     switch (id) {
     case MISC_MEM_BYTES_READ_ID:
         return read_mc_bytes_read(state);
@@ -1538,19 +1444,19 @@ static zx_status_t x86_perfmon_map_buffers_locked(PerfmonState* state) {
             data->buffer_mapping.reset();
             break;
         }
-        data->buffer_start = reinterpret_cast<cpuperf_buffer_header_t*>(
+        data->buffer_start = reinterpret_cast<perfmon::BufferHeader*>(
             data->buffer_mapping->base() + vmo_offset);
         data->buffer_end = reinterpret_cast<char*>(data->buffer_start) + size;
         LTRACEF("buffer mapped: cpu %u, start %p, end %p\n",
                 cpu, data->buffer_start, data->buffer_end);
 
         auto hdr = data->buffer_start;
-        hdr->version = CPUPERF_BUFFER_VERSION;
-        hdr->arch = CPUPERF_BUFFER_ARCH_X86_64;
+        hdr->version = perfmon::kBufferVersion;
+        hdr->arch = perfmon::kArchX64;
         hdr->flags = 0;
         hdr->ticks_per_second = ticks_per_second();
         hdr->capture_end = sizeof(*hdr);
-        data->buffer_next = reinterpret_cast<cpuperf_record_header_t*>(
+        data->buffer_next = reinterpret_cast<perfmon::RecordHeader*>(
             reinterpret_cast<char*>(data->buffer_start) + hdr->capture_end);
     }
 
@@ -1586,7 +1492,7 @@ static void x86_perfmon_start_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_AN
         write_msr(IA32_PERFEVTSEL_FIRST + i, 0);
         // The counter must be written before PERFEVTSEL.EN is set to 1.
         write_msr(IA32_PMC_FIRST + i, state->programmable_initial_value[i]);
-        write_msr(IA32_PERFEVTSEL_FIRST + i, state->events[i]);
+        write_msr(IA32_PERFEVTSEL_FIRST + i, state->programmable_hw_events[i]);
     }
 
     write_msr(IA32_DEBUGCTL, state->debug_ctrl);
@@ -1595,20 +1501,26 @@ static void x86_perfmon_start_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_AN
 
     // Enable counters as late as possible so that our setup doesn't contribute
     // to the data.
-    write_msr(IA32_PERF_GLOBAL_CTRL, state->global_ctrl);
+    enable_counters(state);
 }
 
 // Begin collecting data.
 
 zx_status_t arch_perfmon_start() {
-    fbl::AutoLock al(&perfmon_lock);
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-    if (!supports_perfmon)
+    if (!perfmon_supported)
         return ZX_ERR_NOT_SUPPORTED;
     if (atomic_load(&perfmon_active))
         return ZX_ERR_BAD_STATE;
     if (!perfmon_state)
         return ZX_ERR_BAD_STATE;
+
+    // Make sure all relevant sysregs have been wiped clean.
+    if (!perfmon_hw_initialized) {
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, x86_perfmon_reset_task, nullptr);
+        perfmon_hw_initialized = true;
+    }
 
     // Sanity check the buffers and map them in.
     // This is deferred until now so that they are mapped in as minimally as
@@ -1633,7 +1545,7 @@ zx_status_t arch_perfmon_start() {
         }
         for (unsigned i = 0; i < state->num_used_programmable; ++i) {
             LTRACEF("programmable[%u]: id 0x%x, initial 0x%" PRIx64 "\n",
-                    i, state->programmable_ids[i],
+                    i, state->programmable_events[i],
                     state->programmable_initial_value[i]);
         }
     }
@@ -1647,10 +1559,10 @@ zx_status_t arch_perfmon_start() {
 // This is invoked via mp_sync_exec which thread safety analysis cannot follow.
 static void x86_perfmon_write_last_records(PerfmonState* state, uint32_t cpu) TA_NO_THREAD_SAFETY_ANALYSIS {
     PerfmonCpuData* data = &state->cpu_data[cpu];
-    cpuperf_record_header_t* next = data->buffer_next;
+    perfmon::RecordHeader* next = data->buffer_next;
 
     zx_time_t now = rdtsc();
-    next = x86_perfmon_write_time_record(next, CPUPERF_EVENT_ID_NONE, now);
+    next = arch_perfmon_write_time_record(next, perfmon::kEventIdNone, now);
 
     // If the counter triggers interrupts then the PMI handler will
     // continually reset it to its initial value. To keep things simple
@@ -1666,7 +1578,7 @@ static void x86_perfmon_write_last_records(PerfmonState* state, uint32_t cpu) TA
     // an overflowed value here, but that's what I'm seeing.
 
     for (unsigned i = 0; i < state->num_used_programmable; ++i) {
-        cpuperf_event_id_t id = state->programmable_ids[i];
+        PmuEventId id = state->programmable_events[i];
         DEBUG_ASSERT(id != 0);
         uint64_t count = read_msr(IA32_PMC_FIRST + i);
         if (count >= state->programmable_initial_value[i]) {
@@ -1676,10 +1588,10 @@ static void x86_perfmon_write_last_records(PerfmonState* state, uint32_t cpu) TA
             count += (perfmon_max_programmable_counter_value -
                       state->programmable_initial_value[i] + 1);
         }
-        next = x86_perfmon_write_count_record(next, id, count);
+        next = arch_perfmon_write_count_record(next, id, count);
     }
     for (unsigned i = 0; i < state->num_used_fixed; ++i) {
-        cpuperf_event_id_t id = state->fixed_ids[i];
+        PmuEventId id = state->fixed_events[i];
         DEBUG_ASSERT(id != 0);
         unsigned hw_num = state->fixed_hw_map[i];
         DEBUG_ASSERT(hw_num < perfmon_num_fixed_counters);
@@ -1691,20 +1603,20 @@ static void x86_perfmon_write_last_records(PerfmonState* state, uint32_t cpu) TA
             count += (perfmon_max_fixed_counter_value -
                       state->fixed_initial_value[i] + 1);
         }
-        next = x86_perfmon_write_count_record(next, id, count);
+        next = arch_perfmon_write_count_record(next, id, count);
     }
     // Misc events are currently all non-cpu-specific.
     // Just report for cpu 0. See pmi_interrupt_handler.
     if (cpu == 0) {
         for (unsigned i = 0; i < state->num_used_misc; ++i) {
-            cpuperf_event_id_t id = state->misc_ids[i];
+            PmuEventId id = state->misc_events[i];
             ReadMiscResult typed_value = read_misc_event(state, id);
             switch (typed_value.type) {
-            case CPUPERF_RECORD_COUNT:
-                next = x86_perfmon_write_count_record(next, id, typed_value.value);
+            case perfmon::kRecordTypeCount:
+                next = arch_perfmon_write_count_record(next, id, typed_value.value);
                 break;
-            case CPUPERF_RECORD_VALUE:
-                next = x86_perfmon_write_value_record(next, id, typed_value.value);
+            case perfmon::kRecordTypeValue:
+                next = arch_perfmon_write_value_record(next, id, typed_value.value);
                 break;
             default:
                 __UNREACHABLE;
@@ -1720,14 +1632,14 @@ static void x86_perfmon_finalize_buffer(PerfmonState* state, uint32_t cpu) TA_NO
     LTRACEF("Collecting last data for cpu %u\n", cpu);
 
     PerfmonCpuData* data = &state->cpu_data[cpu];
-    cpuperf_buffer_header_t* hdr = data->buffer_start;
+    perfmon::BufferHeader* hdr = data->buffer_start;
 
     // KISS. There may be enough space to write some of what we want to write
     // here, but don't try. Just use the same simple check that
     // |pmi_interrupt_handler()| does.
     size_t space_needed = get_max_space_needed_for_all_records(state);
     if (reinterpret_cast<char*>(data->buffer_next) + space_needed > data->buffer_end) {
-        hdr->flags |= CPUPERF_BUFFER_FLAG_FULL;
+        hdr->flags |= perfmon::BufferHeader::kBufferFlagFull;
         LTRACEF("Buffer overflow on cpu %u\n", cpu);
     } else {
         x86_perfmon_write_last_records(state, cpu);
@@ -1741,7 +1653,7 @@ static void x86_perfmon_finalize_buffer(PerfmonState* state, uint32_t cpu) TA_NO
 // This is invoked via mp_sync_exec which thread safety analysis cannot follow.
 static void x86_perfmon_stop_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_ANALYSIS {
     // Disable all counters ASAP.
-    write_msr(IA32_PERF_GLOBAL_CTRL, 0);
+    disable_counters();
     apic_pmi_mask();
 
     DEBUG_ASSERT(arch_ints_disabled());
@@ -1761,16 +1673,19 @@ static void x86_perfmon_stop_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_ANA
     x86_perfmon_clear_overflow_indicators();
 }
 
-// Stop collecting data.
-// It's ok to call this multiple times.
-// Returns an error if called before ALLOC or after FREE.
-zx_status_t arch_perfmon_stop() {
-    fbl::AutoLock al(&perfmon_lock);
-
-    if (!supports_perfmon)
-        return ZX_ERR_NOT_SUPPORTED;
-    if (!perfmon_state)
-        return ZX_ERR_BAD_STATE;
+void arch_perfmon_stop_locked() TA_REQ(PerfmonLock::Get()) {
+    if (!perfmon_supported) {
+        // Nothing to do.
+        return;
+    }
+    if (!perfmon_state) {
+        // Nothing to do.
+        return;
+    }
+    if (!atomic_load(&perfmon_active)) {
+        // Nothing to do.
+        return;
+    }
 
     TRACEF("Disabling perfmon\n");
 
@@ -1788,8 +1703,12 @@ zx_status_t arch_perfmon_stop() {
     // Make sure to do this after we've turned everything off so that we
     // don't get another PMI after this.
     x86_perfmon_unmap_buffers_locked(state);
+}
 
-    return ZX_OK;
+// Stop collecting data.
+void arch_perfmon_stop() {
+    Guard<Mutex> guard(PerfmonLock::Get());
+    arch_perfmon_stop_locked();
 }
 
 // Worker for x86_perfmon_fini to be executed on all cpus.
@@ -1799,7 +1718,7 @@ static void x86_perfmon_reset_task(void* raw_context) TA_NO_THREAD_SAFETY_ANALYS
     DEBUG_ASSERT(!atomic_load(&perfmon_active));
     DEBUG_ASSERT(!raw_context);
 
-    write_msr(IA32_PERF_GLOBAL_CTRL, 0);
+    disable_counters();
     apic_pmi_mask();
     x86_perfmon_clear_overflow_indicators();
 
@@ -1818,35 +1737,37 @@ static void x86_perfmon_reset_task(void* raw_context) TA_NO_THREAD_SAFETY_ANALYS
 
 // Finish data collection, reset h/w back to initial state and undo
 // everything x86_perfmon_init did.
-// Must be called while tracing is stopped.
-// It's ok to call this multiple times.
-zx_status_t arch_perfmon_fini() {
-    fbl::AutoLock al(&perfmon_lock);
+void arch_perfmon_fini() {
+    Guard<Mutex> guard(PerfmonLock::Get());
 
-    if (!supports_perfmon)
-        return ZX_ERR_NOT_SUPPORTED;
-    if (atomic_load(&perfmon_active))
-        return ZX_ERR_BAD_STATE;
+    if (!perfmon_supported) {
+        // Nothing to do.
+        return;
+    }
+
+    if (atomic_load(&perfmon_active)) {
+        arch_perfmon_stop_locked();
+        DEBUG_ASSERT(!atomic_load(&perfmon_active));
+    }
 
     mp_sync_exec(MP_IPI_TARGET_ALL, 0, x86_perfmon_reset_task, nullptr);
 
     perfmon_state.reset();
-
-    return ZX_OK;
 }
 
 // Interrupt handling.
 
-// Write out a |cpuperf_last_branch_record_t| record.
-static cpuperf_record_header_t* x86_perfmon_write_last_branches(
-        PerfmonState* state, uint64_t cr3, cpuperf_record_header_t* hdr,
-        cpuperf_event_id_t id) {
-    auto rec = reinterpret_cast<cpuperf_last_branch_record_t*>(hdr);
+// Write out a |perfmon::LastBranchRecord| record.
+static perfmon::RecordHeader* x86_perfmon_write_last_branches(
+        PerfmonState* state, uint64_t cr3, perfmon::RecordHeader* hdr,
+        PmuEventId id) {
+    auto rec = reinterpret_cast<perfmon::LastBranchRecord*>(hdr);
     auto num_entries = perfmon_lbr_stack_size;
-    static_assert(CPUPERF_MAX_NUM_LAST_BRANCH ==
-                  countof(cpuperf_last_branch_record_t::branches), "");
-    DEBUG_ASSERT(num_entries > 0 && num_entries <= CPUPERF_MAX_NUM_LAST_BRANCH);
-    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_LAST_BRANCH, id);
+    static_assert(perfmon::LastBranchRecord::kMaxNumLastBranch ==
+                  countof(perfmon::LastBranchRecord::branches), "");
+    DEBUG_ASSERT(num_entries > 0 &&
+                 num_entries <= perfmon::LastBranchRecord::kMaxNumLastBranch);
+    arch_perfmon_write_header(&rec->header, perfmon::kRecordTypeLastBranch, id);
     rec->num_branches = num_entries;
     rec->aspace = cr3;
 
@@ -1865,8 +1786,8 @@ static cpuperf_record_header_t* x86_perfmon_write_last_branches(
 
     // Get a pointer to the end of this record. Since this record is
     // variable length it's more complicated than just "rec + 1".
-    auto next = reinterpret_cast<cpuperf_record_header_t*>(
-        reinterpret_cast<char*>(rec) + CPUPERF_LAST_BRANCH_RECORD_SIZE(rec));
+    auto next = reinterpret_cast<perfmon::RecordHeader*>(
+        reinterpret_cast<char*>(rec) + perfmon::LastBranchRecordSize(rec));
     LTRACEF("LBR record: num branches %u, @%p, next @%p\n",
             num_entries, hdr, next);
     return next;
@@ -1877,10 +1798,6 @@ static cpuperf_record_header_t* x86_perfmon_write_last_branches(
 // Returns true if success, false if buffer is full.
 
 static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
-    // This is done here instead of in the caller so that it is done *after*
-    // we disable the counters.
-    CPU_STATS_INC(perf_ints);
-
     uint cpu = arch_curr_cpu_num();
     auto data = &state->cpu_data[cpu];
 
@@ -1893,7 +1810,7 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
     size_t space_needed = get_max_space_needed_for_all_records(state);
     if (reinterpret_cast<char*>(data->buffer_next) + space_needed > data->buffer_end) {
         TRACEF("cpu %u: @%" PRIi64 " pmi buffer full\n", cpu, now);
-        data->buffer_start->flags |= CPUPERF_BUFFER_FLAG_FULL;
+        data->buffer_start->flags |= perfmon::BufferHeader::kBufferFlagFull;
         return false;
     }
 
@@ -1914,12 +1831,11 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
 
         auto next = data->buffer_next;
         bool saw_timebase = false;
-        bool request_lbr = false;
         // We can't record every event that requested LBR data.
         // It is unspecified which one we pick.
-        cpuperf_event_id_t lbr_id = CPUPERF_EVENT_ID_NONE;
+        PmuEventId lbr_id = perfmon::kEventIdNone;
 
-        next = x86_perfmon_write_time_record(next, CPUPERF_EVENT_ID_NONE, now);
+        next = arch_perfmon_write_time_record(next, perfmon::kEventIdNone, now);
 
         // Note: We don't write "value" records here instead prefering the
         // smaller "tick" record. If the user is tallying the counts the user
@@ -1930,22 +1846,21 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
         for (unsigned i = 0; i < state->num_used_programmable; ++i) {
             if (!(status & IA32_PERF_GLOBAL_STATUS_PMC_OVF_MASK(i)))
                 continue;
-            cpuperf_event_id_t id = state->programmable_ids[i];
+            PmuEventId id = state->programmable_events[i];
             // Counters using a separate timebase are handled below.
             // We shouldn't get an interrupt on a counter using a timebase.
             // TODO(dje): The counter could still overflow. Later.
-            if (id == state->timebase_id) {
+            if (id == state->timebase_event) {
                 saw_timebase = true;
-            } else if (state->programmable_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) {
+            } else if (state->programmable_flags[i] & perfmon::kPmuConfigFlagUsesTimebase) {
                 continue;
             }
-            if (state->programmable_flags[i] & IPM_CONFIG_FLAG_PC) {
-                next = x86_perfmon_write_pc_record(next, id, cr3, frame->ip);
+            if (state->programmable_flags[i] & perfmon::kPmuConfigFlagPc) {
+                next = arch_perfmon_write_pc_record(next, id, cr3, frame->ip);
             } else {
-                next = x86_perfmon_write_tick_record(next, id);
+                next = arch_perfmon_write_tick_record(next, id);
             }
-            if (state->programmable_flags[i] & IPM_CONFIG_FLAG_LBR) {
-                request_lbr = true;
+            if (state->programmable_flags[i] & perfmon::kPmuConfigFlagLastBranch) {
                 lbr_id = id;
             }
             LTRACEF("cpu %u: resetting PMC %u to 0x%" PRIx64 "\n",
@@ -1958,22 +1873,21 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
             DEBUG_ASSERT(hw_num < perfmon_num_fixed_counters);
             if (!(status & IA32_PERF_GLOBAL_STATUS_FIXED_OVF_MASK(hw_num)))
                 continue;
-            cpuperf_event_id_t id = state->fixed_ids[i];
+            PmuEventId id = state->fixed_events[i];
             // Counters using a separate timebase are handled below.
             // We shouldn't get an interrupt on a counter using a timebase.
             // TODO(dje): The counter could still overflow. Later.
-            if (id == state->timebase_id) {
+            if (id == state->timebase_event) {
                 saw_timebase = true;
-            } else if (state->fixed_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) {
+            } else if (state->fixed_flags[i] & perfmon::kPmuConfigFlagUsesTimebase) {
                 continue;
             }
-            if (state->fixed_flags[i] & IPM_CONFIG_FLAG_PC) {
-                next = x86_perfmon_write_pc_record(next, id, cr3, frame->ip);
+            if (state->fixed_flags[i] & perfmon::kPmuConfigFlagPc) {
+                next = arch_perfmon_write_pc_record(next, id, cr3, frame->ip);
             } else {
-                next = x86_perfmon_write_tick_record(next, id);
+                next = arch_perfmon_write_tick_record(next, id);
             }
-            if (state->fixed_flags[i] & IPM_CONFIG_FLAG_LBR) {
-                request_lbr = true;
+            if (state->fixed_flags[i] & perfmon::kPmuConfigFlagLastBranch) {
                 lbr_id = id;
             }
             LTRACEF("cpu %u: resetting FIXED %u to 0x%" PRIx64 "\n",
@@ -1983,14 +1897,14 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
 
         bits_to_clear |= perfmon_counter_status_bits;
 
-        // Now handle events that have IPM_CONFIG_FLAG_TIMEBASE set.
+        // Now handle events that have kPmuConfigFlagTimebase0 set.
         if (saw_timebase) {
             for (unsigned i = 0; i < state->num_used_programmable; ++i) {
-                if (!(state->programmable_flags[i] & IPM_CONFIG_FLAG_TIMEBASE))
+                if (!(state->programmable_flags[i] & perfmon::kPmuConfigFlagUsesTimebase))
                     continue;
-                cpuperf_event_id_t id = state->programmable_ids[i];
+                PmuEventId id = state->programmable_events[i];
                 uint64_t count = read_msr(IA32_PMC_FIRST + i);
-                next = x86_perfmon_write_count_record(next, id, count);
+                next = arch_perfmon_write_count_record(next, id, count);
                 // We could leave the counter alone, but it could overflow.
                 // Instead reduce the risk and just always reset to zero.
                 LTRACEF("cpu %u: resetting PMC %u to 0x%" PRIx64 "\n",
@@ -1998,13 +1912,13 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
                 write_msr(IA32_PMC_FIRST + i, state->programmable_initial_value[i]);
             }
             for (unsigned i = 0; i < state->num_used_fixed; ++i) {
-                if (!(state->fixed_flags[i] & IPM_CONFIG_FLAG_TIMEBASE))
+                if (!(state->fixed_flags[i] & perfmon::kPmuConfigFlagUsesTimebase))
                     continue;
-                cpuperf_event_id_t id = state->fixed_ids[i];
+                PmuEventId id = state->fixed_events[i];
                 unsigned hw_num = state->fixed_hw_map[i];
                 DEBUG_ASSERT(hw_num < perfmon_num_fixed_counters);
                 uint64_t count = read_msr(IA32_FIXED_CTR0 + hw_num);
-                next = x86_perfmon_write_count_record(next, id, count);
+                next = arch_perfmon_write_count_record(next, id, count);
                 // We could leave the counter alone, but it could overflow.
                 // Instead reduce the risk and just always reset to zero.
                 LTRACEF("cpu %u: resetting FIXED %u to 0x%" PRIx64 "\n",
@@ -2021,19 +1935,19 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
             // ameliorates the problem somewhat.
             if (cpu == 0) {
                 for (unsigned i = 0; i < state->num_used_misc; ++i) {
-                    if (!(state->misc_flags[i] & IPM_CONFIG_FLAG_TIMEBASE)) {
+                    if (!(state->misc_flags[i] & perfmon::kPmuConfigFlagUsesTimebase)) {
                         // While a timebase is required for all current misc
                         // counters, we don't assume this here.
                         continue;
                     }
-                    cpuperf_event_id_t id = state->misc_ids[i];
+                    PmuEventId id = state->misc_events[i];
                     ReadMiscResult typed_value = read_misc_event(state, id);
                     switch (typed_value.type) {
-                    case CPUPERF_RECORD_COUNT:
-                        next = x86_perfmon_write_count_record(next, id, typed_value.value);
+                    case perfmon::kRecordTypeCount:
+                        next = arch_perfmon_write_count_record(next, id, typed_value.value);
                         break;
-                    case CPUPERF_RECORD_VALUE:
-                        next = x86_perfmon_write_value_record(next, id, typed_value.value);
+                    case perfmon::kRecordTypeValue:
+                        next = arch_perfmon_write_value_record(next, id, typed_value.value);
                         break;
                     default:
                         __UNREACHABLE;
@@ -2042,7 +1956,7 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
             }
         }
 
-        if (request_lbr) {
+        if (lbr_id != perfmon::kEventIdNone) {
             next = x86_perfmon_write_last_branches(state, cr3, next, lbr_id);
         }
 
@@ -2096,10 +2010,12 @@ void apic_pmi_interrupt_handler(x86_iframe_t *frame) TA_NO_THREAD_SAFETY_ANALYSI
     // Otherwise once we reset the counter that overflowed the other counters
     // will resume counting, and if we don't reset them too then CTR_FRZ
     // remains set and we'll get no more PMIs.
-    write_msr(IA32_PERF_GLOBAL_CTRL, 0);
+    disable_counters();
 #endif
 
     DEBUG_ASSERT(arch_ints_disabled());
+
+    CPU_STATS_INC(perf_ints);
 
     auto state = perfmon_state.get();
 
@@ -2125,7 +2041,7 @@ void apic_pmi_interrupt_handler(x86_iframe_t *frame) TA_NO_THREAD_SAFETY_ANALYSI
     // If buffer is full leave everything turned off.
     if (!success) {
 #if TRY_FREEZE_ON_PMI
-        write_msr(IA32_PERF_GLOBAL_CTRL, 0);
+        disable_counters();
 #else
         // Don't restore GLOBAL_CTRL, leave everything turned off.
 #endif
@@ -2139,7 +2055,7 @@ void apic_pmi_interrupt_handler(x86_iframe_t *frame) TA_NO_THREAD_SAFETY_ANALYSI
 #if !TRY_FREEZE_ON_PMI
         // This is the last thing we do: Once we do this the counters
         // will start counting again.
-        write_msr(IA32_PERF_GLOBAL_CTRL, state->global_ctrl);
+        enable_counters(state);
 #endif
     }
 }

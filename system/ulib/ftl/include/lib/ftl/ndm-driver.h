@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <inttypes.h>
+#include <stdint.h>
 
 struct ndm;
 
@@ -21,6 +21,9 @@ constexpr int kNdmFatalError = -2;
 constexpr int kNdmUnsafeEcc = 1;
 constexpr int kTrue = 1;
 constexpr int kFalse = 0;
+
+// Initialization should not alter the contents of the volume.
+constexpr uint32_t kReadOnlyInit = (1 << 8);  // Matches FSF_READ_ONLY_INIT.
 
 // Options for a device to be created. All sizes are in bytes.
 struct VolumeOptions {
@@ -82,11 +85,35 @@ class NdmBaseDriver : public NdmDriver {
     NdmBaseDriver() {}
     virtual ~NdmBaseDriver();
 
+    // Returns true if known data appears to be present on the device. This does
+    // not imply that creating a volume will not find errors, just that calling
+    // CreateNdmVolume after this method returns false will result in a freshly
+    // minted (aka empty) volume.
+    // This method should be called after Init(), but before CreateNdmVolume(),
+    // for the result to be meaningful, but calling this is not required.
+    bool IsNdmDataPresent(const VolumeOptions& options);
+
+    // Returns true if the size of the bad block reservation cannot be used.
+    // The size to use (options.max_bad_blocks) may be too small to hold the
+    // current known bad blocks, or some internal value may be inconsistent if
+    // this size is used.
+    // This only makes sense when comparing the desired options with the data
+    // already stored on a volume, and in general should only be used to attempt
+    // to reduce the reserved space (increasing it would reduce the size of the
+    // visible volume, and that is not supported).
+    // This method should only be called right after calling IsNdmDataPresent(),
+    // before calling CreateNdmVolume().
+    bool BadBbtReservation() const;
+
     // Creates the underlying NDM volume, with the provided parameters.
     const char* CreateNdmVolume(const Volume* ftl_volume, const VolumeOptions& options);
 
     // Deletes the underlying NDM volume.
     bool RemoveNdmVolume();
+
+    // Saves and restores bad block data for volume extension.
+    bool SaveBadBlockData();
+    bool RestoreBadBlockData();
 
     // Inspects |data_len| bytes from |data| and |spare_len| bytes from |spare|
     // looking for a typical empty (erased) page. Returns true if all bits are 1.

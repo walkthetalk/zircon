@@ -2,20 +2,27 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 #include "astro-display.h"
-#include <fbl/auto_call.h>
+#include <ddk/binding.h>
 #include <ddk/platform-defs.h>
+#include <ddk/protocol/composite.h>
+#include <fbl/algorithm.h>
+#include <fbl/auto_call.h>
+#include <fbl/vector.h>
+#include <fuchsia/sysmem/c/fidl.h>
+#include <lib/image-format/image_format.h>
 
 namespace astro_display {
 
 namespace {
+
 // List of supported pixel formats
 zx_pixel_format_t kSupportedPixelFormats[] = { ZX_PIXEL_FORMAT_RGB_x888 };
 
 constexpr uint64_t kDisplayId = PANEL_DISPLAY_ID;
 
-// Astro Display Configuration. These configuration comes directly from
+// Astro/Sherlock Display Configuration. These configuration comes directly from
 // from LCD vendor and hardware team.
-constexpr DisplaySetting kDisplaySettingTV070WSM_FT = {
+constexpr display_setting_t kDisplaySettingTV070WSM_FT = {
     .lane_num                   = 4,
     .bit_rate_max               = 360,
     .clock_factor               = 8,
@@ -31,7 +38,7 @@ constexpr DisplaySetting kDisplaySettingTV070WSM_FT = {
     .vsync_bp                   = 8,
     .vsync_pol                  = 0,
 };
-constexpr DisplaySetting kDisplaySettingP070ACB_FT = {
+constexpr display_setting_t kDisplaySettingP070ACB_FT = {
     .lane_num                   = 4,
     .bit_rate_max               = 400,
     .clock_factor               = 8,
@@ -44,6 +51,38 @@ constexpr DisplaySetting kDisplaySettingP070ACB_FT = {
     .hsync_bp                   = 80,
     .hsync_pol                  = 0,
     .vsync_width                = 6,
+    .vsync_bp                   = 20,
+    .vsync_pol                  = 0,
+};
+constexpr display_setting_t kDisplaySettingG101B158_FT = {
+    .lane_num                   = 4,
+    .bit_rate_max               = 566,
+    .clock_factor               = 8,
+    .lcd_clock                  = 70701600,
+    .h_active                   = 800,
+    .v_active                   = 1280,
+    .h_period                   = 890,
+    .v_period                   = 1324,
+    .hsync_width                = 24,
+    .hsync_bp                   = 20,
+    .hsync_pol                  = 0,
+    .vsync_width                = 4,
+    .vsync_bp                   = 20,
+    .vsync_pol                  = 0,
+};
+constexpr display_setting_t kDisplaySettingTV101WXM_FT = {
+    .lane_num                   = 4,
+    .bit_rate_max               = 566,
+    .clock_factor               = 8,
+    .lcd_clock                  = 70701600,
+    .h_active                   = 800,
+    .v_active                   = 1280,
+    .h_period                   = 890,
+    .v_period                   = 1324,
+    .hsync_width                = 20,
+    .hsync_bp                   = 50,
+    .hsync_pol                  = 0,
+    .vsync_width                = 4,
     .vsync_bp                   = 20,
     .vsync_pol                  = 0,
 };
@@ -87,11 +126,14 @@ zx_status_t AstroDisplay::DisplayInit() {
     if (!skip_disp_init_) {
         // Detect panel type
         PopulatePanelType();
-
         if (panel_type_ == PANEL_TV070WSM_FT) {
             init_disp_table_ = &kDisplaySettingTV070WSM_FT;
         } else if (panel_type_ == PANEL_P070ACB_FT) {
             init_disp_table_ = &kDisplaySettingP070ACB_FT;
+        } else if (panel_type_ == PANEL_TV101WXM_FT) {
+            init_disp_table_ = &kDisplaySettingTV101WXM_FT;
+        } else if (panel_type_ == PANEL_G101B158_FT) {
+            init_disp_table_ = &kDisplaySettingG101B158_FT;
         } else {
             DISP_ERROR("Unsupported panel detected!\n");
             status = ZX_ERR_NOT_SUPPORTED;
@@ -116,7 +158,7 @@ zx_status_t AstroDisplay::DisplayInit() {
         if (!ac.check()) {
             return ZX_ERR_NO_MEMORY;
         }
-        status = vpu_->Init(parent_);
+        status = vpu_->Init(components_[COMPONENT_PDEV]);
         if (status != ZX_OK) {
             DISP_ERROR("Could not initialize VPU object\n");
             return status;
@@ -125,12 +167,11 @@ zx_status_t AstroDisplay::DisplayInit() {
         vpu_->PowerOff();
         vpu_->PowerOn();
         vpu_->VppInit();
-
         clock_ = fbl::make_unique_checked<astro_display::AstroDisplayClock>(&ac);
         if (!ac.check()) {
             return ZX_ERR_NO_MEMORY;
         }
-        status = clock_->Init(parent_);
+        status = clock_->Init(components_[COMPONENT_PDEV]);
         if (status != ZX_OK) {
             DISP_ERROR("Could not initialize Clock object\n");
             return status;
@@ -145,9 +186,11 @@ zx_status_t AstroDisplay::DisplayInit() {
 
         // Program and Enable DSI Host Interface
         dsi_host_ = fbl::make_unique_checked<astro_display::AmlDsiHost>(&ac,
-                                                                        parent_,
-                                                                        clock_->GetBitrate(),
-                                                                        panel_type_);
+                                                                    components_[COMPONENT_PDEV],
+                                                                    components_[COMPONENT_DSI],
+                                                                    components_[COMPONENT_LCD_GPIO],
+                                                                    clock_->GetBitrate(),
+                                                                    panel_type_);
         if (!ac.check()) {
             return ZX_ERR_NO_MEMORY;
         }
@@ -173,7 +216,7 @@ zx_status_t AstroDisplay::DisplayInit() {
     }
 
     // Initialize osd object
-    status = osd_->Init(parent_);
+    status = osd_->Init(components_[COMPONENT_PDEV]);
     if (status != ZX_OK) {
         DISP_ERROR("Could not initialize OSD object\n");
         return status;
@@ -204,9 +247,9 @@ uint32_t AstroDisplay::DisplayControllerImplComputeLinearStride(uint32_t width,
 
 // part of ZX_PROTOCOL_DISPLAY_CONTROLLER_IMPL ops
 void AstroDisplay::DisplayControllerImplSetDisplayControllerInterface(
-    const display_controller_interface_t* intf) {
+    const display_controller_interface_protocol_t* intf) {
     fbl::AutoLock lock(&display_lock_);
-    dc_intf_ = ddk::DisplayControllerInterfaceClient(intf);
+    dc_intf_ = ddk::DisplayControllerInterfaceProtocolClient(intf);
     added_display_args_t args;
     PopulateAddedDisplayArgs(&args);
     dc_intf_.OnDisplaysChanged(&args, 1, nullptr, 0, nullptr, 0, nullptr);
@@ -231,6 +274,7 @@ zx_status_t AstroDisplay::DisplayControllerImplImportVmoImage(image_t* image, zx
     canvas_info.wrap            = 0;
     canvas_info.blkmode         = 0;
     canvas_info.endianness      = 0;
+    canvas_info.flags           = CANVAS_FLAGS_READ;
 
     uint8_t local_canvas_idx;
     status = amlogic_canvas_config(&canvas_, vmo.release(), offset, &canvas_info,
@@ -245,7 +289,75 @@ zx_status_t AstroDisplay::DisplayControllerImplImportVmoImage(image_t* image, zx
     }
     imported_images_.SetOne(local_canvas_idx);
     image->handle = local_canvas_idx;
+    return status;
+}
 
+// part of ZX_PROTOCOL_DISPLAY_CONTROLLER_IMPL ops
+zx_status_t AstroDisplay::DisplayControllerImplImportImage(image_t* image,
+                                                           zx_unowned_handle_t handle,
+                                                           uint32_t index) {
+    zx_status_t status = ZX_OK;
+
+    if (image->type != IMAGE_TYPE_SIMPLE || image->pixel_format != format_) {
+        status = ZX_ERR_INVALID_ARGS;
+        return status;
+    }
+
+    zx_status_t status2;
+    fuchsia_sysmem_BufferCollectionInfo_2 collection_info;
+    status =
+        fuchsia_sysmem_BufferCollectionWaitForBuffersAllocated(handle, &status2, &collection_info);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (status2 != ZX_OK) {
+        return status2;
+    }
+
+    fbl::Vector<zx::vmo> vmos;
+    for (uint32_t i = 0; i < collection_info.buffer_count; ++i) {
+        vmos.push_back(zx::vmo(collection_info.buffers[i].vmo));
+    }
+
+    if (!collection_info.settings.has_image_format_constraints || index >= vmos.size()) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+
+    ZX_DEBUG_ASSERT(collection_info.settings.image_format_constraints.pixel_format.type ==
+                    fuchsia_sysmem_PixelFormatType_BGRA32);
+    ZX_DEBUG_ASSERT(
+        !collection_info.settings.image_format_constraints.pixel_format.has_format_modifier);
+
+    uint32_t minimum_row_bytes;
+    if (!ImageFormatMinimumRowBytes(&collection_info.settings.image_format_constraints,
+                                    image->width, &minimum_row_bytes)) {
+        DISP_ERROR("Invalid image width %d for collection\n", image->width);
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    canvas_info_t canvas_info;
+    canvas_info.height = image->height;
+    canvas_info.stride_bytes = minimum_row_bytes;
+    canvas_info.wrap = 0;
+    canvas_info.blkmode = 0;
+    canvas_info.endianness = 0;
+    canvas_info.flags = CANVAS_FLAGS_READ;
+
+    uint8_t local_canvas_idx;
+    status = amlogic_canvas_config(&canvas_, vmos[index].release(),
+                                   collection_info.buffers[index].vmo_usable_start, &canvas_info,
+                                   &local_canvas_idx);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not configure canvas: %d\n", status);
+        status = ZX_ERR_NO_RESOURCES;
+        return status;
+    }
+    fbl::AutoLock lock(&image_lock_);
+    if (imported_images_.GetOne(local_canvas_idx)) {
+        DISP_INFO("Reusing previously allocated canvas (index = %d)\n", local_canvas_idx);
+    }
+    imported_images_.SetOne(local_canvas_idx);
+    image->handle = local_canvas_idx;
     return status;
 }
 
@@ -272,10 +384,31 @@ uint32_t AstroDisplay::DisplayControllerImplCheckConfiguration(
 
     fbl::AutoLock lock(&display_lock_);
 
-    bool success;
-    if (display_configs[0]->layer_count != 1) {
-        success = display_configs[0]->layer_count == 0;
-    } else {
+    bool success = true;
+
+    if (display_configs[0]->layer_count > 1) {
+        // We only support 1 layer
+        success = false;
+    }
+
+    if (success && display_configs[0]->cc_flags) {
+        // Make sure cc values are correct
+        if (display_configs[0]->cc_flags & COLOR_CONVERSION_PREOFFSET) {
+            for (int i = 0; i < 3; i++) {
+                success = success && display_configs[0]->cc_preoffsets[i] > -1;
+                success = success && display_configs[0]->cc_preoffsets[i] < 1;
+            }
+        }
+        if (success && display_configs[0]->cc_flags & COLOR_CONVERSION_POSTOFFSET) {
+            for (int i = 0; i < 3; i++) {
+                success = success && display_configs[0]->cc_postoffsets[i] > -1;
+                success = success && display_configs[0]->cc_postoffsets[i] < 1;
+            }
+        }
+    }
+
+    if (success) {
+        // Make sure ther layer configuration is supported
         const primary_layer_t& layer = display_configs[0]->layer_list[0]->cfg.primary;
         frame_t frame = {
             .x_pos = 0, .y_pos = 0, .width = width_, .height = height_,
@@ -286,7 +419,6 @@ uint32_t AstroDisplay::DisplayControllerImplCheckConfiguration(
                 && layer.image.height == height_
                 && memcmp(&layer.dest_frame, &frame, sizeof(frame_t)) == 0
                 && memcmp(&layer.src_frame, &frame, sizeof(frame_t)) == 0
-                && display_configs[0]->cc_flags == 0
                 && layer.alpha_mode == ALPHA_DISABLE;
     }
     if (!success) {
@@ -294,18 +426,16 @@ uint32_t AstroDisplay::DisplayControllerImplCheckConfiguration(
         for (unsigned i = 1; i < display_configs[0]->layer_count; i++) {
             layer_cfg_results[0][i] = CLIENT_MERGE_SRC;
         }
-        layer_cfg_result_count[0] = display_configs[0]->layer_count;
     }
     return CONFIG_DISPLAY_OK;
 }
 
 // part of ZX_PROTOCOL_DISPLAY_CONTROLLER_IMPL ops
-void AstroDisplay::DisplayControllerImplApplyConfiguration( const display_config_t** display_configs,
+void AstroDisplay::DisplayControllerImplApplyConfiguration(const display_config_t** display_configs,
                                                         size_t display_count) {
     ZX_DEBUG_ASSERT(display_configs);
 
     fbl::AutoLock lock(&display_lock_);
-
     uint8_t addr;
     if (display_count == 1 && display_configs[0]->layer_count) {
        if (!full_init_done_) {
@@ -322,11 +452,21 @@ void AstroDisplay::DisplayControllerImplApplyConfiguration( const display_config
         addr = (uint8_t) (uint64_t) display_configs[0]->layer_list[0]->cfg.primary.image.handle;
         current_image_valid_= true;
         current_image_ = addr;
-        osd_->FlipOnVsync(addr);
+        osd_->FlipOnVsync(display_configs[0]);
     } else {
         current_image_valid_= false;
         if (full_init_done_) {
             osd_->Disable();
+        }
+    }
+
+    // If bootloader does not enable any of the display hardware, no vsync will be generated.
+    // This fakes a vsync to let clients know we are ready until we actually initialize hardware
+    if (!full_init_done_) {
+        if (dc_intf_.is_valid()) {
+            if (display_count == 0 || display_configs[0]->layer_count == 0) {
+                dc_intf_.OnDisplayVsync(kDisplayId, zx_clock_get_monotonic(), nullptr, 0);
+            }
         }
     }
 }
@@ -355,8 +495,17 @@ void AstroDisplay::PopulatePanelType() {
     if ((gpio_config_in(&gpio_, GPIO_NO_PULL) == ZX_OK) &&
         (gpio_read(&gpio_, &pt) == ZX_OK)) {
         panel_type_ = pt;
-        DISP_INFO("Detected panel type = %s (%d)\n",
-                  panel_type_ ? "P070ACB_FT" : "TV070WSM_FT", panel_type_);
+        if (board_info_.pid == PDEV_PID_ASTRO) {
+            DISP_INFO("Detected panel type = %s (%d)\n",
+                      panel_type_ ? "P070ACB_FT" : "TV070WSM_FT", panel_type_);
+        } else if (board_info_.pid == PDEV_PID_SHERLOCK) {
+            DISP_INFO("Detected panel type = %s (%d)\n",
+                      panel_type_ ? "G101B158_FT" : "TV101WXM_FT", panel_type_);
+            panel_type_ = static_cast<uint8_t>(pt + PANEL_TV101WXM_FT);
+        } else {
+            DISP_ERROR("Panel detection attempted on Unsupported hardware\n");
+            ZX_ASSERT(0);
+        }
     } else {
         panel_type_ = PANEL_UNKNOWN;
         DISP_ERROR("Failed to detect a valid panel\n");
@@ -375,6 +524,9 @@ zx_status_t AstroDisplay::SetupDisplayInterface() {
                 board_info_.board_revision);
             skip_disp_init_ = true;
         }
+    } else if (board_info_.pid == PDEV_PID_SHERLOCK) {
+        panel_type_ = PANEL_UNKNOWN;
+        skip_disp_init_ = false;
     } else {
         skip_disp_init_ = true;
     }
@@ -397,6 +549,62 @@ zx_status_t AstroDisplay::SetupDisplayInterface() {
     return ZX_OK;
 }
 
+zx_status_t AstroDisplay::DisplayControllerImplGetSysmemConnection(zx::channel connection) {
+    zx_status_t status = sysmem_connect(&sysmem_, connection.release());
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not connect to sysmem\n");
+        return status;
+    }
+
+    return ZX_OK;
+}
+
+zx_status_t AstroDisplay::DisplayControllerImplSetBufferCollectionConstraints(
+    const image_t* config, zx_unowned_handle_t collection) {
+    fuchsia_sysmem_BufferCollectionConstraints constraints = {};
+    constraints.usage.display = fuchsia_sysmem_displayUsageLayer;
+    constraints.has_buffer_memory_constraints = true;
+    fuchsia_sysmem_BufferMemoryConstraints& buffer_constraints =
+        constraints.buffer_memory_constraints;
+    buffer_constraints.min_size_bytes = 0;
+    buffer_constraints.max_size_bytes = 0xffffffff;
+    buffer_constraints.physically_contiguous_required = true;
+    buffer_constraints.secure_required = false;
+    buffer_constraints.secure_permitted = true;
+    buffer_constraints.ram_domain_supported = true;
+    buffer_constraints.cpu_domain_supported = true;
+    constraints.image_format_constraints_count = 1;
+    fuchsia_sysmem_ImageFormatConstraints& image_constraints =
+        constraints.image_format_constraints[0];
+    image_constraints.pixel_format.type = fuchsia_sysmem_PixelFormatType_BGRA32;
+    image_constraints.color_spaces_count = 1;
+    image_constraints.color_space[0].type = fuchsia_sysmem_ColorSpaceType_SRGB;
+    image_constraints.min_coded_width = 0;
+    image_constraints.max_coded_width = 0xffffffff;
+    image_constraints.min_coded_height = 0;
+    image_constraints.max_coded_height = 0xffffffff;
+    image_constraints.min_bytes_per_row = 0;
+    image_constraints.max_bytes_per_row = 0xffffffff;
+    image_constraints.max_coded_width_times_coded_height = 0xffffffff;
+    image_constraints.layers = 1;
+    image_constraints.coded_width_divisor = 1;
+    image_constraints.coded_height_divisor = 1;
+    image_constraints.bytes_per_row_divisor = 32;
+    image_constraints.start_offset_divisor = 32;
+    image_constraints.display_width_divisor = 1;
+    image_constraints.display_height_divisor = 1;
+
+    zx_status_t status = fuchsia_sysmem_BufferCollectionSetConstraints(collection, true,
+                                                                       &constraints);
+
+    if (status != ZX_OK) {
+        DISP_ERROR("Failed to set constraints");
+        return status;
+    }
+
+    return ZX_OK;
+}
+
 int AstroDisplay::VSyncThread() {
     zx_status_t status;
     while (1) {
@@ -409,7 +617,7 @@ int AstroDisplay::VSyncThread() {
         uint64_t live[] = { current_image_ };
         bool current_image_valid = current_image_valid_;
         if (dc_intf_.is_valid()) {
-            dc_intf_.OnDisplayVsync(kDisplayId, zx_clock_get(ZX_CLOCK_MONOTONIC),
+            dc_intf_.OnDisplayVsync(kDisplayId, zx_clock_get_monotonic(),
                                     live, current_image_valid);
         }
     }
@@ -419,13 +627,34 @@ int AstroDisplay::VSyncThread() {
 
 // TODO(payamm): make sure unbind/release are called if we return error
 zx_status_t AstroDisplay::Bind() {
-    zx_status_t status;
+    composite_protocol_t composite;
 
-    status = device_get_protocol(parent_, ZX_PROTOCOL_PDEV, &pdev_);
-    if (status !=  ZX_OK) {
-        DISP_ERROR("Could not get parent protocol\n");
+    auto status = device_get_protocol(parent_, ZX_PROTOCOL_COMPOSITE, &composite);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not get composite protocol\n");
         return status;
     }
+
+    size_t actual;
+    composite_get_components(&composite, components_, fbl::count_of(components_), &actual);
+    if (actual != fbl::count_of(components_)) {
+        DISP_ERROR("could not get components\n");
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    status = device_get_protocol(components_[COMPONENT_PDEV], ZX_PROTOCOL_PDEV, &pdev_);
+    if (status !=  ZX_OK) {
+        DISP_ERROR("Could not get PDEV protocol\n");
+        return status;
+    }
+
+    dsi_impl_protocol_t dsi;
+    status = device_get_protocol(components_[COMPONENT_DSI], ZX_PROTOCOL_DSI_IMPL, &dsi);
+    if (status !=  ZX_OK) {
+        DISP_ERROR("Could not get DSI_IMPL protocol\n");
+        return status;
+    }
+    dsiimpl_ = &dsi;
 
     // Get board info
     status = pdev_get_board_info(&pdev_, &board_info_);
@@ -435,22 +664,30 @@ zx_status_t AstroDisplay::Bind() {
     }
 
     if (board_info_.pid == PDEV_PID_ASTRO) {
-        // Obtain GPIO Protocol for Panel reset
-        size_t actual;
-        status = pdev_get_protocol(&pdev_, ZX_PROTOCOL_GPIO, GPIO_PANEL_DETECT, &gpio_, sizeof(gpio_),
-                                   &actual);
-        if (status != ZX_OK) {
-            DISP_ERROR("Could not obtain GPIO protocol.\n");
-            return status;
-        }
-    }
-
-    if (board_info_.pid == PDEV_PID_SHERLOCK) {
+        width_ = ASTRO_DISPLAY_WIDTH;
+        height_ = ASTRO_DISPLAY_HEIGHT;
+    } else if (board_info_.pid == PDEV_PID_SHERLOCK) {
         width_ = SHERLOCK_DISPLAY_WIDTH;
         height_ = SHERLOCK_DISPLAY_HEIGHT;
+    } else {
+        DISP_ERROR("Running on Unsupported hardware. Use at your own risk\n");
     }
 
-    status = device_get_protocol(parent_, ZX_PROTOCOL_AMLOGIC_CANVAS, &canvas_);
+    // Obtain GPIO Protocol for Panel reset
+    status = device_get_protocol(components_[COMPONENT_PANEL_GPIO], ZX_PROTOCOL_GPIO, &gpio_);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not obtain GPIO protocol.\n");
+        return status;
+    }
+
+    status = device_get_protocol(components_[COMPONENT_SYSMEM], ZX_PROTOCOL_SYSMEM, &sysmem_);
+    if (status != ZX_OK) {
+        DISP_ERROR("Could not get Display SYSMEM protocol\n");
+        return status;
+    }
+
+    status = device_get_protocol(components_[COMPONENT_CANVAS], ZX_PROTOCOL_AMLOGIC_CANVAS,
+                                 &canvas_);
     if (status != ZX_OK) {
         DISP_ERROR("Could not obtain CANVAS protocol\n");
         return status;
@@ -470,7 +707,7 @@ zx_status_t AstroDisplay::Bind() {
     }
 
     // Map VSync Interrupt
-    status = pdev_map_interrupt(&pdev_, IRQ_VSYNC, vsync_irq_.reset_and_get_address());
+    status = pdev_get_interrupt(&pdev_, IRQ_VSYNC, 0, vsync_irq_.reset_and_get_address());
     if (status  != ZX_OK) {
         DISP_ERROR("Could not map vsync interrupt\n");
         return status;
@@ -529,17 +766,13 @@ void AstroDisplay::Dump() {
               disp_setting_.clock_factor);
 }
 
-} // namespace astro_display
-
 // main bind function called from dev manager
-extern "C" zx_status_t astro_display_bind(void* ctx, zx_device_t* parent) {
+zx_status_t astro_display_bind(void* ctx, zx_device_t* parent) {
     fbl::AllocChecker ac;
-    auto dev = fbl::make_unique_checked<astro_display::AstroDisplay>(&ac,
-        parent, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+    auto dev = fbl::make_unique_checked<astro_display::AstroDisplay>(&ac, parent);
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
-
     auto status = dev->Bind();
     if (status == ZX_OK) {
         // devmgr is now in charge of the memory for dev
@@ -547,3 +780,19 @@ extern "C" zx_status_t astro_display_bind(void* ctx, zx_device_t* parent) {
     }
     return status;
 }
+
+static zx_driver_ops_t astro_display_ops = [](){
+    zx_driver_ops_t ops;
+    ops.version = DRIVER_OPS_VERSION;
+    ops.bind = astro_display_bind;
+    return ops;
+}();
+
+} // namespace astro_display
+
+ZIRCON_DRIVER_BEGIN(astro_display, astro_display::astro_display_ops, "zircon", "0.1", 4)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_COMPOSITE),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_AMLOGIC),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_AMLOGIC_S905D2),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_AMLOGIC_DISPLAY),
+ZIRCON_DRIVER_END(astro_display)

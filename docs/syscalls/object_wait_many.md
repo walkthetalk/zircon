@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-object_wait_many - wait for signals on multiple objects
+Wait for signals on multiple objects.
 
 ## SYNOPSIS
 
@@ -103,11 +103,9 @@ In a future build this error will no longer occur.
 
 ## SEE ALSO
 
- - [timer slack]
+ - [timer slack](../timer_slack.md)
  - [`zx_object_wait_async()`]
  - [`zx_object_wait_one()`]
-
-[timer slack]: ../timer_slack.md
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 

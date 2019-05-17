@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <algorithm>
+#include <inttypes.h>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -48,6 +49,9 @@ bool BlobfsCreator::IsCommandValid(Command command) {
     switch (command) {
     case Command::kMkfs:
     case Command::kFsck:
+    case Command::kUsedDataSize:
+    case Command::kUsedInodes:
+    case Command::kUsedSize:
     case Command::kAdd:
         return true;
     default:
@@ -151,6 +155,7 @@ zx_status_t BlobfsCreator::CalculateRequiredSize(off_t* out) {
 
                 if ((res = blobfs::blobfs_preprocess(data_fd.get(), ShouldCompress(), &info))
                     != ZX_OK) {
+                    mtx.lock();
                     status = res;
                     mtx.unlock();
                     return;
@@ -223,7 +228,41 @@ zx_status_t BlobfsCreator::Fsck() {
         return status;
     }
 
-    return blobfs::Fsck(std::move(vn));
+    bool apply_journal = false;
+    return blobfs::Fsck(std::move(vn), apply_journal);
+}
+
+zx_status_t BlobfsCreator::UsedDataSize() {
+    zx_status_t status;
+    uint64_t size;
+    if ((status = blobfs::UsedDataSize(fd_, &size)) != ZX_OK) {
+        return status;
+    }
+
+    printf("%" PRIu64 "\n", size);
+    return ZX_OK;
+}
+
+zx_status_t BlobfsCreator::UsedInodes() {
+    zx_status_t status;
+    uint64_t used_inodes;
+    if ((status = blobfs::UsedInodes(fd_, &used_inodes)) != ZX_OK) {
+        return status;
+    }
+
+    printf("%" PRIu64 "\n", used_inodes);
+    return ZX_OK;
+}
+
+zx_status_t BlobfsCreator::UsedSize() {
+    zx_status_t status;
+    uint64_t size;
+    if ((status = blobfs::UsedSize(fd_, &size)) != ZX_OK) {
+        return status;
+    }
+
+    printf("%" PRIu64 "\n", size);
+    return ZX_OK;
 }
 
 zx_status_t BlobfsCreator::Add() {

@@ -8,10 +8,12 @@
 
 #include "xhci-transfer-common.h"
 
+namespace usb_xhci {
+
 void xhci_print_trb(xhci_transfer_ring_t* ring, xhci_trb_t* trb) {
     size_t index = trb - ring->start;
     uint32_t* ptr = (uint32_t *)trb;
-    uint64_t paddr = io_buffer_phys(&ring->buffer) + index * sizeof(xhci_trb_t);
+    uint64_t paddr = ring->buffer.phys() + index * sizeof(xhci_trb_t);
 
     zxlogf(LSPEW, "trb[%03zu] %p: %08X %08X %08X %08X\n", index, (void *)paddr, ptr[0], ptr[1], ptr[2], ptr[3]);
 }
@@ -132,3 +134,5 @@ zx_status_t xhci_queue_data_trbs(xhci_transfer_ring_t* ring, xhci_transfer_state
     }
     return ZX_OK;
 }
+
+} // namespace usb_xhci

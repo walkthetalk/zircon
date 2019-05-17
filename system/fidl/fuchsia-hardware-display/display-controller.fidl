@@ -4,6 +4,7 @@
 
 library fuchsia.hardware.display;
 
+using fuchsia.sysmem;
 using zx;
 
 // Invalid id for displays, images, and events.
@@ -170,26 +171,50 @@ struct ClientCompositionOp {
     ClientCompositionOpcode opcode;
 };
 
-// Interface for accessing the display hardware.
-//
-// The driver supports two simultaneous clients - a primary client and a virtcon
-// client. The primary client is obtained by directly opening the devfs device,
-// while the virtcon client is obtained by opening a 'virtcon' child of the
-// device.
-//
-// A display configuration can be separated into two parts: the layer layout and
-// the layer contents. The layout includes all parts of a configuration other
-// than the image handles. The active configuration is composed of the most
-// recently applied layout and an active image from each layer - see
-// SetLayerImage for details on how the active image is defined. Note the
-// requirement that each layer has an active image. Whenever a new active
-// configuration is available, it is immediately given to the hardware. This
-// allows the layout and each layer's contents to advance independently when
-// possible.
-//
-// Performing illegal actions on the interface will result in the interface
-// being closed.
-interface Controller {
+/// Provider for display controllers.
+///
+/// The driver supports two simultaneous clients - a primary client and a virtcon
+/// client.
+[Layout = "Simple"]
+protocol Provider {
+    /// Open a virtcon client. |device| should be a handle to one endpoint of a
+    /// channel that (on success) will become an open connection to a new
+    /// instance of a display client device. An protocol request |controller|
+    /// provides an interface to the Controller for the new device. Closing the
+    /// connection to |device| will also close the |controller| interface. If
+    /// the display device already has a virtcon controller then this method
+    /// will return ZX_ERR_ALREADY_BOUND.
+    // TODO(ZX-3889): Once llcpp is supported in Zircon, unify |device| and
+    // |controller|.
+    OpenVirtconController(handle<channel> device, request<Controller> controller) -> (zx.status s);
+
+    /// Open a primary client. |device| should be a handle to one endpoint of a
+    /// channel that (on success) will become an open connection to a new
+    /// instance of a display client device. An protocol request |controller|
+    /// provides an interface to the Controller for the new device. Closing the
+    /// connection to |device| will also close the |controller| interface. If
+    /// the display device already has a primary controller then this method
+    /// will return ZX_ERR_ALREADY_BOUND.
+    // TODO(ZX-3889): Once llcpp is supported in Zircon, unify |device| and
+    // |controller|.
+    OpenController(handle<channel> device, request<Controller> controller) -> (zx.status s);
+};
+
+/// Interface for accessing the display hardware.
+///
+/// A display configuration can be separated into two parts: the layer layout and
+/// the layer contents. The layout includes all parts of a configuration other
+/// than the image handles. The active configuration is composed of the most
+/// recently applied layout and an active image from each layer - see
+/// SetLayerImage for details on how the active image is defined. Note the
+/// requirement that each layer has an active image. Whenever a new active
+/// configuration is available, it is immediately given to the hardware. This
+/// allows the layout and each layer's contents to advance independently when
+/// possible.
+///
+/// Performing illegal actions on the interface will result in the interface
+/// being closed.
+protocol Controller {
     // Event fired when displays are added or removed. This event will be fired
     // when the callback is registered if there are any connected displays.
     //
@@ -202,6 +227,14 @@ interface Controller {
     // the driver and client to agree on its meaning through some mechanism
     // outside the scope of this API.
     ImportVmoImage(ImageConfig image_config, handle<vmo> vmo, int32 offset) -> (zx.status res, uint64 image_id);
+
+    // Imports a Buffer-Collection backed image. If tiling is not typeSimple,
+    // it is up to the driver and client to agree on its meaning through some
+    // mechanism outside the scope of this API. The ImageConfig must be
+    // compatible with that passed through SetBufferCollectionConstraints on
+    // the collection id.
+    ImportImage(ImageConfig image_config, uint64 collection_id, uint32 index)
+        -> (zx.status res, uint64 image_id);
 
     // Releases an image.
     //
@@ -255,9 +288,9 @@ interface Controller {
     // array is NaN, the array is treated as the identity element for the relevant
     // operation.
     SetDisplayColorConversion(uint64 display_id,
-                                 array<float32>:3 preoffsets,
-                                 array<float32>:9 coefficients,
-                                 array<float32>:3 postoffsets);
+                              array<float32>:3 preoffsets,
+                              array<float32>:9 coefficients,
+                              array<float32>:3 postoffsets);
 
     // Sets which layers are on a display. The list is in increasing z-order.
     //
@@ -414,4 +447,21 @@ interface Controller {
     // Allocates a VMO of the requested size which can be used for images.
     // TODO: move this into a separate video buffer management system.
     AllocateVmo(uint64 size) -> (zx.status res, handle<vmo>? vmo);
+
+    // Import a sysmem buffer collection token. |collection_id| must not
+    // already be in use.
+    ImportBufferCollection(uint64 collection_id,
+                           fuchsia.sysmem.BufferCollectionToken collection_token)
+        -> (zx.status res);
+
+    // Release an imported buffer collection.
+    ReleaseBufferCollection(uint64 collection_id);
+
+    // Takes an imported buffer collection and sets the constraints
+    // on it so that it can be imported with a specific config.
+    SetBufferCollectionConstraints(uint64 collection_id, ImageConfig config) -> (zx.status res);
+
+    // If the system only supports single-buffered mode with a single framebuffer, then this returns
+    // that buffer and its stride. Otherwise it can return ZX_ERR_NOT_SUPPORTED.
+    GetSingleBufferFramebuffer() -> (zx.status res, handle<vmo>? vmo, uint32 stride);
 };

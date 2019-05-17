@@ -10,11 +10,26 @@
 #include <ddk/binding.h>
 #include <ddk/debug.h>
 #include <ddk/driver.h>
+#include <ddk/metadata.h>
 #include <ddk/platform-defs.h>
+#include <ddktl/metadata/audio.h>
+#include <ddk/protocol/composite.h>
 #include <soc/mt8167/mt8167-clk-regs.h>
+
+#include "tas5782.h"
+#include "tas5805.h"
 
 namespace audio {
 namespace mt8167 {
+
+enum {
+    COMPONENT_PDEV,
+    COMPONENT_I2C,
+    COMPONENT_RESET_GPIO, // This is optional
+    COMPONENT_MUTE_GPIO, // This is optional
+    COMPONENT_COUNT,
+};
+
 
 // Expects L+R.
 constexpr size_t kNumberOfChannels = 2;
@@ -27,33 +42,59 @@ Mt8167AudioStreamOut::Mt8167AudioStreamOut(zx_device_t* parent)
 }
 
 zx_status_t Mt8167AudioStreamOut::InitPdev() {
+    composite_protocol_t composite;
+
+    auto status = device_get_protocol(parent(), ZX_PROTOCOL_COMPOSITE, &composite);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "Could not get composite protocol\n");
+        return status;
+    }
+
+    zx_device_t* components[COMPONENT_COUNT] = {};
+    size_t actual;
+    composite_get_components(&composite, components, countof(components), &actual);
+    // Only PDEV and I2C components are required.
+    if (actual < 2) {
+        zxlogf(ERROR, "could not get components\n");
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    pdev_ = components[COMPONENT_PDEV];
     if (!pdev_.is_valid()) {
         return ZX_ERR_NO_RESOURCES;
     }
 
-    clk_ = pdev_.GetClk(0);
-    if (!clk_.is_valid()) {
-        zxlogf(ERROR, "%s failed to allocate clk\n", __FUNCTION__);
-        return ZX_ERR_NO_RESOURCES;
-    }
-    clk_.Enable(0); // board_mt8167::kClkAud1, disables clk gating.
-
-    codec_reset_ = pdev_.GetGpio(0);
-    codec_mute_ = pdev_.GetGpio(1);
-    if (!codec_reset_.is_valid() || !codec_mute_.is_valid()) {
-        zxlogf(ERROR, "%s failed to allocate gpio\n", __FUNCTION__);
-        return ZX_ERR_NO_RESOURCES;
+    metadata::Codec codec;
+    status = device_get_metadata(parent(), DEVICE_METADATA_PRIVATE, &codec, sizeof(metadata::Codec),
+                                 &actual);
+    if (status != ZX_OK || sizeof(metadata::Codec) != actual) {
+        zxlogf(ERROR, "%s device_get_metadata failed %d\n", __FILE__, status);
+        return status;
     }
 
-    codec_ = Tas5782::Create(pdev_, 0);
-    if (!codec_) {
-        zxlogf(ERROR, "%s could not get tas5782\n", __func__);
+    // TODO(andresoportus): Move GPIO control to codecs?
+    // Not all codecs have these GPIOs.
+    if (components[COMPONENT_RESET_GPIO]) {
+        codec_reset_ = components[COMPONENT_RESET_GPIO];
+    }
+    if (components[COMPONENT_MUTE_GPIO]) {
+        codec_mute_ = components[COMPONENT_MUTE_GPIO];
+    }
+
+    if (codec == metadata::Codec::Tas5782) {
+        zxlogf(INFO, "audio: using TAS5782 codec\n");
+        codec_ = Tas5782::Create(components[COMPONENT_I2C], 0);
+    } else if (codec == metadata::Codec::Tas5805) {
+        zxlogf(INFO, "audio: using TAS5805 codec\n");
+        codec_ = Tas5805::Create(components[COMPONENT_I2C], 0);
+    } else {
+        zxlogf(ERROR, "%s could not get codec\n", __FUNCTION__);
         return ZX_ERR_NO_RESOURCES;
     }
 
-    zx_status_t status = pdev_.GetBti(0, &bti_);
+    status = pdev_.GetBti(0, &bti_);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s could not obtain bti %d\n", __func__, status);
+        zxlogf(ERROR, "%s could not obtain bti %d\n", __FUNCTION__, status);
         return status;
     }
 
@@ -78,13 +119,14 @@ zx_status_t Mt8167AudioStreamOut::InitPdev() {
         return ZX_ERR_NO_MEMORY;
     }
 
-    codec_reset_.Write(0); // Reset.
-    // Delay to be safe.  Not in the datasheet, from similar codecs.
-    zx_nanosleep(zx_deadline_after(ZX_NSEC(10)));
-    codec_reset_.Write(1); // Set to "not reset".
-    // Delay to be safe.  Not in the datasheet, from similar codecs.
-    zx_nanosleep(zx_deadline_after(ZX_MSEC(10)));
-
+    if (codec_reset_.is_valid()) {
+        codec_reset_.Write(0); // Reset.
+        // Delay to be safe.
+        zx_nanosleep(zx_deadline_after(ZX_USEC(1)));
+        codec_reset_.Write(1); // Set to "not reset".
+        // Delay to be safe.
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(10)));
+    }
     codec_->Init();
 
     // Initialize the ring buffer
@@ -177,8 +219,12 @@ zx_status_t Mt8167AudioStreamOut::ChangeFormat(const audio_proto::StreamSetFmtRe
 }
 
 void Mt8167AudioStreamOut::ShutdownHook() {
-    codec_mute_.Write(0); // Set to "mute".
-    codec_reset_.Write(0); // Keep the codec in reset.
+    if (codec_mute_.is_valid()) {
+        codec_mute_.Write(0); // Set to "mute".
+    }
+    if (codec_reset_.is_valid()) {
+        codec_reset_.Write(0); // Keep the codec in reset.
+    }
     mt_audio_->Shutdown();
 }
 
@@ -264,17 +310,17 @@ zx_status_t Mt8167AudioStreamOut::InitBuffer(size_t size) {
     status = zx_vmo_create_contiguous(bti_.get(), size, 0,
                                       ring_buffer_vmo_.reset_and_get_address());
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s failed to allocate ring buffer vmo - %d\n", __func__, status);
+        zxlogf(ERROR, "%s failed to allocate ring buffer vmo - %d\n", __FUNCTION__, status);
         return status;
     }
 
     status = pinned_ring_buffer_.Pin(ring_buffer_vmo_, bti_, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s failed to pin ring buffer vmo - %d\n", __func__, status);
+        zxlogf(ERROR, "%s failed to pin ring buffer vmo - %d\n", __FUNCTION__, status);
         return status;
     }
     if (pinned_ring_buffer_.region_count() != 1) {
-        zxlogf(ERROR, "%s buffer is not contiguous", __func__);
+        zxlogf(ERROR, "%s buffer is not contiguous", __FUNCTION__);
         return ZX_ERR_NO_MEMORY;
     }
 
@@ -306,7 +352,8 @@ static zx_driver_ops_t mt_audio_out_driver_ops = {
 };
 
 // clang-format off
-ZIRCON_DRIVER_BEGIN(mt8167_audio_out, mt_audio_out_driver_ops, "zircon", "0.1", 3)
+ZIRCON_DRIVER_BEGIN(mt8167_audio_out, mt_audio_out_driver_ops, "zircon", "0.1", 4)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_COMPOSITE),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_MEDIATEK),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_MEDIATEK_8167S_REF),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_AUDIO_OUT),

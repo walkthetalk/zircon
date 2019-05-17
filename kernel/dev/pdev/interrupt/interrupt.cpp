@@ -76,10 +76,10 @@ static void default_init_percpu_early() {
 static void default_init_percpu() {
 }
 
-static void default_handle_irq(iframe* frame) {
+static void default_handle_irq(iframe_short_t* frame) {
 }
 
-static void default_handle_fiq(iframe* frame) {
+static void default_handle_fiq(iframe_short_t* frame) {
 }
 
 static void default_shutdown() {
@@ -189,11 +189,11 @@ void interrupt_init_percpu() {
     intr_ops->init_percpu();
 }
 
-void platform_irq(iframe* frame) {
+void platform_irq(iframe_short_t* frame) {
     intr_ops->handle_irq(frame);
 }
 
-void platform_fiq(iframe* frame) {
+void platform_fiq(iframe_short_t* frame) {
     intr_ops->handle_fiq(frame);
 }
 
@@ -239,4 +239,4 @@ void msi_register_handler(const msi_block_t* block, uint msi_id, int_handler han
     intr_ops->msi_register_handler(block, msi_id, handler, ctx);
 }
 
-LK_INIT_HOOK_FLAGS(interrupt_init_percpu_early, interrupt_init_percpu_early, LK_INIT_LEVEL_PLATFORM_EARLY, LK_INIT_FLAG_SECONDARY_CPUS);
+LK_INIT_HOOK_FLAGS(interrupt_init_percpu_early, interrupt_init_percpu_early, LK_INIT_LEVEL_PLATFORM_EARLY, LK_INIT_FLAG_SECONDARY_CPUS)

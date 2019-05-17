@@ -17,12 +17,14 @@ bool ClockGetMonotonicTest() {
 }
 
 bool ClockGetUtcTest() {
-    zx_clock_get(ZX_CLOCK_UTC);
+    zx_time_t now = 0;
+    zx_clock_get_new(ZX_CLOCK_UTC, &now);
     return true;
 }
 
 bool ClockGetThreadTest() {
-    zx_clock_get(ZX_CLOCK_THREAD);
+    zx_time_t now = 0;
+    zx_clock_get_new(ZX_CLOCK_THREAD, &now);
     return true;
 }
 
@@ -37,6 +39,6 @@ void RegisterTests() {
     perftest::RegisterSimpleTest<ClockGetThreadTest>("ClockGetThread");
     perftest::RegisterSimpleTest<TicksGetTest>("TicksGet");
 }
-PERFTEST_CTOR(RegisterTests);
+PERFTEST_CTOR(RegisterTests)
 
 }  // namespace

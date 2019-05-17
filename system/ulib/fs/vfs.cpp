@@ -27,13 +27,14 @@
 #include <utility>
 #endif
 
+#include "debug.h"
+
 namespace fs {
 namespace {
 
 // Trim a name before sending it to internal filesystem functions.
 // Trailing '/' characters imply that the name must refer to a directory.
-zx_status_t vfs_name_trim(fbl::StringPiece name, fbl::StringPiece* name_out,
-                          bool* dir_out) {
+zx_status_t TrimName(fbl::StringPiece name, fbl::StringPiece* name_out, bool* dir_out) {
     size_t len = name.length();
     bool is_dir = false;
     while ((len > 0) && name[len - 1] == '/') {
@@ -41,11 +42,15 @@ zx_status_t vfs_name_trim(fbl::StringPiece name, fbl::StringPiece* name_out,
         is_dir = true;
     }
 
-    // 'name' should not contain paths consisting of exclusively '/' characters.
     if (len == 0) {
+        // 'name' should not contain paths consisting of exclusively '/' characters.
         return ZX_ERR_INVALID_ARGS;
     } else if (len > NAME_MAX) {
+        // Name must be less than the maximum-expected length.
         return ZX_ERR_BAD_PATH;
+    } else if (memchr(name.data(), '/', len) != nullptr) {
+        // Name must not contain '/' characters after being trimmed.
+        return ZX_ERR_INVALID_ARGS;
     }
 
     name_out->set(name.data(), len);
@@ -53,8 +58,7 @@ zx_status_t vfs_name_trim(fbl::StringPiece name, fbl::StringPiece* name_out,
     return ZX_OK;
 }
 
-zx_status_t vfs_lookup(fbl::RefPtr<Vnode> vn, fbl::RefPtr<Vnode>* out,
-                       fbl::StringPiece name) {
+zx_status_t LookupNode(fbl::RefPtr<Vnode> vn, fbl::StringPiece name, fbl::RefPtr<Vnode>* out) {
     if (name == "..") {
         return ZX_ERR_INVALID_ARGS;
     } else if (name == ".") {
@@ -66,13 +70,13 @@ zx_status_t vfs_lookup(fbl::RefPtr<Vnode> vn, fbl::RefPtr<Vnode>* out,
 
 // Validate open flags as much as they can be validated
 // independently of the target node.
-zx_status_t vfs_prevalidate_flags(uint32_t flags) {
+zx_status_t PrevalidateFlags(uint32_t flags) {
     if (!(flags & ZX_FS_RIGHT_WRITABLE)) {
         if (flags & ZX_FS_FLAG_TRUNCATE) {
             return ZX_ERR_INVALID_ARGS;
         }
     } else if (!(flags & ZX_FS_RIGHTS)) {
-        if (!IsPathOnly(flags)) {
+        if (!IsVnodeRefOnly(flags)) {
             return ZX_ERR_INVALID_ARGS;
         }
     }
@@ -122,9 +126,10 @@ zx_status_t Vfs::Open(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
 zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
                             fbl::StringPiece path, fbl::StringPiece* out_path,
                             uint32_t flags, uint32_t mode) {
-    FS_TRACE_DEBUG("VfsOpen: path='%s' flags=%d\n", path.begin(), flags);
+    FS_PRETTY_TRACE_DEBUG("VfsOpen: path='", Path(path.data(), path.size()),
+                          "' flags=", ZxFlags(flags));
     zx_status_t r;
-    if ((r = vfs_prevalidate_flags(flags)) != ZX_OK) {
+    if ((r = PrevalidateFlags(flags)) != ZX_OK) {
         return r;
     }
     if ((r = Vfs::Walk(vndir, &vndir, path, &path)) < 0) {
@@ -142,7 +147,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
     fbl::RefPtr<Vnode> vn;
 
     bool must_be_dir = false;
-    if ((r = vfs_name_trim(path, &path, &must_be_dir)) != ZX_OK) {
+    if ((r = TrimName(path, &path, &must_be_dir)) != ZX_OK) {
         return r;
     } else if (path == "..") {
         return ZX_ERR_INVALID_ARGS;
@@ -172,7 +177,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
 #endif
     } else {
     try_open:
-        r = vfs_lookup(std::move(vndir), &vn, path);
+        r = LookupNode(std::move(vndir), path, &vn);
         if (r < 0) {
             return r;
         }
@@ -184,7 +189,9 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
             return ZX_OK;
         }
 
-        flags |= (must_be_dir ? ZX_FS_FLAG_DIRECTORY : 0);
+        if (must_be_dir) {
+            flags |= ZX_FS_FLAG_DIRECTORY;
+        }
 #endif
         if (ReadonlyLocked() && IsWritable(flags)) {
             return ZX_ERR_ACCESS_DENIED;
@@ -192,9 +199,9 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
         if ((r = vn->ValidateFlags(flags)) != ZX_OK) {
             return r;
         }
-        // VNODE_REF_ONLY requests that we don't actually open the underlying
-        // Vnode.
-        if (!IsPathOnly(flags)) {
+        // VNODE_REF_ONLY requests that we don't actually open the underlying Vnode,
+        // but use the connection as a reference to the Vnode.
+        if (!IsVnodeRefOnly(flags)) {
             if ((r = OpenVnode(flags, &vn)) != ZX_OK) {
                 return r;
             }
@@ -213,7 +220,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
 zx_status_t Vfs::Unlink(fbl::RefPtr<Vnode> vndir, fbl::StringPiece path) {
     bool must_be_dir;
     zx_status_t r;
-    if ((r = vfs_name_trim(path, &path, &must_be_dir)) != ZX_OK) {
+    if ((r = TrimName(path, &path, &must_be_dir)) != ZX_OK) {
         return r;
     } else if (path == ".") {
         return ZX_ERR_UNAVAILABLE;
@@ -312,7 +319,7 @@ zx_status_t Vfs::Rename(zx::event token, fbl::RefPtr<Vnode> oldparent,
     bool old_must_be_dir;
     bool new_must_be_dir;
     zx_status_t r;
-    if ((r = vfs_name_trim(oldStr, &oldStr, &old_must_be_dir)) != ZX_OK) {
+    if ((r = TrimName(oldStr, &oldStr, &old_must_be_dir)) != ZX_OK) {
         return r;
     } else if (oldStr == ".") {
         return ZX_ERR_UNAVAILABLE;
@@ -320,7 +327,7 @@ zx_status_t Vfs::Rename(zx::event token, fbl::RefPtr<Vnode> oldparent,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    if ((r = vfs_name_trim(newStr, &newStr, &new_must_be_dir)) != ZX_OK) {
+    if ((r = TrimName(newStr, &newStr, &new_must_be_dir)) != ZX_OK) {
         return r;
     } else if (newStr == "." || newStr == "..") {
         return ZX_ERR_INVALID_ARGS;
@@ -366,7 +373,7 @@ zx_status_t Vfs::Link(zx::event token, fbl::RefPtr<Vnode> oldparent,
     bool new_must_be_dir;
     if (ReadonlyLocked()) {
         return ZX_ERR_ACCESS_DENIED;
-    } else if ((r = vfs_name_trim(oldStr, &oldStr, &old_must_be_dir)) != ZX_OK) {
+    } else if ((r = TrimName(oldStr, &oldStr, &old_must_be_dir)) != ZX_OK) {
         return r;
     } else if (old_must_be_dir) {
         return ZX_ERR_NOT_DIR;
@@ -376,7 +383,7 @@ zx_status_t Vfs::Link(zx::event token, fbl::RefPtr<Vnode> oldparent,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    if ((r = vfs_name_trim(newStr, &newStr, &new_must_be_dir)) != ZX_OK) {
+    if ((r = TrimName(newStr, &newStr, &new_must_be_dir)) != ZX_OK) {
         return r;
     } else if (new_must_be_dir) {
         return ZX_ERR_NOT_DIR;
@@ -413,8 +420,8 @@ void Vfs::OnConnectionClosedRemotely(Connection* connection) {
     UnregisterConnection(connection);
 }
 
-zx_status_t Vfs::ServeDirectory(fbl::RefPtr<fs::Vnode> vn, zx::channel channel) {
-    uint32_t flags = ZX_FS_FLAG_DIRECTORY;
+zx_status_t Vfs::ServeDirectory(fbl::RefPtr<fs::Vnode> vn, zx::channel channel, uint32_t rights) {
+    const uint32_t flags = ZX_FS_FLAG_DIRECTORY;
     zx_status_t r;
     if ((r = vn->ValidateFlags(flags)) != ZX_OK) {
         return r;
@@ -429,7 +436,7 @@ zx_status_t Vfs::ServeDirectory(fbl::RefPtr<fs::Vnode> vn, zx::channel channel) 
         return r;
     }
 
-    return vn->Serve(this, std::move(channel), ZX_FS_RIGHT_ADMIN);
+    return vn->Serve(this, std::move(channel), flags | rights);
 }
 
 #endif // ifdef __Fuchsia__
@@ -479,7 +486,10 @@ zx_status_t Vfs::Walk(fbl::RefPtr<Vnode> vn, fbl::RefPtr<Vnode>* out_vn,
 
         // Path has at least one additional segment.
         fbl::StringPiece component(path.data(), next_path - path.data());
-        if ((r = vfs_lookup(std::move(vn), &vn, component)) != ZX_OK) {
+        if (component.length() > NAME_MAX) {
+            return ZX_ERR_BAD_PATH;
+        }
+        if ((r = LookupNode(std::move(vn), component, &vn)) != ZX_OK) {
             return r;
         }
         // Traverse to the next segment.

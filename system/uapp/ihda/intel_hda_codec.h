@@ -38,7 +38,7 @@ public:
     static CodecTree& codecs() { return codecs_; }
 
 private:
-    friend class fbl::unique_ptr<IntelHDACodec>;
+    friend class std::default_delete<IntelHDACodec>;
 
     zx_status_t DoCodecCmd(uint16_t nid, const CodecVerb& verb, CodecResponse* resp_out);
     zx_status_t ReadCodecState();
@@ -57,7 +57,7 @@ private:
                                size_t cmd_count);
 
     IntelHDACodec(uint32_t codec_id, const char* const dev_name)
-        : IntelHDADevice(dev_name),
+        : IntelHDADevice(dev_name, Type::Codec),
           codec_id_(codec_id) { }
 
     ~IntelHDACodec() { }

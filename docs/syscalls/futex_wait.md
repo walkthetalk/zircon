@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-futex_wait - Wait on a futex.
+Wait on a futex.
 
 ## SYNOPSIS
 
@@ -75,11 +75,9 @@ None.
 ## SEE ALSO
 
  - [futex objects](../objects/futex.md)
- - [timer slack]
+ - [timer slack](../timer_slack.md)
  - [`zx_futex_requeue()`]
  - [`zx_futex_wake()`]
-
-[timer slack]: ../timer_slack.md
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 

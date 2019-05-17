@@ -171,14 +171,6 @@ public:
         return zx_object_set_property(get(), property, value, size);
     }
 
-    zx_status_t get_cookie(const object_base& scope, uint64_t *cookie) const {
-        return zx_object_get_cookie(get(), scope.get(), cookie);
-    }
-
-    zx_status_t set_cookie(const object_base& scope, uint64_t cookie) const {
-        return zx_object_set_cookie(get(), scope.get(), cookie);
-    }
-
     zx_status_t set_profile(const object<profile>& profile, uint32_t options) const {
         return zx_object_set_profile(get(), profile.get(), options);
     }
@@ -284,15 +276,22 @@ template <typename T> bool operator>=(const object<T>& a, zx_handle_t b) {
 template <typename T>
 class unowned final {
 public:
-    explicit unowned(zx_handle_t h) : value_(h) {}
-    explicit unowned(const T& owner) : unowned(owner.get()) {}
-    explicit unowned(unowned& other) : unowned(*other) {}
+    explicit unowned(zx_handle_t h)
+        : value_(h) {}
+    explicit unowned(const T& owner)
+        : unowned(owner.get()) {}
+    explicit unowned(const unowned& other)
+        : unowned(*other) {}
     constexpr unowned() = default;
     unowned(unowned&& other) = default;
 
     ~unowned() { release_value(); }
 
-    unowned& operator=(unowned& other) {
+    unowned& operator=(const unowned& other) {
+        if (&other == this) {
+            return *this;
+        }
+
         *this = unowned(other);
         return *this;
     }

@@ -5,20 +5,20 @@
 #include <lib/fidl/coding.h>
 
 #include <stdalign.h>
-#include <stdint.h>
-#include <stdlib.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
+#include <lib/fidl/envelope_frames.h>
 #include <lib/fidl/internal.h>
+#include <lib/fidl/visitor.h>
+#include <lib/fidl/walker.h>
 #include <zircon/assert.h>
 #include <zircon/compiler.h>
 
 #ifdef __Fuchsia__
 #include <zircon/syscalls.h>
 #endif
-
-#include "envelope_frames.h"
-#include "visitor.h"
-#include "walker.h"
 
 // TODO(kulakowski) Design zx_status_t error values.
 
@@ -34,7 +34,7 @@ struct StartingPoint {
 struct Position {
     uint32_t offset;
     Position operator+(uint32_t size) const {
-        return Position { offset + size };
+        return Position{offset + size};
     }
     Position& operator+=(uint32_t size) {
         offset += size;
@@ -47,7 +47,7 @@ struct Position {
 };
 
 Position StartingPoint::ToPosition() const {
-    return Position { 0 };
+    return Position{0};
 }
 
 constexpr uintptr_t kAllocPresenceMarker = FIDL_ALLOC_PRESENT;
@@ -56,7 +56,7 @@ constexpr uintptr_t kAllocAbsenceMarker = FIDL_ALLOC_ABSENT;
 using EnvelopeState = ::fidl::EnvelopeFrames::EnvelopeState;
 
 class FidlDecoder final : public fidl::Visitor<
-    fidl::MutatingVisitorTrait, StartingPoint, Position> {
+                              fidl::MutatingVisitorTrait, StartingPoint, Position> {
 public:
     FidlDecoder(void* bytes, uint32_t num_bytes, const zx_handle_t* handles, uint32_t num_handles,
                 uint32_t next_out_of_line, const char** out_error_msg)
@@ -68,7 +68,7 @@ public:
 
     using Position = Position;
 
-    static constexpr bool kContinueAfterConstraintViolation = true;
+    static constexpr bool kContinueAfterConstraintViolation = false;
 
     Status VisitPointer(Position ptr_position,
                         ObjectPointerPointer object_ptr_ptr,
@@ -88,7 +88,7 @@ public:
             return Status::kMemoryError;
         }
 
-        *out_position = Position { next_out_of_line_ };
+        *out_position = Position{next_out_of_line_};
         *object_ptr_ptr = reinterpret_cast<void*>(&bytes_[next_out_of_line_]);
 
         next_out_of_line_ = new_offset;
@@ -146,10 +146,11 @@ public:
         // treat it as unknown and close its contained handles
         if (envelope->presence != kAllocAbsenceMarker && payload_type == nullptr &&
             envelope->num_handles > 0) {
-#ifdef __Fuchsia__
-            zx_handle_close_many(&handles_[handle_idx_], envelope->num_handles);
-#endif
-            handle_idx_ += num_handles_;
+            memcpy(&unknown_handles_[unknown_handle_idx_],
+                   &handles_[handle_idx_],
+                   envelope->num_handles * sizeof(zx_handle_t));
+            handle_idx_ += envelope->num_handles;
+            unknown_handle_idx_ += envelope->num_handles;
         }
         return Status::kSuccess;
     }
@@ -180,6 +181,10 @@ public:
 
     bool DidConsumeAllHandles() const { return handle_idx_ == num_handles_; }
 
+    uint32_t unknown_handle_idx() const { return unknown_handle_idx_; }
+
+    const zx_handle_t* unknown_handles() const { return unknown_handles_; }
+
 private:
     void SetError(const char* error) {
         if (status_ != ZX_OK) {
@@ -203,6 +208,8 @@ private:
     // Decoder state
     zx_status_t status_ = ZX_OK;
     uint32_t handle_idx_ = 0;
+    uint32_t unknown_handle_idx_ = 0;
+    zx_handle_t unknown_handles_[ZX_CHANNEL_MAX_MSG_HANDLES];
     fidl::EnvelopeFrames envelope_frames_;
 };
 
@@ -211,19 +218,28 @@ private:
 zx_status_t fidl_decode(const fidl_type_t* type, void* bytes, uint32_t num_bytes,
                         const zx_handle_t* handles, uint32_t num_handles,
                         const char** out_error_msg) {
-    auto set_error = [&out_error_msg] (const char* msg) {
-        if (out_error_msg) *out_error_msg = msg;
+    auto drop_all_handles = [&]() {
+#ifdef __Fuchsia__
+        // Return value intentionally ignored. This is best-effort cleanup.
+        (void)zx_handle_close_many(handles, num_handles);
+#endif
     };
+    auto set_error = [&out_error_msg](const char* msg) {
+        if (out_error_msg)
+            *out_error_msg = msg;
+    };
+    if (handles == nullptr && num_handles != 0) {
+        set_error("Cannot provide non-zero handle count and null handle pointer");
+        return ZX_ERR_INVALID_ARGS;
+    }
     if (bytes == nullptr) {
         set_error("Cannot decode null bytes");
+        drop_all_handles();
         return ZX_ERR_INVALID_ARGS;
     }
     if (!fidl::IsAligned(reinterpret_cast<uint8_t*>(bytes))) {
         set_error("Bytes must be aligned to FIDL_ALIGNMENT");
-        return ZX_ERR_INVALID_ARGS;
-    }
-    if (handles == nullptr && num_handles != 0) {
-        set_error("Cannot provide non-zero handle count and null handle pointer");
+        drop_all_handles();
         return ZX_ERR_INVALID_ARGS;
     }
 
@@ -233,39 +249,34 @@ zx_status_t fidl_decode(const fidl_type_t* type, void* bytes, uint32_t num_bytes
                                                 num_bytes,
                                                 &next_out_of_line,
                                                 out_error_msg)) != ZX_OK) {
+        drop_all_handles();
         return status;
     }
 
     FidlDecoder decoder(bytes, num_bytes, handles, num_handles, next_out_of_line, out_error_msg);
     fidl::Walk(decoder,
                type,
-               StartingPoint { reinterpret_cast<uint8_t*>(bytes) });
+               StartingPoint{reinterpret_cast<uint8_t*>(bytes)});
 
-    auto drop_all_handles = [&] () {
-#ifdef __Fuchsia__
-        if (handles) {
-            // Return value intentionally ignored. This is best-effort cleanup.
-            (void)zx_handle_close_many(handles, num_handles);
-        }
-#endif
-    };
-
-    if (decoder.status() == ZX_OK) {
-        if (!decoder.DidConsumeAllBytes()) {
-            set_error("message did not decode all provided bytes");
-            drop_all_handles();
-            return ZX_ERR_INVALID_ARGS;
-        }
-        if (!decoder.DidConsumeAllHandles()) {
-            set_error("message did not decode all provided handles");
-            drop_all_handles();
-            return ZX_ERR_INVALID_ARGS;
-        }
-    } else {
+    if (decoder.status() != ZX_OK) {
         drop_all_handles();
+        return decoder.status();
+    }
+    if (!decoder.DidConsumeAllBytes()) {
+        set_error("message did not decode all provided bytes");
+        drop_all_handles();
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if (!decoder.DidConsumeAllHandles()) {
+        set_error("message did not decode all provided handles");
+        drop_all_handles();
+        return ZX_ERR_INVALID_ARGS;
     }
 
-    return decoder.status();
+#ifdef __Fuchsia__
+    (void)zx_handle_close_many(decoder.unknown_handles(), decoder.unknown_handle_idx());
+#endif
+    return ZX_OK;
 }
 
 zx_status_t fidl_decode_msg(const fidl_type_t* type, fidl_msg_t* msg,

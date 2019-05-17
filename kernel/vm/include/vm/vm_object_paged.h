@@ -32,6 +32,7 @@ public:
     // |options_| is a bitmask of:
     static constexpr uint32_t kResizable = (1u << 0);
     static constexpr uint32_t kContiguous = (1u << 1);
+    static constexpr uint32_t kHidden = (1u << 2);
 
     static zx_status_t Create(uint32_t pmm_alloc_flags,
                               uint32_t options,
@@ -52,13 +53,22 @@ public:
     static zx_status_t CreateContiguous(uint32_t pmm_alloc_flags, uint64_t size,
                                         uint8_t alignment_log2, fbl::RefPtr<VmObject>* vmo);
 
-    static zx_status_t CreateFromROData(const void* data, size_t size, fbl::RefPtr<VmObject>* vmo);
+    // Creates a VMO from wired pages.
+    //
+    // Creating a VMO using this method is destructive. Once the VMO is released, its
+    // pages will be released into the general purpose page pool, so it is not possible
+    // to create multiple VMOs for the same region using this method.
+    //
+    // |exclusive| indicates whether or not the created vmo should have exclusive access to
+    // the pages. If exclusive is true, then [data, data + size) will be unmapped from the
+    // kernel address space (unless they lie in the physmap).
+    static zx_status_t CreateFromWiredPages(const void* data, size_t size, bool exclusive,
+                                            fbl::RefPtr<VmObject>* vmo);
 
-    static zx_status_t CreateExternal(fbl::RefPtr<PageSource> src,
+    static zx_status_t CreateExternal(fbl::RefPtr<PageSource> src, uint32_t options,
                                       uint64_t size, fbl::RefPtr<VmObject>* vmo);
 
     zx_status_t Resize(uint64_t size) override;
-    zx_status_t ResizeLocked(uint64_t size) override TA_REQ(lock_);
     uint32_t create_options() const override { return options_; }
     uint64_t size() const override
         // TODO: Figure out whether it's safe to lock here without causing
@@ -67,6 +77,19 @@ public:
     bool is_paged() const override { return true; }
     bool is_contiguous() const override { return (options_ & kContiguous); }
     bool is_resizable() const override { return (options_ & kResizable); }
+    bool is_pager_backed() const override {
+        Guard<fbl::Mutex> guard{&lock_};
+        return GetRootPageSourceLocked() != nullptr;
+    }
+    bool is_hidden() const { return (options_ & kHidden); }
+    ChildType child_type() const override {
+        Guard<fbl::Mutex> guard{&lock_};
+        return (original_parent_user_id_ != 0) ? ChildType::kCowClone : ChildType::kNotChild;
+    }
+    uint64_t parent_user_id() const override {
+        Guard<fbl::Mutex> guard{&lock_};
+        return original_parent_user_id_;
+    }
 
     size_t AllocatedPagesInRange(uint64_t offset, uint64_t len) const override;
 
@@ -89,19 +112,20 @@ public:
 
     void Dump(uint depth, bool verbose) override;
 
-    zx_status_t InvalidateCache(const uint64_t offset, const uint64_t len) override;
-    zx_status_t CleanCache(const uint64_t offset, const uint64_t len) override;
-    zx_status_t CleanInvalidateCache(const uint64_t offset, const uint64_t len) override;
-    zx_status_t SyncCache(const uint64_t offset, const uint64_t len) override;
-
     zx_status_t GetPageLocked(uint64_t offset, uint pf_flags, list_node* free_list,
                               PageRequest* page_request, vm_page_t**, paddr_t*) override
         // Calls a Locked method of the parent, which confuses analysis.
         TA_NO_THREAD_SAFETY_ANALYSIS;
 
-    zx_status_t CloneCOW(bool resizable, uint64_t offset, uint64_t size, bool copy_name,
-                         fbl::RefPtr<VmObject>* clone_vmo) override
-        // Calls a Locked method of the child, which confuses analysis.
+    zx_status_t CreateCowClone(Resizability resizable, CloneType type,
+                               uint64_t offset, uint64_t size,
+                               bool copy_name, fbl::RefPtr<VmObject>* child_vmo) override
+        // This function reaches into the created child, which confuses analysis.
+        TA_NO_THREAD_SAFETY_ANALYSIS;
+    // Inserts |hidden_parent| as a hidden parent of |this|. This vmo and |hidden_parent|
+    // must have the same lock.
+    void InsertHiddenParentLocked(fbl::RefPtr<VmObjectPaged>&& hidden_parent)
+        // This accesses both |this| and |hidden_parent|, which confuses analysis.
         TA_NO_THREAD_SAFETY_ANALYSIS;
 
     void RangeChangeUpdateFromParentLocked(uint64_t offset, uint64_t len) override
@@ -111,34 +135,46 @@ public:
     uint32_t GetMappingCachePolicy() const override;
     zx_status_t SetMappingCachePolicy(const uint32_t cache_policy) override;
 
+    void OnChildRemoved(Guard<Mutex>&& guard) override
+        // Analysis doesn't know that the guard passed to this function is the vmo's lock.
+        TA_NO_THREAD_SAFETY_ANALYSIS;
+    bool OnChildAddedLocked() override TA_REQ(lock_);
+
     void DetachSource() override {
         DEBUG_ASSERT(page_source_);
         page_source_->Detach();
     }
 
-    // The size is clamped to allow VmPageList to use a one-past-the-end for
-    // VmPageListNode offsets.
-    static const uint64_t MAX_SIZE = ROUNDDOWN(UINT64_MAX, VmPageListNode::kPageFanOut * PAGE_SIZE);
+    static constexpr uint64_t MAX_SIZE = VmPageList::MAX_SIZE;
+    // Ensure that MAX_SIZE + PAGE_SIZE doesn't overflow so VmObjectPaged doesn't
+    // need to worry about overflow for loop bounds.
+    static_assert(MAX_SIZE <= ROUNDDOWN(UINT64_MAX, PAGE_SIZE) - PAGE_SIZE);
+    static_assert(MAX_SIZE % PAGE_SIZE == 0);
 
 private:
     // private constructor (use Create())
     VmObjectPaged(
         uint32_t options, uint32_t pmm_alloc_flags, uint64_t size,
-        fbl::RefPtr<VmObject> parent, fbl::RefPtr<PageSource> page_source);
+        fbl::RefPtr<vm_lock_t> root_lock, fbl::RefPtr<PageSource> page_source);
+
+    // Initializes the original parent state of the vmo. |offset| is the offset of
+    // this vmo in |parent|.
+    //
+    // This function should be called at most once, even if the parent changes
+    // after initialization.
+    void InitializeOriginalParentLocked(fbl::RefPtr<VmObject> parent, uint64_t offset)
+        // Accesses both parent and child, which confuses analysis.
+        TA_NO_THREAD_SAFETY_ANALYSIS;
+
+    static zx_status_t CreateCommon(uint32_t pmm_alloc_flags,
+                                    uint32_t options,
+                                    uint64_t size, fbl::RefPtr<VmObject>* vmo);
 
     // private destructor, only called from refptr
     ~VmObjectPaged() override;
     friend fbl::RefPtr<VmObjectPaged>;
 
     DISALLOW_COPY_ASSIGN_AND_MOVE(VmObjectPaged);
-
-    // perform a cache maintenance operation against the vmo.
-    enum class CacheOpType { Invalidate,
-                             Clean,
-                             CleanInvalidate,
-                             Sync
-    };
-    zx_status_t CacheOp(const uint64_t offset, const uint64_t len, const CacheOpType type);
 
     // add a page to the object
     zx_status_t AddPage(vm_page_t* p, uint64_t offset);
@@ -150,8 +186,12 @@ private:
     zx_status_t PinLocked(uint64_t offset, uint64_t len) TA_REQ(lock_);
     void UnpinLocked(uint64_t offset, uint64_t len) TA_REQ(lock_);
 
-    fbl::RefPtr<PageSource> GetRootPageSourceLocked()
-        // Walks the clone chain to get the root page source, which confuses analysis.
+    fbl::RefPtr<PageSource> GetRootPageSourceLocked() const
+        // Walks the parent chain to get the root page source, which confuses analysis.
+        TA_NO_THREAD_SAFETY_ANALYSIS;
+
+    bool IsBidirectionalClonable() const
+        // Walks the parent chain since the root determines clonability.
         TA_NO_THREAD_SAFETY_ANALYSIS;
 
     // internal check if any pages in a range are pinned
@@ -164,15 +204,34 @@ private:
     template <typename T>
     zx_status_t ReadWriteInternal(uint64_t offset, size_t len, bool write, T copyfunc);
 
-    // set our offset within our parent
-    zx_status_t SetParentOffsetLocked(uint64_t o) TA_REQ(lock_);
+    // Searches for info for initialization of a page being commited into |this| at |offset|.
+    //
+    // If an ancestor has a committed page which corresponds to |offset|, returns that page
+    // as well as the VmObject and offset which own the page. If no ancestor has a committed
+    // page for the offset, returns null as well as the VmObject/offset which need to be queried
+    // to populate the page.
+    //
+    // It is an error to call this when |this| has a committed page at |offset|.
+    vm_page_t* FindInitialPageContentLocked(
+            uint64_t offset, uint pf_flags, VmObject** owner_out, uint64_t* owner_offset_out)
+            // Walks the child chain, which confuses analysis.
+            TA_NO_THREAD_SAFETY_ANALYSIS;
 
     // members
     const uint32_t options_;
     uint64_t size_ TA_GUARDED(lock_) = 0;
+    // offset in the *parent* where this object starts
     uint64_t parent_offset_ TA_GUARDED(lock_) = 0;
-    uint32_t pmm_alloc_flags_ TA_GUARDED(lock_) = PMM_ALLOC_FLAG_ANY;
+    // offset in *this object* where it stops referring to its parent
+    uint64_t parent_limit_ TA_GUARDED(lock_) = 0;
+    const uint32_t pmm_alloc_flags_ = PMM_ALLOC_FLAG_ANY;
     uint32_t cache_policy_ TA_GUARDED(lock_) = ARCH_MMU_FLAG_CACHED;
+
+    // parent pointer (may be null)
+    fbl::RefPtr<VmObject> parent_ TA_GUARDED(lock_);
+    // Record the user_id_ of the original parent, in case we make
+    // a bidirectional clone and end up changing parent_.
+    uint64_t original_parent_user_id_ TA_GUARDED(lock_) = 0;
 
     // The page source, if any.
     const fbl::RefPtr<PageSource> page_source_;

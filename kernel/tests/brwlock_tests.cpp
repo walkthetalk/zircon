@@ -7,9 +7,9 @@
 #include "tests.h"
 
 #include <fbl/algorithm.h>
-#include <fbl/atomic.h>
 #include <kernel/brwlock.h>
 #include <kernel/mp.h>
+#include <ktl/atomic.h>
 #include <lib/unittest/unittest.h>
 #include <platform.h>
 
@@ -23,6 +23,7 @@ static void rand_delay() {
 
 // Use a helper class for running tests so that worker threads and main thread all
 // have easy access to shared state.
+template<typename LockType>
 class BrwLockTest {
 public:
     BrwLockTest() : state_(0), kill_(false) {}
@@ -32,7 +33,7 @@ public:
     static bool RunTest() {
         BEGIN_TEST;
 
-        BrwLockTest test;
+        BrwLockTest<LockType> test;
         thread_t* reader_threads[readers];
         thread_t* writer_threads[writers];
         thread_t* upgrader_threads[upgraders];
@@ -92,7 +93,7 @@ public:
         zx_time_t start = current_time();
         zx_duration_t duration = ZX_MSEC(300);
         while (current_time() < start + duration) {
-            uint32_t local_state = test.state_.load(fbl::memory_order_relaxed);
+            uint32_t local_state = test.state_.load(ktl::memory_order_relaxed);
             uint32_t num_readers = local_state & 0xffff;
             uint32_t num_writers = local_state >> 16;
             EXPECT_LE(num_readers, readers + upgraders, "Too many readers");
@@ -105,7 +106,7 @@ public:
 
         // Shutdown all the threads. Validating they can shutdown is important
         // to ensure they didn't get stuck on the waitqueue and never woken up.
-        test.kill_.store(true, fbl::memory_order_seq_cst);
+        test.kill_.store(true, ktl::memory_order_seq_cst);
         zx_time_t join_deadline = current_time() + ZX_SEC(5);
         for (auto& t : reader_threads) {
             zx_status_t status = thread_join(t, nullptr, join_deadline);
@@ -119,7 +120,7 @@ public:
             zx_status_t status = thread_join(t, nullptr, join_deadline);
             EXPECT_EQ(status, ZX_OK, "Upgrader failed to complete");
         }
-        EXPECT_EQ(test.state_.load(fbl::memory_order_seq_cst), 0u, "Threads still holding lock");
+        EXPECT_EQ(test.state_.load(ktl::memory_order_seq_cst), 0u, "Threads still holding lock");
 
         // Restore original priority.
         thread_set_priority(get_current_thread(), old_prio);
@@ -129,52 +130,56 @@ public:
 
 private:
     void ReaderWorker() {
-        while (!kill_.load(fbl::memory_order_relaxed)) {
+        while (!kill_.load(ktl::memory_order_relaxed)) {
             lock_.ReadAcquire();
-            state_.fetch_add(1, fbl::memory_order_relaxed);
+            state_.fetch_add(1, ktl::memory_order_relaxed);
             thread_yield();
-            state_.fetch_sub(1, fbl::memory_order_relaxed);
+            state_.fetch_sub(1, ktl::memory_order_relaxed);
             lock_.ReadRelease();
             rand_delay();
         }
     }
 
     void WriterWorker() {
-        while (!kill_.load(fbl::memory_order_relaxed)) {
+        while (!kill_.load(ktl::memory_order_relaxed)) {
             lock_.WriteAcquire();
-            state_.fetch_add(0x10000, fbl::memory_order_relaxed);
+            state_.fetch_add(0x10000, ktl::memory_order_relaxed);
             thread_yield();
-            state_.fetch_sub(0x10000, fbl::memory_order_relaxed);
+            state_.fetch_sub(0x10000, ktl::memory_order_relaxed);
             lock_.WriteRelease();
             rand_delay();
         }
     }
 
     void UpgraderWorker() {
-        while (!kill_.load(fbl::memory_order_relaxed)) {
+        while (!kill_.load(ktl::memory_order_relaxed)) {
             lock_.ReadAcquire();
-            state_.fetch_add(1, fbl::memory_order_relaxed);
+            state_.fetch_add(1, ktl::memory_order_relaxed);
             thread_yield();
-            state_.fetch_sub(1, fbl::memory_order_relaxed);
+            state_.fetch_sub(1, ktl::memory_order_relaxed);
             lock_.ReadUpgrade();
-            state_.fetch_add(0x10000, fbl::memory_order_relaxed);
+            state_.fetch_add(0x10000, ktl::memory_order_relaxed);
             thread_yield();
-            state_.fetch_sub(0x10000, fbl::memory_order_relaxed);
+            state_.fetch_sub(0x10000, ktl::memory_order_relaxed);
             lock_.WriteRelease();
             rand_delay();
         }
     }
 
-    BrwLock lock_;
-    fbl::atomic<uint32_t> state_;
-    fbl::atomic<bool> kill_;
+    LockType lock_;
+    ktl::atomic<uint32_t> state_;
+    ktl::atomic<bool> kill_;
 };
 
 UNITTEST_START_TESTCASE(brwlock_tests)
 // The number of threads to use for readers, writers and upgraders was chosen by manual
 // instrumentation of the brwlock to see if all the different code paths were being hit.
-UNITTEST("parallel readers", (BrwLockTest::RunTest<8, 0, 0>))
-UNITTEST("single writer", (BrwLockTest::RunTest<0, 4, 0>))
-UNITTEST("readers and writer", (BrwLockTest::RunTest<4, 2, 0>))
-UNITTEST("upgraders", (BrwLockTest::RunTest<2, 0, 3>))
+UNITTEST("parallel readers(PI)", (BrwLockTest<BrwLockPi>::RunTest<8, 0, 0>))
+UNITTEST("single writer(PI)", (BrwLockTest<BrwLockPi>::RunTest<0, 4, 0>))
+UNITTEST("readers and writer(PI)", (BrwLockTest<BrwLockPi>::RunTest<4, 2, 0>))
+UNITTEST("upgraders(PI)", (BrwLockTest<BrwLockPi>::RunTest<2, 0, 3>))
+UNITTEST("parallel readers(No PI)", (BrwLockTest<BrwLockNoPi>::RunTest<8, 0, 0>))
+UNITTEST("single writer(No PI)", (BrwLockTest<BrwLockNoPi>::RunTest<0, 4, 0>))
+UNITTEST("readers and writer(No PI)", (BrwLockTest<BrwLockNoPi>::RunTest<4, 2, 0>))
+UNITTEST("upgraders(No PI)", (BrwLockTest<BrwLockNoPi>::RunTest<2, 0, 3>))
 UNITTEST_END_TESTCASE(brwlock_tests, "brwlock", "brwlock tests");

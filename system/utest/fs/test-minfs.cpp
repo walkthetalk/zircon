@@ -13,10 +13,10 @@
 
 #include <fbl/algorithm.h>
 #include <fbl/unique_fd.h>
-#include <fs-management/ramdisk.h>
+#include <ramdevice-client/ramdisk.h>
 #include <fuchsia/io/c/fidl.h>
 #include <fuchsia/minfs/c/fidl.h>
-#include <fvm/fvm.h>
+#include <fvm/format.h>
 #include <lib/fdio/vfs.h>
 #include <lib/fzl/fdio.h>
 #include <minfs/format.h>
@@ -42,6 +42,9 @@ bool QueryInfo(fuchsia_io_FilesystemInfo* info) {
     BEGIN_HELPER;
     fbl::unique_fd fd(open(kMountPath, O_RDONLY | O_DIRECTORY));
     ASSERT_TRUE(fd);
+    // Sync before querying fs so that we can obtain an accurate number of used bytes. Otherwise,
+    // blocks which are reserved but not yet allocated won't be counted.
+    fsync(fd.get());
     zx_status_t status;
     fzl::FdioCaller caller(std::move(fd));
     ASSERT_EQ(fuchsia_io_DirectoryAdminQueryFilesystem(caller.borrow_channel(), &status, info),
@@ -112,10 +115,9 @@ bool TestQueryInfo() {
         char path[128];
         snprintf(path, sizeof(path) - 1, "%s/file_%d", kMountPath, i);
 
-        int fd = open(path, O_CREAT | O_RDWR);
-        ASSERT_GT(fd, 0, "Failed to create file");
-        ASSERT_EQ(ftruncate(fd, 30 * 1024), 0);
-        ASSERT_EQ(close(fd), 0);
+        fbl::unique_fd fd(open(path, O_CREAT | O_RDWR));
+        ASSERT_GT(fd.get(), 0, "Failed to create file");
+        ASSERT_EQ(ftruncate(fd.get(), 30 * 1024), 0);
     }
 
     // Adjust our query expectations: We should see 16 new nodes, but no other
@@ -171,22 +173,46 @@ bool TestMetrics() {
     fuchsia_minfs_Metrics metrics;
     ASSERT_TRUE(GetMetrics(&metrics));
 
-    ASSERT_EQ(metrics.create_calls, 0);
-    ASSERT_EQ(metrics.create_calls_success, 0);
+    ASSERT_EQ(metrics.fs_metrics.create.success.total_calls, 0);
+    ASSERT_EQ(metrics.fs_metrics.create.failure.total_calls, 0);
 
     char path[128];
     snprintf(path, sizeof(path) - 1, "%s/test-file", kMountPath);
     fbl::unique_fd fd(open(path, O_CREAT | O_RDWR));
     ASSERT_TRUE(fd);
     ASSERT_TRUE(GetMetrics(&metrics));
-    ASSERT_EQ(metrics.create_calls, 1);
-    ASSERT_EQ(metrics.create_calls_success, 1);
+    ASSERT_EQ(metrics.fs_metrics.create.success.total_calls, 1);
+    ASSERT_EQ(metrics.fs_metrics.create.failure.total_calls, 0);
+    ASSERT_NE(metrics.fs_metrics.create.success.total_time_spent, 0);
+    ASSERT_EQ(metrics.fs_metrics.create.failure.total_time_spent, 0);
 
     fd.reset(open(path, O_CREAT | O_RDWR | O_EXCL));
     ASSERT_FALSE(fd);
     ASSERT_TRUE(GetMetrics(&metrics));
-    ASSERT_EQ(metrics.create_calls, 2);
-    ASSERT_EQ(metrics.create_calls_success, 1);
+    ASSERT_EQ(metrics.fs_metrics.create.success.total_calls, 1);
+    ASSERT_EQ(metrics.fs_metrics.create.failure.total_calls, 1);
+    ASSERT_NE(metrics.fs_metrics.create.success.total_time_spent, 0);
+    ASSERT_NE(metrics.fs_metrics.create.failure.total_time_spent, 0);
+
+    ASSERT_TRUE(GetMetrics(&metrics));
+    ASSERT_EQ(metrics.fs_metrics.unlink.success.total_calls, 0);
+    ASSERT_EQ(metrics.fs_metrics.unlink.failure.total_calls, 0);
+    ASSERT_EQ(metrics.fs_metrics.unlink.success.total_time_spent, 0);
+    ASSERT_EQ(metrics.fs_metrics.unlink.failure.total_time_spent, 0);
+
+    ASSERT_EQ(unlink(path), 0);
+    ASSERT_TRUE(GetMetrics(&metrics));
+    ASSERT_EQ(metrics.fs_metrics.unlink.success.total_calls, 1);
+    ASSERT_EQ(metrics.fs_metrics.unlink.failure.total_calls, 0);
+    ASSERT_NE(metrics.fs_metrics.unlink.success.total_time_spent, 0);
+    ASSERT_EQ(metrics.fs_metrics.unlink.failure.total_time_spent, 0);
+
+    ASSERT_NE(unlink(path), 0);
+    ASSERT_TRUE(GetMetrics(&metrics));
+    ASSERT_EQ(metrics.fs_metrics.unlink.success.total_calls, 1);
+    ASSERT_EQ(metrics.fs_metrics.unlink.failure.total_calls, 1);
+    ASSERT_NE(metrics.fs_metrics.unlink.success.total_time_spent, 0);
+    ASSERT_NE(metrics.fs_metrics.unlink.failure.total_time_spent, 0);
 
     ASSERT_TRUE(ToggleMetrics(false));
     ASSERT_TRUE(GetMetricsUnavailable());
@@ -310,19 +336,24 @@ bool TestFullOperations() {
               minfs::kMinfsBlockSize * minfs::kMinfsDirect);
     ASSERT_LT(write(med_fd.get(), data, sizeof(data)), 0);
 
-    // Since the last operation failed, we should still have 1 free block remaining. Writing to the
-    // beginning of the second file should only require 1 (direct) block, and therefore pass.
-    // Note: This fails without block reservation.
-    ASSERT_EQ(write(sml_fd.get(), data, sizeof(data)), sizeof(data));
-
     // Without block reservation, something from the failed write remains allocated. Try editing
     // nearby blocks to force a writeback of partially allocated data.
-    // Note: This will likely fail without block reservation.
+    // Note: This will fail without block reservation since the previous failed write would leave
+    //       the only free block incorrectly allocated and 1 additional block is required for
+    //       copy-on-write truncation.
     struct stat s;
     ASSERT_EQ(fstat(big_fd.get(), &s), 0);
     ssize_t truncate_size = fbl::round_up(static_cast<uint64_t>(s.st_size / 2),
                                           minfs::kMinfsBlockSize);
     ASSERT_EQ(ftruncate(big_fd.get(), truncate_size), 0);
+
+    // We should still have 1 free block remaining. Writing to the beginning of the second file
+    // should only require 1 (direct) block, and therefore pass.
+    // Note: This fails without block reservation.
+    ASSERT_EQ(write(sml_fd.get(), data, sizeof(data)), sizeof(data));
+
+    // Attempt to remount. Without block reservation, an additional block from the previously
+    // failed write will still be incorrectly allocated, causing fsck to fail.
     ASSERT_TRUE(check_remount());
 
     // Re-open files.
@@ -490,14 +521,24 @@ bool TestUnlinkFail(void) {
     // and all unlinked files will be left intact (on disk).
     ASSERT_EQ(ramdisk_sleep_after(test_ramdisk, 0), 0);
 
-    for (unsigned i = first_fd + 1; i < last_fd; i++) {
+    // The ramdisk is asleep but since no transactions have been processed, the writeback state has
+    // not been updated. The first file we close will appear to succeed.
+    ASSERT_EQ(close(fds[first_fd + 1].release()), 0);
+
+    // Sync to ensure the writeback state is updated. Since the purge from the previous close will
+    // fail, sync will also fail.
+    ASSERT_LT(syncfs(fd.get()), 0);
+
+    // All succeeding close calls will fail.
+    for (unsigned i = first_fd + 2; i < last_fd; i++) {
         if (i != mid_fd) {
-            ASSERT_EQ(close(fds[i].release()), 0);
+            ASSERT_LT(close(fds[i].release()), 0);
         }
     }
 
-    // Sync Minfs to ensure all close operations complete.
-    ASSERT_EQ(syncfs(fd.get()), 0);
+    // Sync Minfs to ensure all close operations complete. Since Minfs is in a read-only state and
+    // some requests have not been successfully persisted to disk, the sync is expected to fail.
+    ASSERT_LT(syncfs(fd.get()), 0);
 
     // Writeback should have failed.
     // However, the in-memory state has been updated correctly.

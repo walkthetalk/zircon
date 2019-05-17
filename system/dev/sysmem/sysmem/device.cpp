@@ -8,7 +8,6 @@
 #include "amlogic_memory_allocator.h"
 #include "buffer_collection_token.h"
 #include "macros.h"
-#include "sysmem-proxy.h"
 
 #include <ddk/device.h>
 #include <ddk/platform-defs.h>
@@ -23,6 +22,7 @@ namespace {
 
 fuchsia_sysmem_DriverConnector_ops_t driver_connector_ops = {
     .Connect = fidl::Binder<Device>::BindMember<&Device::Connect>,
+    .GetProtectedMemoryInfo = fidl::Binder<Device>::BindMember<&Device::GetProtectedMemoryInfo>,
 };
 
 zx_status_t sysmem_message(void* device_ctx, fidl_msg_t* msg, fidl_txn_t* txn) {
@@ -38,18 +38,10 @@ zx_protocol_device_t sysmem_device_ops = [] {
     return tmp;
 }();
 
-zx_protocol_device_t out_of_proc_sysmem_protocol_ops = [] {
-    zx_protocol_device_t tmp{};
-    tmp.version = DEVICE_OPS_VERSION;
-    // tmp.message is not used - sysmem_device_ops.message is used for incoming
-    // FIDL messages.
-    return tmp;
-}();
-
 zx_status_t in_proc_sysmem_Connect(void* ctx,
-                                   zx_handle_t allocator2_request_param) {
+                                   zx_handle_t allocator_request_param) {
     Device* self = static_cast<Device*>(ctx);
-    return self->Connect(allocator2_request_param);
+    return self->Connect(allocator_request_param);
 }
 
 // In-proc sysmem interface.  Essentially an in-proc version of
@@ -57,55 +49,6 @@ zx_status_t in_proc_sysmem_Connect(void* ctx,
 sysmem_protocol_ops_t in_proc_sysmem_protocol_ops = {
     .connect = in_proc_sysmem_Connect,
 };
-
-// This function is used as a platform_proxy_cb.callback.
-void sysmem_proxy_cb(void* ctx, const void* req_buffer, size_t req_size,
-                     const zx_handle_t* req_handle_list,
-                     size_t req_handle_count, void* out_resp_buffer,
-                     size_t resp_size, size_t* out_resp_actual,
-                     zx_handle_t* out_resp_handle_list,
-                     size_t resp_handle_count, size_t* out_resp_handle_actual) {
-    // Consume or close all the incoming handles, regardless of how far we get.
-    // If we consume the first few handles (or first handle), don't close those.
-    uint32_t handles_consumed = 0;
-    auto close_extra_handles = fit::defer(
-        [req_handle_list, req_handle_count, &handles_consumed]{
-        for (uint32_t i = handles_consumed; i < req_handle_count; i++) {
-            zx_handle_close(req_handle_list[i]);
-        }
-    });
-
-    const rpc_sysmem_req_t* req = (rpc_sysmem_req_t*)req_buffer;
-    rpc_sysmem_rsp_t* resp = (rpc_sysmem_rsp_t*)out_resp_buffer;
-
-    if (req_size < sizeof(*req) || resp_size < sizeof(*resp)) {
-        resp->header.status = ZX_ERR_BUFFER_TOO_SMALL;
-        return;
-    }
-
-    if (req->header.proto_id != ZX_PROTOCOL_SYSMEM) {
-        resp->header.status = ZX_ERR_NOT_SUPPORTED;
-        return;
-    }
-
-    *out_resp_actual = sizeof(*resp);
-    *out_resp_handle_actual = 0;
-
-    switch (req->header.op) {
-    case SYSMEM_CONNECT: {
-        if (req_handle_count < 1) {
-            resp->header.status = ZX_ERR_BUFFER_TOO_SMALL;
-            return;
-        }
-        resp->header.status = in_proc_sysmem_Connect(ctx, req_handle_list[0]);
-        handles_consumed = 1;
-        break;
-    }
-    default:
-        resp->header.status = ZX_ERR_NOT_SUPPORTED;
-        return;
-    }
-}
 
 } // namespace
 
@@ -155,7 +98,7 @@ zx_status_t Device::Bind() {
 
     // TODO: Separate protected memory allocator into separate driver or library
     if (pdev_device_info_vid_ == PDEV_VID_AMLOGIC && protected_memory_size > 0) {
-        auto amlogic_allocator = fbl::make_unique<AmlogicMemoryAllocator>(std::move(bti_copy));
+        auto amlogic_allocator = std::make_unique<AmlogicMemoryAllocator>(std::move(bti_copy));
         status = amlogic_allocator->Init(protected_memory_size);
         if (status != ZX_OK) {
             DRIVER_ERROR("Failed to init allocator for amlogic protected memory: %d", status);
@@ -182,7 +125,7 @@ zx_status_t Device::Bind() {
     // callback used is sysmem_device_ops.message, not
     // sysmem_protocol_ops.message.
     device_add_args.proto_id = ZX_PROTOCOL_SYSMEM;
-    device_add_args.proto_ops = &out_of_proc_sysmem_protocol_ops;
+    device_add_args.proto_ops = &in_proc_sysmem_protocol_ops;
     device_add_args.flags = DEVICE_ADD_INVISIBLE;
 
     status = device_add(parent_device_, &device_add_args, &device_);
@@ -199,10 +142,9 @@ zx_status_t Device::Bind() {
     // We should only pbus_register_protocol() if device_add() succeeded, but if
     // pbus_register_protocol() fails, we should remove the device without it
     // ever being visible.
-    const platform_proxy_cb_t callback = {sysmem_proxy_cb, this};
     status = pbus_register_protocol(
         &pbus, ZX_PROTOCOL_SYSMEM, &in_proc_sysmem_protocol_,
-        sizeof(in_proc_sysmem_protocol_), &callback);
+        sizeof(in_proc_sysmem_protocol_));
     if (status != ZX_OK) {
         zx_status_t remove_status = device_remove(device_);
         // If this failed, we're potentially leaving the device invisible in a
@@ -224,6 +166,17 @@ zx_status_t Device::Connect(zx_handle_t allocator_request) {
     // The Allocator is channel-owned / self-owned.
     Allocator::CreateChannelOwned(std::move(local_allocator_request), this);
     return ZX_OK;
+}
+
+zx_status_t Device::GetProtectedMemoryInfo(fidl_txn* txn) {
+    if (!protected_allocator_) {
+        return fuchsia_sysmem_DriverConnectorGetProtectedMemoryInfo_reply(txn, ZX_ERR_NOT_SUPPORTED, 0u, 0u);
+    }
+
+    uint64_t base;
+    uint64_t size;
+    zx_status_t status = protected_allocator_->GetProtectedMemoryInfo(&base, &size);
+    return fuchsia_sysmem_DriverConnectorGetProtectedMemoryInfo_reply(txn, status, base, size);
 }
 
 const zx::bti& Device::bti() {

@@ -14,7 +14,9 @@
 #include <fbl/unique_fd.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/async-loop/cpp/loop.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fzl/fdio.h>
 #include <lib/memfs/memfs.h>
 #include <unittest/unittest.h>
@@ -132,7 +134,8 @@ bool TestFidlQueryFilesystem() {
         ASSERT_TRUE(QueryInfo("/fidltmp-basic", &info));
 
         // Query number of blocks
-        ASSERT_EQ(info.total_bytes, UINT64_MAX);
+        uint64_t physmem_size = zx_system_get_physmem();
+        ASSERT_EQ(info.total_bytes, physmem_size);
         ASSERT_EQ(info.used_bytes, 0);
 
         loop.Shutdown();

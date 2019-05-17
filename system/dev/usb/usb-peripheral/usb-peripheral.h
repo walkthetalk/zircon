@@ -15,6 +15,8 @@
 #include <fbl/string.h>
 #include <fbl/vector.h>
 #include <fuchsia/hardware/usb/peripheral/c/fidl.h>
+#include <lib/zx/channel.h>
+#include <usb/request-cpp.h>
 
 /*
     THEORY OF OPERATION
@@ -46,7 +48,7 @@
     and functions_bound_ is true, then we are ready to start USB in peripheral role.
     At this point, we create DDK devices for our list of functions.
     When the function drivers bind to these functions, they register an interface of type
-    usb_function_interface_t with this driver via the usb_function_register() API.
+    usb_function_interface_protocol_t with this driver via the usb_function_register() API.
     Once all of the function drivers have registered themselves this way,
     UsbPeripheral.functions_registered_ is set to true.
 
@@ -79,10 +81,9 @@ using UsbPeripheralType = ddk::Device<UsbPeripheral, ddk::Unbindable, ddk::Messa
 // one for each USB function in the peripheral role configuration.
 class UsbPeripheral : public UsbPeripheralType,
                       public ddk::EmptyProtocol<ZX_PROTOCOL_USB_PERIPHERAL>,
-                      public ddk::UsbDciInterface<UsbPeripheral> {
+                      public ddk::UsbDciInterfaceProtocol<UsbPeripheral> {
 public:
-    UsbPeripheral(zx_device_t* parent)
-        : UsbPeripheralType(parent), dci_(parent), ums_(parent) {}
+    UsbPeripheral(zx_device_t* parent) : UsbPeripheralType(parent), dci_(parent), ums_(parent) {}
 
     static zx_status_t Create(void* ctx, zx_device_t* parent);
 
@@ -108,17 +109,20 @@ public:
     zx_status_t MsgSetMode(uint32_t mode, fidl_txn_t* txn);
 
     zx_status_t SetFunctionInterface(fbl::RefPtr<UsbFunction> function,
-                                     const usb_function_interface_t* interface);
+                                     const usb_function_interface_protocol_t* interface);
     zx_status_t AllocInterface(fbl::RefPtr<UsbFunction> function, uint8_t* out_intf_num);
     zx_status_t AllocEndpoint(fbl::RefPtr<UsbFunction> function, uint8_t direction,
                               uint8_t* out_address);
-    zx_status_t AllocStringDesc(const char* string, uint8_t* out_index);
+    zx_status_t AllocStringDesc(fbl::String desc, uint8_t* out_index);
     zx_status_t ValidateFunction(fbl::RefPtr<UsbFunction> function, void* descriptors, size_t length,
                                  uint8_t* out_num_interfaces);
     zx_status_t FunctionRegistered();
 
     inline const ddk::UsbDciProtocolClient& dci() const { return dci_; }
     inline size_t ParentRequestSize() const { return parent_request_size_; }
+    zx_status_t MsgSetStateChangeListener(zx_handle_t handle);
+    void UsbPeripheralRequestQueue(usb_request_t* usb_request,
+                                   const usb_request_complete_t* complete_cb);
 
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(UsbPeripheral);
@@ -152,6 +156,8 @@ private:
     zx_status_t SetConfiguration(uint8_t configuration);
     zx_status_t SetInterface(uint8_t interface, uint8_t alt_setting);
     zx_status_t SetDefaultConfig(FunctionDescriptor* descriptors, size_t length);
+    int ListenerCleanupThread();
+    void RequestComplete(usb_request_t* req);
 
     // Our parent's DCI protocol.
     const ddk::UsbDciProtocolClient dci_;
@@ -178,12 +184,14 @@ private:
     // Set if ioctl_usb_peripheral_bind_functions() has been called
     // and we have a complete list of our function.
     bool functions_bound_ __TA_GUARDED(lock_) = false;
-    // True if all our functions have registered their usb_function_interface_t.
+    // True if all our functions have registered their usb_function_interface_protocol_t.
     bool functions_registered_ __TA_GUARDED(lock_) = false;
     // True if we have added child devices for our functions.
     bool function_devs_added_ __TA_GUARDED(lock_) = false;
     // True if we are connected to a host,
     bool connected_ __TA_GUARDED(lock_) = false;
+    // True if we are shutting down/clearing functions
+    bool shutting_down_ = false;
     // Current configuration number selected via USB_REQ_SET_CONFIGURATION
     // (will be 0 or 1 since we currently do not support multiple configurations).
     uint8_t configuration_;
@@ -191,6 +199,16 @@ private:
     usb_speed_t speed_;
     // Size of our parent's usb_request_t.
     size_t parent_request_size_;
+    // Registered listener
+    zx::channel listener_;
+
+    thrd_t thread_ = 0;
+
+    bool cache_enabled_ = true;
+    bool cache_report_enabled_ = true;
+
+    fbl::Mutex pending_requests_lock_;
+    usb::UnownedRequestList<void> pending_requests_ __TA_GUARDED(pending_requests_lock_);
 };
 
 } // namespace usb_peripheral

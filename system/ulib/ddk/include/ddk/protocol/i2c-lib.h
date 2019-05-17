@@ -3,7 +3,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_PROTOCOL_I2C_LIB_H_
+#define DDK_PROTOCOL_I2C_LIB_H_
 
 #include <string.h>
 
@@ -13,13 +14,7 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-__BEGIN_CDECLS;
-
-typedef struct {
-    size_t length;
-    bool is_read;
-    bool stop;
-} __PACKED i2c_rpc_op_t;
+__BEGIN_CDECLS
 
 // Writes and reads data on an i2c channel. If both write_length and read_length
 // are greater than zero, this call will perform a write operation immediately followed
@@ -96,4 +91,6 @@ static inline zx_status_t i2c_read_sync(const i2c_protocol_t* i2c, void* read_bu
     return i2c_write_read_sync(i2c, NULL, 0, read_buf, read_length);
 }
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // DDK_PROTOCOL_I2C_LIB_H_

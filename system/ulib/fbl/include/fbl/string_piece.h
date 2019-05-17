@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_STRING_PIECE_H_
+#define FBL_STRING_PIECE_H_
 
 #include <string.h>
 #include <type_traits>
@@ -31,10 +32,10 @@ constexpr static size_t constexpr_strlen(const char* str) {
 class StringPiece {
 public:
     constexpr StringPiece()
-        : data_(nullptr), length_(0u) {}
+        : data_(nullptr), length_(0U) {}
 
     constexpr StringPiece(const char* data)
-        : data_(data), length_(data != nullptr ? constexpr_strlen(data) : 0u) {}
+        : data_(data), length_(data != nullptr ? constexpr_strlen(data) : 0U) {}
 
     constexpr StringPiece(const char* data, size_t length)
         : data_(data), length_(length) {}
@@ -54,7 +55,7 @@ public:
 
     constexpr size_t length() const { return length_; }
     constexpr size_t size() const { return length_; }
-    constexpr bool empty() const { return length_ == 0u; }
+    constexpr bool empty() const { return length_ == 0U; }
 
     constexpr const char* begin() const { return data_; }
     constexpr const char* cbegin() const { return data_; }
@@ -67,7 +68,7 @@ public:
 
     void clear() {
         data_ = nullptr;
-        length_ = 0u;
+        length_ = 0U;
     }
 
     constexpr StringPiece& operator=(const StringPiece& other) = default;
@@ -81,7 +82,7 @@ public:
 
     void set(const char* data) {
         data_ = data;
-        length_ = data != nullptr ? constexpr_strlen(data) : 0u;
+        length_ = data != nullptr ? constexpr_strlen(data) : 0U;
     }
 
     void set(const char* data, size_t length) {
@@ -120,3 +121,5 @@ inline bool operator>=(const StringPiece& lhs, const StringPiece& rhs) {
 }
 
 } // namespace fbl
+
+#endif  // FBL_STRING_PIECE_H_

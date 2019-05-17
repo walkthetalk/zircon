@@ -5,6 +5,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <optional>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -14,7 +15,7 @@
 #include <blobfs/host.h>
 #include <fbl/unique_fd.h>
 #include <fs-management/mount.h>
-#include <fvm/fvm.h>
+#include <fvm/format.h>
 #include <fvm/fvm-sparse.h>
 #include <minfs/bcache.h>
 #include <minfs/format.h>
@@ -56,6 +57,61 @@ typedef struct {
     bool zero_fill;
 } vslice_info_t;
 
+// Reservation is a request that may or may not be approved.
+// Request for reservation may fail the AddPartition or
+// request may be rejected silently. Only way to verify is
+// to check both return value and "reserved" field.
+struct fvm_reserve_t {
+    // How many bytes/inodes needs to be reserved. Serves as input to
+    // AddPartition.
+    std::optional<uint64_t> request;
+
+    // How many bytes/inodes were reserved. Serves as output of
+    // AddPartition.
+    // Depending on filesystems, more than request may be reserved.
+    uint64_t reserved;
+};
+
+class FvmReservation {
+
+public:
+    FvmReservation() {}
+    FvmReservation(std::optional<uint64_t> inode_count, std::optional<uint64_t> data,
+                   std::optional<uint64_t> total_bytes) {
+        nodes_.request = inode_count;
+        data_.request = data;
+        total_bytes_.request = total_bytes;
+    }
+
+    // Returns true if all parts of the request are approved.
+    bool Approved() const;
+
+    void Dump(FILE* stream) const;
+
+    fvm_reserve_t inodes() const { return nodes_; }
+
+    fvm_reserve_t total_bytes() const { return total_bytes_; }
+
+    fvm_reserve_t data() const { return data_; }
+
+    void set_inodes_reserved(uint64_t reserved) { nodes_.reserved = reserved; }
+
+    void set_data_reserved(uint64_t reserved) { data_.reserved = reserved; }
+
+    void set_total_bytes_reserved(uint64_t reserved) { total_bytes_.reserved = reserved; }
+
+private:
+    // Reserve number of files/directory that can be created.
+    fvm_reserve_t nodes_ = {};
+
+    // Raw bytes for "data" that needs to be reserved.
+    fvm_reserve_t data_ = {};
+
+    // Byte limit on the reservation. Zero value implies limitless. If set,
+    // over-committing will fail. Return value contains total bytes reserved.
+    fvm_reserve_t total_bytes_ = {};
+};
+
 // Format defines an interface for file systems to implement in order to be placed into an FVM or
 // sparse container
 class Format {
@@ -64,13 +120,34 @@ public:
     static zx_status_t Detect(int fd, off_t offset, disk_format_t* out);
     // Read file at |path| and generate appropriate Format
     static zx_status_t Create(const char* path, const char* type, fbl::unique_ptr<Format>* out);
-    // Fun fsck on partition contained between bytes |start| and |end|
+    // Run fsck on partition contained between bytes |start| and |end|. extent_lengths is lengths
+    // of each extent (in bytes).
     static zx_status_t Check(fbl::unique_fd fd, off_t start, off_t end,
                              const fbl::Vector<size_t>& extent_lengths, disk_format_t part);
+
+    // Copies into |out_size| the number of bytes used by data in fs contained in a partition
+    // between bytes |start| and |end|. extent_lengths is lengths of each extent (in bytes).
+    static zx_status_t UsedDataSize(const fbl::unique_fd& fd, off_t start, off_t end,
+                                    const fbl::Vector<size_t>& extent_lengths, disk_format_t part,
+                                    uint64_t* out_size);
+
+    // Copies into |out_inodes| the number of allocated inodes in fs contained in a partition
+    // between bytes |start| and |end|. extent_lengths is lengths of each extent (in bytes).
+    static zx_status_t UsedInodes(const fbl::unique_fd& fd, off_t start, off_t end,
+                                  const fbl::Vector<size_t>& extent_lengths, disk_format_t part,
+                                  uint64_t* out_inodes);
+
+    // Copies into |out_size| the number of bytes used by data and bytes reserved for superblock,
+    // bitmaps, inodes and journal on fs contained in a partition between bytes |start| and |end|.
+    // extent_lengths is lengths of each extent (in bytes).
+    static zx_status_t UsedSize(const fbl::unique_fd& fd, off_t start, off_t end,
+                                const fbl::Vector<size_t>& extent_lengths, disk_format_t part,
+                                uint64_t* out_size);
     virtual ~Format() {}
     // Update the file system's superblock (e.g. set FVM flag), and any other information required
     // for the partition to be placed in FVM.
-    virtual zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index) = 0;
+    virtual zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index,
+                                     FvmReservation* reserve) = 0;
     // Get FVM data for each extent
     virtual zx_status_t GetVsliceRange(unsigned extent_index, vslice_info_t* vslice_info) const = 0;
     // Get total number of slices required for this partition
@@ -82,7 +159,7 @@ public:
 
     void GetPartitionInfo(fvm::partition_descriptor_t* partition) const {
         memcpy(partition->type, type_, sizeof(type_));
-        strncpy(reinterpret_cast<char*>(partition->name), Name(), FVM_NAME_LEN);
+        strncpy(reinterpret_cast<char*>(partition->name), Name(), fvm::kMaxVPartitionNameLength);
         partition->flags = flags_;
     }
 
@@ -102,7 +179,7 @@ public:
 protected:
     bool fvm_ready_;
     uint32_t vpart_index_;
-    uint8_t guid_[FVM_GUID_LEN];
+    uint8_t guid_[fvm::kGuidSize];
     uint8_t type_[GPT_GUID_LEN];
     uint32_t flags_;
 
@@ -116,8 +193,8 @@ protected:
     }
 
     void GenerateGuid() {
-        srand(time(0));
-        for (unsigned i = 0; i < FVM_GUID_LEN; i++) {
+        srand(static_cast<unsigned int>(time(0)));
+        for (unsigned i = 0; i < fvm::kGuidSize; i++) {
             guid_[i] = static_cast<uint8_t>(rand());
         }
     }
@@ -129,7 +206,8 @@ private:
 class MinfsFormat final : public Format {
 public:
     MinfsFormat(fbl::unique_fd fd, const char* type);
-    zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index) final;
+    zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index,
+                             FvmReservation* reserve) final;
     zx_status_t GetVsliceRange(unsigned extent_index, vslice_info_t* vslice_info) const final;
     zx_status_t GetSliceCount(uint32_t* slices_out) const final;
     zx_status_t FillBlock(size_t block_offset) final;
@@ -161,7 +239,8 @@ class BlobfsFormat final : public Format {
 public:
     BlobfsFormat(fbl::unique_fd fd, const char* type);
     ~BlobfsFormat();
-    zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index) final;
+    zx_status_t MakeFvmReady(size_t slice_size, uint32_t vpart_index,
+                             FvmReservation* reserve) final;
     zx_status_t GetVsliceRange(unsigned extent_index, vslice_info_t* vslice_info) const final;
     zx_status_t GetSliceCount(uint32_t* slices_out) const final;
     zx_status_t FillBlock(size_t block_offset) final;
@@ -191,4 +270,6 @@ private:
 
     uint32_t BlocksToSlices(uint32_t block_count) const;
     uint32_t SlicesToBlocks(uint32_t slice_count) const;
+    zx_status_t ComputeSlices(uint64_t inode_count, uint64_t data_blocks,
+                              uint64_t journal_block_count);
 };

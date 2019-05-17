@@ -8,6 +8,7 @@
 
 #include <lib/debuglog.h>
 #include <object/dispatcher.h>
+#include <object/handle.h>
 
 #include <zircon/rights.h>
 #include <zircon/types.h>
@@ -17,7 +18,7 @@
 
 class LogDispatcher final : public SoloDispatcher<LogDispatcher, ZX_DEFAULT_LOG_RIGHTS> {
 public:
-    static zx_status_t Create(uint32_t flags, fbl::RefPtr<Dispatcher>* dispatcher,
+    static zx_status_t Create(uint32_t flags, KernelHandle<LogDispatcher>* handle,
                               zx_rights_t* rights);
 
     ~LogDispatcher() final;
@@ -31,8 +32,6 @@ private:
 
     static void Notify(void* cookie);
     void Signal();
-
-    fbl::Canary<fbl::magic("LOGD")> canary_;
 
     dlog_reader reader_ TA_GUARDED(get_lock());
     const uint32_t flags_;

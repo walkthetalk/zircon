@@ -9,6 +9,7 @@
 #include <fbl/string.h>
 #include <fbl/vector.h>
 #include <zxtest/base/assertion.h>
+#include <zxtest/base/environment.h>
 #include <zxtest/base/event-broadcaster.h>
 #include <zxtest/base/observer.h>
 #include <zxtest/base/reporter.h>
@@ -54,6 +55,9 @@ public:
     // Resets the states for running new tests.
     void Reset();
 
+    // Returns whether the current test has any failures so far.
+    bool CurrentTestHasAnyFailures() const { return current_test_has_any_failures_; }
+
     // Returns whether any test driven by this instance had any test failure.
     // This is not cleared on |TestDriverImpl::Reset|.
     bool HadAnyFailures() const { return had_any_failures_; }
@@ -61,7 +65,8 @@ public:
 private:
     TestStatus status_ = TestStatus::kFailed;
 
-    bool has_fatal_failures_ = false;
+    bool current_test_has_any_failures_ = false;
+    bool current_test_has_fatal_failures_ = false;
 
     bool had_any_failures_ = false;
 };
@@ -123,6 +128,9 @@ public:
 
         // When set list all registered tests.
         bool list = false;
+
+        // Whether the test suite should stop running upon encountering the first fatal failure.
+        bool break_on_failure = false;
     };
 
     // Default Runner options.
@@ -170,6 +178,11 @@ public:
         return test_cases_[test_ref.test_case_index].GetTestInfo(test_ref.test_index);
     }
 
+    // Adds an environment to be set up and tear down for each iteration.
+    void AddGlobalTestEnvironment(std::unique_ptr<Environment> environment) {
+        environments_.push_back(std::move(environment));
+    }
+
     // Provides an entry point for asertions. The runner will propagate the assertion to the
     // interested parties. This is needed in a global scope, because helper methods do not have
     // access to a |Test| instance and legacy tests are not part of a Fixture, but wrapped by one.
@@ -178,14 +191,29 @@ public:
 
     // Returns true if the current test should be aborted. This happens as a result of a fatal
     // failure.
-    bool ShouldAbortCurrentTest() { return !test_driver_.Continue(); }
+    bool CurrentTestHasFatalFailures() const { return !test_driver_.Continue(); }
+
+    // Returns whether the current test has experienced any type of failure.
+    bool CurrentTestHasFailures() const { return test_driver_.CurrentTestHasAnyFailures(); }
+
+    int random_seed() const {
+        return options_ ? options_->seed : kDefaultOptions.seed;
+    }
+
+    // Set of options currently in use. By default |Runner::kDefaultOptions| will be returned.
+    const Options& options() const {
+        return options_ ? *options_ : kDefaultOptions;
+    }
 
 private:
     TestRef RegisterTest(const fbl::String& test_case_name, const fbl::String& test_name,
                          const SourceLocation& location, internal::TestFactory factory,
                          internal::SetUpTestCaseFn set_up, internal::TearDownTestCaseFn tear_down);
 
-    void Filter(const fbl::String& pattern);
+    void EnforceOptions(const Runner::Options& options);
+
+    // List of registered environments.
+    fbl::Vector<std::unique_ptr<Environment>> environments_;
 
     // List of registered test cases.
     fbl::Vector<TestCase> test_cases_;
@@ -204,6 +232,9 @@ private:
 
     // Runner information.
     RunnerSummary summary_;
+
+    // Sets of options to use for |Runner::Run| or |Runner::List|.
+    const Options* options_ = nullptr;
 };
 
 // Entry point for C++

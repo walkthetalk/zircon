@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_STRING_BUFFER_H_
+#define FBL_STRING_BUFFER_H_
 
 #include "string.h"
 #include <stdarg.h>
@@ -29,7 +30,7 @@ class StringBuffer final {
 public:
     // Creates an empty string buffer.
     StringBuffer()
-        : length_(0u) {
+        : length_(0U) {
         data_[0] = 0;
     }
 
@@ -46,7 +47,7 @@ public:
     size_t size() const { return length_; }
 
     // Returns the length of the string, excluding its null terminator.
-    bool empty() const { return length_ == 0u; }
+    bool empty() const { return length_ == 0U; }
 
     // Returns the capacity of the buffer.
     constexpr size_t capacity() const { return N; }
@@ -66,7 +67,7 @@ public:
 
     // Clears the string buffer.
     void Clear() {
-        length_ = 0u;
+        length_ = 0U;
         data_[0] = 0;
     }
 
@@ -161,8 +162,10 @@ private:
         data_[length_] = 0;
     }
 
-    size_t length_ = 0u;
-    char data_[N + 1u];
+    size_t length_ = 0U;
+    char data_[N + 1U];
 };
 
 } // namespace fbl
+
+#endif  // FBL_STRING_BUFFER_H_

@@ -11,7 +11,8 @@
 #include <kernel/percpu.h>
 
 #include <zircon/compiler.h>
-#include <zircon/kernel-counters.h>
+
+#include "counter-vmo-abi.h"
 
 // Kernel counters are a facility designed to help field diagnostics and
 // to help devs properly dimension the load/clients/size of the kernel
@@ -33,12 +34,12 @@
 // sum() across cores rather than summing.
 //
 // Naming the counters
-// The naming convention is "kernel.subsystem.thing_or_action"
-// for example "kernel.dispatcher.destroy"
-//             "kernel.exceptions.fpu"
-//             "kernel.handles.new"
+// The naming convention is "subsystem.thing_or_action"
+// for example "dispatcher.destroy"
+//             "exceptions.fpu"
+//             "handles.live"
 //
-// Reading the counters in code
+// Reading the counter values in code:
 // Don't. The counters are maintained in a per-cpu arena and atomic
 // operations are never used to set their value so they are both
 // imprecise and reflect only the operations on a particular core.
@@ -112,6 +113,15 @@ public:
         // loss of a preemption in the middle of this sequence is fairly
         // minimal.
         *Slot() += delta;
+#endif
+    }
+
+    // Set value of counter to |value|. No memory order is implied.
+    void Set(uint64_t value) const {
+#if defined(__aarch64__)
+        atomic_store_64_relaxed(Slot(), value);
+#else
+        *Slot() = value;
 #endif
     }
 

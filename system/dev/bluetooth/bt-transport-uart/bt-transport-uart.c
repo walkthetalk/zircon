@@ -102,8 +102,10 @@ static void snoop_channel_write_locked(hci_t* hci, uint8_t flags, uint8_t* bytes
     memcpy(snoop_buffer + 1, bytes, length);
     zx_status_t status = zx_channel_write(hci->snoop_channel, 0, snoop_buffer, length + 1, NULL, 0);
     if (status < 0) {
-        zxlogf(ERROR, "bt-transport-uart: failed to write to snoop channel: %s\n",
-               zx_status_get_string(status));
+        if (status != ZX_ERR_PEER_CLOSED) {
+            zxlogf(ERROR, "bt-transport-uart: failed to write to snoop channel: %s\n",
+                   zx_status_get_string(status));
+        }
         channel_cleanup_locked(hci, &hci->snoop_channel);
     }
 }
@@ -391,23 +393,17 @@ static int hci_read_thread(void* arg) {
     return 0;
 }
 
-static zx_status_t hci_open_channel(hci_t* hci, zx_handle_t* in_channel, zx_handle_t* out_channel) {
+static zx_status_t hci_open_channel(hci_t* hci, zx_handle_t* in_channel, zx_handle_t in) {
     zx_status_t result = ZX_OK;
     mtx_lock(&hci->mutex);
 
-    if (*in_channel != ZX_HANDLE_INVALID) {
+    if (*in_channel!= ZX_HANDLE_INVALID) {
         zxlogf(ERROR, "bt-transport-uart: already bound, failing\n");
         result = ZX_ERR_ALREADY_BOUND;
         goto done;
     }
 
-    zx_status_t status = zx_channel_create(0, in_channel, out_channel);
-    if (status < 0) {
-        zxlogf(ERROR, "bt-transport-uart: Failed to create channel: %s\n",
-               zx_status_get_string(status));
-        result = ZX_ERR_INTERNAL;
-        goto done;
-    }
+    *in_channel= in;
 
     // Kick off the hci_read_thread if it's not already running.
     if (!hci->read_thread_running) {
@@ -447,19 +443,19 @@ static void hci_release(void* ctx) {
     free(hci);
 }
 
-static zx_status_t hci_open_command_channel(void* ctx, zx_handle_t* out_channel) {
+static zx_status_t hci_open_command_channel(void* ctx, zx_handle_t in) {
     hci_t* hci = ctx;
-    return hci_open_channel(hci, &hci->cmd_channel, out_channel);
+    return hci_open_channel(hci, &hci->cmd_channel, in);
 }
 
-static zx_status_t hci_open_acl_data_channel(void* ctx, zx_handle_t* out_channel) {
+static zx_status_t hci_open_acl_data_channel(void* ctx, zx_handle_t in) {
     hci_t* hci = ctx;
-    return hci_open_channel(hci, &hci->acl_channel, out_channel);
+    return hci_open_channel(hci, &hci->acl_channel, in);
 }
 
-static zx_status_t hci_open_snoop_channel(void* ctx, zx_handle_t* out_channel) {
+static zx_status_t hci_open_snoop_channel(void* ctx, zx_handle_t in) {
     hci_t* hci = ctx;
-    return hci_open_channel(hci, &hci->snoop_channel, out_channel);
+    return hci_open_channel(hci, &hci->snoop_channel, in);
 }
 
 static bt_hci_protocol_ops_t hci_protocol_ops = {

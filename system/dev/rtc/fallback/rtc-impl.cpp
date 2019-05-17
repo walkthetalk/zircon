@@ -19,6 +19,7 @@ namespace {
 zx_status_t set_utc_offset(const fuchsia_hardware_rtc_Time* rtc) {
     uint64_t rtc_nanoseconds = seconds_since_epoch(rtc) * 1000000000;;
     int64_t offset = rtc_nanoseconds - zx_clock_get_monotonic();
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     return zx_clock_adjust(get_root_resource(), ZX_CLOCK_UTC, offset);
 }
 
@@ -110,7 +111,7 @@ zx_status_t fidl_Set(void* ctx, const fuchsia_hardware_rtc_Time* rtc, fidl_txn_t
 }  // namespace
 
 extern "C" zx_status_t fallback_rtc_bind(void* ctx, zx_device_t* parent) {
-    auto dev = fbl::make_unique<FallbackRtc>(parent);
+    auto dev = std::make_unique<FallbackRtc>(parent);
     auto status = dev->Bind();
     if (status == ZX_OK) {
         // devmgr is now in charge of the device, until DdkRelease().

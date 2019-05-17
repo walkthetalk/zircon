@@ -7,28 +7,6 @@
 #include <hw/sdmmc.h>
 #include <hwreg/bitfields.h>
 
-// Define weak specialization methods that can be overridden in tests. There is a slight performance
-// hit as doing this prevents the MMIO accesses from being inlined.
-
-template <>
-template <>
-__WEAK uint8_t ddk::MmioBuffer::Read<uint8_t>(zx_off_t offs) const {
-    return *reinterpret_cast<volatile uint8_t*>(ptr_ + offs);
-}
-
-template <>
-template <>
-__WEAK uint32_t ddk::MmioBuffer::Read<uint32_t>(zx_off_t offs) const {
-    return *reinterpret_cast<volatile uint32_t*>(ptr_ + offs);
-}
-
-template <>
-template <>
-__WEAK void ddk::MmioBuffer::Write<uint32_t>(uint32_t val, zx_off_t offs) const {
-    *reinterpret_cast<volatile uint32_t*>(ptr_ + offs) = val;
-    hw_mb();
-}
-
 namespace sdmmc {
 
 class MsdcCfg : public hwreg::RegisterBase<MsdcCfg, uint32_t> {
@@ -83,6 +61,7 @@ public:
     DEF_BIT(10, cmd_crc_err);
     DEF_BIT(9, cmd_timeout);
     DEF_BIT(8, cmd_ready);
+    DEF_BIT(7, sdio_irq);
 };
 
 class MsdcIntEn : public hwreg::RegisterBase<MsdcIntEn, uint32_t> {
@@ -97,6 +76,7 @@ public:
     DEF_BIT(10, cmd_crc_err_enable);
     DEF_BIT(9, cmd_timeout_enable);
     DEF_BIT(8, cmd_ready_enable);
+    DEF_BIT(7, sdio_irq_enable);
 };
 
 class MsdcFifoCs : public hwreg::RegisterBase<MsdcFifoCs, uint32_t> {
@@ -106,6 +86,13 @@ public:
     DEF_BIT(31, fifo_clear);
     DEF_FIELD(23, 16, tx_fifo_count);
     DEF_FIELD(7, 0, rx_fifo_count);
+};
+
+class MsdcTxData : public hwreg::RegisterBase<MsdcTxData, uint8_t> {
+public:
+    static auto Get() { return hwreg::RegisterAddr<MsdcTxData>(0x18); }
+
+    DEF_FIELD(7, 0, data);
 };
 
 class MsdcRxData : public hwreg::RegisterBase<MsdcRxData, uint8_t> {
@@ -147,7 +134,7 @@ public:
 
     static auto Get() { return hwreg::RegisterAddr<SdcCmd>(0x34); }
 
-    static SdcCmd FromRequest(const sdmmc_req_t* req) {
+    static SdcCmd FromRequest(const sdmmc_req_t* req, bool is_sdio) {
         SdcCmd cmd = Get().FromValue(0);
 
         cmd.set_cmd(req->cmd_idx);
@@ -168,7 +155,11 @@ public:
         cmd.set_block_size(req->blocksize);
 
         if (req->cmd_flags & SDMMC_RESP_DATA_PRESENT) {
-            if (req->cmd_flags & SDMMC_CMD_MULTI_BLK) {
+            if (req->blockcount > 1) {
+                if (!is_sdio) {
+                    cmd.set_auto_cmd(kAutoCmd12);
+                }
+
                 cmd.set_block_type(kBlockTypeMulti);
             } else {
                 cmd.set_block_type(kBlockTypeSingle);
@@ -177,13 +168,9 @@ public:
             if (!(req->cmd_flags & SDMMC_CMD_READ)) {
                 cmd.set_write(1);
             }
-
-            if (req->blockcount > 1) {
-                cmd.set_auto_cmd(kAutoCmd12);
-            }
         }
 
-        if (req->cmd_flags & SDMMC_CMD_TYPE_ABORT) {
+        if ((req->cmd_flags & SDMMC_CMD_TYPE_ABORT) && !is_sdio) {
             cmd.set_stop(1);
         }
 

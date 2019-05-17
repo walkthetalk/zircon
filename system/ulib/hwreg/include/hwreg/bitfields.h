@@ -7,12 +7,11 @@
 #include <hwreg/internal.h>
 #include <hwreg/mmio.h>
 
-#ifndef _KERNEL
-#include <ddktl/mmio.h>
-#endif
 #include <limits.h>
 #include <stdint.h>
 #include <zircon/assert.h>
+
+#include <type_traits>
 
 // This file provides some helpers for accessing bitfields in registers.
 //
@@ -75,6 +74,11 @@
 // then that translates to:
 //   DEF_FIELD(23, 0, data_m_value)
 // To match up, we put the upper bit first and use an inclusive bit range.
+//
+// For fields whose value is relative to their position in the register you can
+// use DEF_UNSHIFTED_FIELD(high, low, name). This ensures that when you
+// read/write full values they will be applied to the field with the bits
+// overlapping other fields masked off, without shifting anything.
 
 namespace hwreg {
 
@@ -97,12 +101,12 @@ struct EnablePrinter;
 template <class DerivedType, class IntType, class PrinterState = void>
 class RegisterBase {
     static_assert(internal::IsSupportedInt<IntType>::value, "unsupported register access width");
-    static_assert(fbl::is_same<PrinterState, void>::value ||
-                  fbl::is_same<PrinterState, EnablePrinter>::value, "unsupported printer state");
+    static_assert(std::is_same<PrinterState, void>::value ||
+                  std::is_same<PrinterState, EnablePrinter>::value, "unsupported printer state");
 public:
     using SelfType = DerivedType;
     using ValueType = IntType;
-    using PrinterEnabled = fbl::is_same<PrinterState, EnablePrinter>;
+    using PrinterEnabled = std::is_same<PrinterState, EnablePrinter>;
 
     uint32_t reg_addr() const { return reg_addr_; }
     void set_reg_addr(uint32_t addr) { reg_addr_ = addr; }
@@ -115,27 +119,17 @@ public:
         return *static_cast<SelfType*>(this);
     }
 
-    SelfType& ReadFrom(RegisterIo* reg_io) {
-        reg_value_ = reg_io->Read<ValueType>(reg_addr_);
+    template <typename T>
+    SelfType& ReadFrom(T* reg_io) {
+        reg_value_ = reg_io->template Read<ValueType>(reg_addr_);
         return *static_cast<SelfType*>(this);
     }
-#ifndef _KERNEL
-    SelfType& ReadFrom(ddk::MmioBuffer* mmio) {
-        reg_value_ = mmio->Read<ValueType>(reg_addr_);
-        return *static_cast<SelfType*>(this);
-    }
-#endif
 
-    SelfType& WriteTo(RegisterIo* reg_io) {
-        reg_io->Write(reg_addr_, static_cast<IntType>(reg_value_ & ~rsvdz_mask_));
-        return *static_cast<SelfType*>(this);
-    }
-#ifndef _KERNEL
-    SelfType& WriteTo(ddk::MmioBuffer* mmio) {
+    template <typename T>
+    SelfType& WriteTo(T* mmio) {
         mmio->Write(static_cast<IntType>(reg_value_ & ~rsvdz_mask_), reg_addr_);
         return *static_cast<SelfType*>(this);
     }
-#endif
 
     // Invokes print_fn(const char* buf) once for each field, including each
     // RsvdZ field, and one extra time if there are any undefined bits set.
@@ -184,29 +178,22 @@ template <class RegType> class RegisterAddr {
 public:
     RegisterAddr(uint32_t reg_addr) : reg_addr_(reg_addr) {}
 
-    static_assert(fbl::is_base_of<RegisterBase<RegType,
+    static_assert(std::is_base_of<RegisterBase<RegType,
                                                typename RegType::ValueType>, RegType>::value ||
-                  fbl::is_base_of<RegisterBase<RegType,
+                  std::is_base_of<RegisterBase<RegType,
                                                typename RegType::ValueType,
                                                EnablePrinter>, RegType>::value,
                   "Parameter of RegisterAddr<> should derive from RegisterBase");
 
     // Instantiate a RegisterBase using the value of the register read from
     // MMIO.
-    RegType ReadFrom(RegisterIo* reg_io) {
+    template <typename T>
+    RegType ReadFrom(T* reg_io) {
         RegType reg;
         reg.set_reg_addr(reg_addr_);
         reg.ReadFrom(reg_io);
         return reg;
     }
-#ifndef _KERNEL
-    RegType ReadFrom(ddk::MmioBuffer* mmio) {
-        RegType reg;
-        reg.set_reg_addr(reg_addr_);
-        reg.ReadFrom(mmio);
-        return reg;
-    }
-#endif
 
     // Instantiate a RegisterBase using the given value for the register.
     RegType FromValue(typename RegType::ValueType value) {
@@ -229,10 +216,16 @@ public:
           mask_(internal::ComputeMask<IntType>(bit_high_incl - bit_low + 1)) {
     }
 
+    BitfieldRef(IntType* value_ptr, uint32_t bit_high_incl, uint32_t bit_low, bool unshifted)
+        : value_ptr_(value_ptr), shift_(0),
+          mask_(static_cast<IntType>(internal::ComputeMask<IntType>(bit_high_incl - bit_low + 1)
+                                     << bit_low)) {
+    }
+
     IntType get() const { return static_cast<IntType>((*value_ptr_ >> shift_) & mask_); }
 
     void set(IntType field_val) {
-        static_assert(!fbl::is_const<IntType>::value, "");
+        static_assert(!std::is_const<IntType>::value, "");
         ZX_DEBUG_ASSERT((field_val & ~mask_) == 0);
         *value_ptr_ = static_cast<IntType>(*value_ptr_ & ~(mask_ << shift_));
         *value_ptr_ = static_cast<IntType>(*value_ptr_ | (field_val << shift_));
@@ -258,7 +251,23 @@ private:
     SelfType& set_ ## NAME(ValueType val) {                                                       \
         hwreg::BitfieldRef<ValueType>(reg_value_ptr(), (BIT_HIGH), (BIT_LOW)).set(val);           \
         return *this;                                                                             \
-    }
+    } \
+    static_assert(true) // eat a ;
+
+#define DEF_UNSHIFTED_FIELD(BIT_HIGH, BIT_LOW, NAME)                                              \
+    static_assert((BIT_HIGH) >= (BIT_LOW), "Upper bit goes before lower bit");                    \
+    static_assert((BIT_HIGH) < sizeof(ValueType) * CHAR_BIT, "Upper bit is out of range");        \
+    hwreg::internal::Field<SelfType> Field ## BIT_HIGH ## _ ## BIT_LOW =                          \
+        hwreg::internal::Field<SelfType>(this, #NAME, (BIT_HIGH), (BIT_LOW));                     \
+    ValueType NAME() const {                                                                      \
+        return hwreg::BitfieldRef<const ValueType>(reg_value_ptr(), (BIT_HIGH), (BIT_LOW), true)  \
+                                                   .get();                                        \
+    }                                                                                             \
+    SelfType& set_ ## NAME(ValueType val) {                                                       \
+        hwreg::BitfieldRef<ValueType>(reg_value_ptr(), (BIT_HIGH), (BIT_LOW), true).set(val);     \
+        return *this;                                                                             \
+    } \
+    static_assert(true) // eat a ;
 
 // Declares single-bit fields in a derived class of RegisterBase<D, T>.  This
 // produces functions "T NAME() const" and "void set_NAME(T)".
@@ -273,7 +282,7 @@ private:
     hwreg::internal::Field<SelfType> Field ## BIT_HIGH ## _ ## BIT_LOW =                          \
         hwreg::internal::Field<SelfType>(this, "RsvdZ", (BIT_HIGH), (BIT_LOW));                   \
     hwreg::internal::RsvdZField<SelfType> RsvdZ ## BIT_HIGH ## _ ## BIT_LOW =                     \
-        hwreg::internal::RsvdZField<SelfType>(this, (BIT_HIGH), (BIT_LOW));
+        hwreg::internal::RsvdZField<SelfType>(this, (BIT_HIGH), (BIT_LOW))
 
 // Declares single-bit reserved-zero fields in a derived class of RegisterBase<D, T>.
 // This will ensure that on RegisterBase<T>::WriteTo(), reserved-zero bits are
@@ -284,18 +293,20 @@ private:
 // reads/modifies the declared bitrange.  Both bit indices are inclusive.
 #define DEF_SUBFIELD(FIELD, BIT_HIGH, BIT_LOW, NAME)                                              \
     static_assert(hwreg::internal::IsSupportedInt<                                                \
-                      typename fbl::remove_reference<decltype(FIELD)>::type>::value,              \
+                      typename std::remove_reference<decltype(FIELD)>::type>::value,              \
                   #FIELD " has unsupported type");                                                \
     static_assert((BIT_HIGH) >= (BIT_LOW), "Upper bit goes before lower bit");                    \
     static_assert((BIT_HIGH) < sizeof(decltype(FIELD)) * CHAR_BIT, "Upper bit is out of range");  \
-    typename fbl::remove_reference<decltype(FIELD)>::type NAME() const {                          \
-        return hwreg::BitfieldRef<const typename fbl::remove_reference<decltype(FIELD)>::type>(   \
+    typename std::remove_reference<decltype(FIELD)>::type NAME() const {                          \
+        return hwreg::BitfieldRef<const typename std::remove_reference<decltype(FIELD)>::type>(   \
             &FIELD, (BIT_HIGH), (BIT_LOW)).get();                                                 \
     }                                                                                             \
-    void set_ ## NAME(typename fbl::remove_reference<decltype(FIELD)>::type val) {                \
-        hwreg::BitfieldRef<typename fbl::remove_reference<decltype(FIELD)>::type>(                \
+    auto& set_ ## NAME(typename std::remove_reference<decltype(FIELD)>::type val) {               \
+        hwreg::BitfieldRef<typename std::remove_reference<decltype(FIELD)>::type>(                \
                 &FIELD, (BIT_HIGH), (BIT_LOW)).set(val);                                          \
-    }
+        return *this;                                                                             \
+    }                                                                   \
+    static_assert(true) // eat a ;
 
 // Declares "decltype(FIELD) NAME() const" and "void set_NAME(decltype(FIELD))" that
 // reads/modifies the declared bit.

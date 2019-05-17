@@ -8,13 +8,19 @@
 
 #include <object/pci_interrupt_dispatcher.h>
 
-#include <kernel/auto_lock.h>
-#include <zircon/rights.h>
 #include <fbl/alloc_checker.h>
+#include <kernel/auto_lock.h>
+#include <lib/counters.h>
 #include <object/pci_device_dispatcher.h>
 #include <platform.h>
+#include <zircon/rights.h>
+
+KCOUNTER(dispatcher_pci_interrupt_create_count, "dispatcher.pci_interrupt.create")
+KCOUNTER(dispatcher_pci_interrupt_destroy_count, "dispatcher.pci_interrupt.destroy")
 
 PciInterruptDispatcher::~PciInterruptDispatcher() {
+    kcounter_add(dispatcher_pci_interrupt_destroy_count, 1);
+
     // Release our reference to our device.
     device_ = nullptr;
 }
@@ -28,11 +34,11 @@ pcie_irq_handler_retval_t PciInterruptDispatcher::IrqThunk(const PcieDevice& dev
 }
 
 zx_status_t PciInterruptDispatcher::Create(
-        const fbl::RefPtr<PcieDevice>& device,
-        uint32_t irq_id,
-        bool maskable,
-        zx_rights_t* out_rights,
-        fbl::RefPtr<Dispatcher>* out_interrupt) {
+    const fbl::RefPtr<PcieDevice>& device,
+    uint32_t irq_id,
+    bool maskable,
+    zx_rights_t* out_rights,
+    KernelHandle<InterruptDispatcher>* out_interrupt) {
     // Sanity check our args
     if (!device || !out_rights || !out_interrupt) {
         return ZX_ERR_INVALID_ARGS;
@@ -41,10 +47,13 @@ zx_status_t PciInterruptDispatcher::Create(
         return ZX_ERR_INTERNAL;
     }
 
-    fbl::AllocChecker ac;
     // Attempt to allocate a new dispatcher wrapper.
-    auto interrupt_dispatcher = new (&ac) PciInterruptDispatcher(device, irq_id, maskable);
-    fbl::RefPtr<Dispatcher> dispatcher = fbl::AdoptRef<Dispatcher>(interrupt_dispatcher);
+    // Do not create a KernelHandle until all initialization has succeeded;
+    // if an interrupt already exists on |vector| our on_zero_handles() would
+    // tear down the existing interrupt when creation fails.
+    fbl::AllocChecker ac;
+    auto interrupt_dispatcher = fbl::AdoptRef(new (&ac) PciInterruptDispatcher(device, irq_id,
+                                                                               maskable));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
@@ -58,13 +67,13 @@ zx_status_t PciInterruptDispatcher::Create(
         return status;
 
     // Everything seems to have gone well.  Make sure the interrupt is unmasked
-    // (if it is maskable) then transfer our dispatcher refererence to the
+    // (if it is maskable) then transfer our dispatcher reference to the
     // caller.
     if (maskable) {
         device->UnmaskIrq(irq_id);
     }
-    *out_interrupt = ktl::move(dispatcher);
-    *out_rights    = ZX_DEFAULT_PCI_INTERRUPT_RIGHTS;
+    out_interrupt->reset(ktl::move(interrupt_dispatcher));
+    *out_rights = ZX_DEFAULT_PCI_INTERRUPT_RIGHTS;
     return ZX_OK;
 }
 
@@ -76,6 +85,12 @@ void PciInterruptDispatcher::MaskInterrupt() {
 void PciInterruptDispatcher::UnmaskInterrupt() {
     if (maskable_)
         device_->UnmaskIrq(vector_);
+}
+
+PciInterruptDispatcher::PciInterruptDispatcher(const fbl::RefPtr<PcieDevice>& device,
+                                               uint32_t vector, bool maskable)
+    : device_(device), vector_(vector), maskable_(maskable) {
+    kcounter_add(dispatcher_pci_interrupt_create_count, 1);
 }
 
 zx_status_t PciInterruptDispatcher::RegisterInterruptHandler() {

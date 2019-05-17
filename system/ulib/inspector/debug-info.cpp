@@ -8,7 +8,6 @@
 #include <string.h>
 
 #include <lib/backtrace-request/backtrace-request.h>
-#include <pretty/hexdump.h>
 #include <zircon/assert.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/exception.h>
@@ -26,7 +25,7 @@ static bool swbreak_backtrace_enabled = true;
 
 // Return true if the thread is to be resumed "successfully" (meaning the o/s
 // won't kill it, and thus the kill process).
-static bool is_resumable_swbreak(zx_excp_type_t excp_type) {
+static bool is_resumable_swbreak(const zx_excp_type_t excp_type) {
     if (excp_type == ZX_EXCP_SW_BREAKPOINT && swbreak_backtrace_enabled)
         return true;
     return false;
@@ -52,7 +51,12 @@ static int have_swbreak_magic(const zx_thread_state_general_regs_t* regs) {
 
 #endif
 
-static const char* excp_type_to_str(zx_excp_type_t type) {
+static bool is_backtrace_request(const zx_excp_type_t excp_type,
+                                 const zx_thread_state_general_regs_t* regs) {
+    return is_resumable_swbreak(excp_type) && regs != nullptr && have_swbreak_magic(regs);
+}
+
+static const char* excp_type_to_str(const zx_excp_type_t type) {
     switch (type) {
     case ZX_EXCP_GENERAL:
         return "general fault";
@@ -77,7 +81,6 @@ static const char* excp_type_to_str(zx_excp_type_t type) {
 }
 
 // How much memory to dump, in bytes.
-// Space for this is allocated on the stack, so this can't be too large.
 static constexpr size_t kMemoryDumpSize = 256;
 
 #if defined(__aarch64__)
@@ -92,19 +95,6 @@ static bool write_general_regs(zx_handle_t thread, void* buf, size_t buf_size) {
     return true;
 }
 #endif
-
-static void dump_memory(zx_handle_t proc, uintptr_t start, size_t len) {
-    // Make sure we're not allocating an excessive amount of stack.
-    ZX_DEBUG_ASSERT(len <= kMemoryDumpSize);
-
-    uint8_t buf[len];
-    auto res = zx_process_read_memory(proc, start, buf, len, &len);
-    if (res < 0) {
-        printf("failed reading %p memory; error : %d\n", (void*)start, res);
-    } else if (len != 0) {
-        hexdump_ex(buf, len, start);
-    }
-}
 
 static void resume_thread(zx_handle_t thread, zx_handle_t exception_port, bool handled) {
     uint32_t options = 0;
@@ -122,8 +112,7 @@ static void resume_thread(zx_handle_t thread, zx_handle_t exception_port, bool h
 static void resume_thread_from_exception(zx_handle_t thread, zx_handle_t exception_port,
                                          zx_excp_type_t excp_type,
                                          const zx_thread_state_general_regs_t* gregs) {
-    if (is_resumable_swbreak(excp_type) &&
-        gregs != nullptr && have_swbreak_magic(gregs)) {
+    if (is_backtrace_request(excp_type, gregs)) {
 #if defined(__x86_64__)
 // On x86, the pc is left at one past the s/w break insn,
 // so there's nothing more we need to do.
@@ -180,7 +169,6 @@ static void print_debug_info(zx_handle_t process, zx_handle_t thread, zx_excp_ty
 
     zx_vaddr_t pc = 0, sp = 0, fp = 0;
     const char* arch = "unknown";
-    const char* fatal = "fatal ";
 
     if (inspector_read_general_regs(thread, regs) != ZX_OK) {
         return;
@@ -200,13 +188,12 @@ static void print_debug_info(zx_handle_t process, zx_handle_t thread, zx_excp_ty
 #error unsupported architecture
 #endif
 
-    // This won't print "fatal" in the case where this is a s/w bkpt but
-    // ZX_CRASHLOGGER_REQUEST_SELF_BT_MAGIC isn't set. Big deal.
-    if (is_resumable_swbreak(*type))
+    const char* fatal = "fatal ";
+    // We don't want to print "fatal" when we are printing the debug info from a
+    // backtrace request as we will resume the thread at the end.
+    if (is_backtrace_request(*type, regs)) {
         fatal = "";
-    // TODO(MA-922): Remove this and make policy exceptions fatal.
-    if (*type == ZX_EXCP_POLICY_ERROR)
-        fatal = "";
+    }
 
     char process_name[ZX_MAX_NAME_LEN];
     status = zx_object_get_property(process, ZX_PROP_NAME, process_name, sizeof(process_name));
@@ -229,8 +216,10 @@ static void print_debug_info(zx_handle_t process, zx_handle_t thread, zx_excp_ty
 #elif defined(__aarch64__)
     inspector_print_general_regs(stdout, regs, &context.arch.u.arm_64);
 
-    // Only output the Fault address register and ESR if there's a data fault.
-    if (ZX_EXCP_FATAL_PAGE_FAULT == report.header.type) {
+    // Only output the Fault address register and ESR if there's a data or
+    // alignment fault.
+    if (ZX_EXCP_FATAL_PAGE_FAULT == report.header.type ||
+        ZX_EXCP_UNALIGNED_ACCESS == report.header.type) {
         printf(" far %#18" PRIx64 " esr %#18x\n",
                context.arch.u.arm_64.far, context.arch.u.arm_64.esr);
     }
@@ -239,7 +228,7 @@ static void print_debug_info(zx_handle_t process, zx_handle_t thread, zx_excp_ty
 #endif
 
     printf("bottom of user stack:\n");
-    dump_memory(process, sp, kMemoryDumpSize);
+    inspector_print_memory(stdout, process, sp, kMemoryDumpSize);
 
     printf("arch: %s\n", arch);
 
@@ -268,13 +257,15 @@ static void print_debug_info(zx_handle_t process, zx_handle_t thread, zx_excp_ty
 
 } // namespace inspector
 
-void inspector_print_debug_info(zx_handle_t process, zx_handle_t thread) {
+ __EXPORT void inspector_print_debug_info(zx_handle_t process,
+                                          zx_handle_t thread) {
     zx_excp_type_t type = 0;
     zx_thread_state_general_regs_t regs;
     inspector::print_debug_info(process, thread, &type, &regs);
 }
 
-void inspector_print_debug_info_and_resume_thread(zx_handle_t process, zx_handle_t thread, zx_handle_t exception_port) {
+ __EXPORT void inspector_print_debug_info_and_resume_thread(
+     zx_handle_t process, zx_handle_t thread, zx_handle_t exception_port) {
     zx_excp_type_t type = 0;
     zx_thread_state_general_regs_t regs;
     inspector::print_debug_info(process, thread, &type, &regs);

@@ -11,7 +11,7 @@
 
 namespace zx {
 
-class channel : public object<channel> {
+class channel final : public object<channel> {
 public:
     static constexpr zx_obj_type_t TYPE = ZX_OBJ_TYPE_CHANNEL;
 
@@ -31,16 +31,16 @@ public:
     static zx_status_t create(uint32_t flags, channel* endpoint0,
                               channel* endpoint1);
 
-    zx_status_t read(uint32_t flags, void* bytes, uint32_t num_bytes,
-                     uint32_t* actual_bytes, zx_handle_t* handles,
-                     uint32_t num_handles, uint32_t* actual_handles) const {
+    zx_status_t read(uint32_t flags, void* bytes, zx_handle_t* handles,
+                     uint32_t num_bytes, uint32_t num_handles,
+                     uint32_t* actual_bytes, uint32_t* actual_handles) const {
         return zx_channel_read(get(), flags, bytes, handles, num_bytes,
                                num_handles, actual_bytes, actual_handles);
     }
 
-    zx_status_t read_etc(uint32_t flags, void* bytes, uint32_t num_bytes,
-                         uint32_t* actual_bytes, zx_handle_info_t* handles,
-                         uint32_t num_handles, uint32_t* actual_handles) const {
+    zx_status_t read_etc(uint32_t flags, void* bytes, zx_handle_info_t* handles,
+                         uint32_t num_bytes, uint32_t num_handles,
+                         uint32_t* actual_bytes, uint32_t* actual_handles) const {
         return zx_channel_read_etc(get(), flags, bytes, handles, num_bytes,
                                    num_handles, actual_bytes, actual_handles);
     }

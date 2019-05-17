@@ -17,10 +17,14 @@
 #include <fbl/array.h>
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
+#include <lib/counters.h>
 
 #include <object/process_dispatcher.h>
 
 #include <platform.h>
+
+KCOUNTER(dispatcher_job_create_count, "dispatcher.job.create")
+KCOUNTER(dispatcher_job_destroy_count, "dispatcher.job.destroy")
 
 // The starting max_height value of the root job.
 static constexpr uint32_t kRootJobMaxHeight = 32;
@@ -116,7 +120,7 @@ fbl::RefPtr<JobDispatcher> JobDispatcher::CreateRootJob() {
 
 zx_status_t JobDispatcher::Create(uint32_t flags,
                                   fbl::RefPtr<JobDispatcher> parent,
-                                  fbl::RefPtr<Dispatcher>* dispatcher,
+                                  KernelHandle<JobDispatcher>* handle,
                                   zx_rights_t* rights) {
     if (parent != nullptr && parent->max_height() == 0) {
         // The parent job cannot have children.
@@ -124,17 +128,17 @@ zx_status_t JobDispatcher::Create(uint32_t flags,
     }
 
     fbl::AllocChecker ac;
-    fbl::RefPtr<JobDispatcher> job =
-        fbl::AdoptRef(new (&ac) JobDispatcher(flags, parent, parent->GetPolicy()));
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) JobDispatcher(flags, parent,
+                                                                  parent->GetPolicy())));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    if (!parent->AddChildJob(job)) {
+    if (!parent->AddChildJob(new_handle.dispatcher())) {
         return ZX_ERR_BAD_STATE;
     }
 
     *rights = default_rights();
-    *dispatcher = ktl::move(job);
+    *handle = ktl::move(new_handle);
     return ZX_OK;
 }
 
@@ -147,55 +151,22 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
       state_(State::READY),
       process_count_(0u),
       job_count_(0u),
+      return_code_(0),
       kill_on_oom_(false),
-      policy_(policy) {
+      policy_(policy),
+      exceptionate_(ExceptionPort::Type::JOB),
+      debug_exceptionate_(ExceptionPort::Type::JOB_DEBUGGER) {
+    kcounter_add(dispatcher_job_create_count, 1);
 
-    // Maintain consistent lock ordering by grabbing the all-jobs lock before
-    // any individual JobDispatcher lock.
-    Guard<fbl::Mutex> guard{AllJobsLock::Get()};
-
-    // Set the initial job order, and try to make older jobs closer to
-    // the root (both hierarchically and temporally) show up earlier
-    // in enumeration.
     if (parent_ == nullptr) {
-        // Root job is the most important.
+        Guard<Mutex> guard{AllJobsLock::Get()};
         all_jobs_list_.push_back(this);
-    } else {
-        Guard<fbl::Mutex> parent_guard{parent_->get_lock()};
-        JobDispatcher* neighbor;
-        if (!parent_->jobs_.is_empty()) {
-            // Our youngest sibling.
-            //
-            // IMPORTANT: We must hold the parent's lock during list insertion
-            // to ensure that our sibling stays alive until we're done with it.
-            // The sibling may be in its dtor right now, trying to remove itself
-            // from parent_->jobs_ but blocked on parent_->get_lock(), and could be
-            // freed if we released the lock.
-            neighbor = &parent_->jobs_.back();
-
-            // This can't be us: we aren't added to our parent's child list
-            // until after construction.
-            DEBUG_ASSERT(!dll_job_raw_.InContainer());
-            DEBUG_ASSERT(neighbor != this);
-        } else {
-            // Our parent.
-            neighbor = parent_.get();
-        }
-
-        // Make ourselves appear after our next-youngest neighbor.
-        all_jobs_list_.insert(all_jobs_list_.make_iterator(*neighbor), this);
     }
 }
 
 JobDispatcher::~JobDispatcher() {
-    if (parent_)
-        parent_->RemoveChildJob(this);
-
-    {
-        Guard<fbl::Mutex> guard{AllJobsLock::Get()};
-        DEBUG_ASSERT(dll_all_jobs_.InContainer());
-        all_jobs_list_.erase(*this);
-    }
+    kcounter_add(dispatcher_job_destroy_count, 1);
+    RemoveFromJobTreesUnlocked();
 }
 
 zx_koid_t JobDispatcher::get_related_koid() const {
@@ -217,9 +188,26 @@ bool JobDispatcher::AddChildProcess(const fbl::RefPtr<ProcessDispatcher>& proces
 bool JobDispatcher::AddChildJob(const fbl::RefPtr<JobDispatcher>& job) {
     canary_.Assert();
 
+    // Maintain consistent lock ordering by grabbing the all-jobs lock before
+    // any individual JobDispatcher lock.
+    Guard<fbl::Mutex> all_jobs_guard{AllJobsLock::Get()};
     Guard<fbl::Mutex> guard{get_lock()};
+
     if (state_ != State::READY)
         return false;
+
+    // Put the new job after our next-youngest child, or us if we have none.
+    //
+    // We try to make older jobs closer to the root (both hierarchically and
+    // temporally) show up earlier in enumeration.
+    JobDispatcher* neighbor = (jobs_.is_empty() ? this : &jobs_.back());
+
+    // This can only be called once, the job should not already be part
+    // of any job tree.
+    DEBUG_ASSERT(!job->dll_job_raw_.InContainer());
+    DEBUG_ASSERT(neighbor != job.get());
+
+    all_jobs_list_.insert(all_jobs_list_.make_iterator(*neighbor), job.get());
 
     jobs_.push_back(job.get());
     ++job_count_;
@@ -230,25 +218,83 @@ bool JobDispatcher::AddChildJob(const fbl::RefPtr<JobDispatcher>& job) {
 void JobDispatcher::RemoveChildProcess(ProcessDispatcher* process) {
     canary_.Assert();
 
-    Guard<fbl::Mutex> guard{get_lock()};
-    // The process dispatcher can call us in its destructor, Kill(),
-    // or RemoveThread().
-    if (!ProcessDispatcher::JobListTraitsRaw::node_state(*process).InContainer())
-        return;
-    procs_.erase(*process);
-    --process_count_;
-    UpdateSignalsDecrementLocked();
+    bool should_die = false;
+    {
+        Guard<fbl::Mutex> guard{get_lock()};
+        // The process dispatcher can call us in its destructor, Kill(),
+        // or RemoveThread().
+        if (!ProcessDispatcher::JobListTraitsRaw::node_state(*process).InContainer())
+            return;
+        procs_.erase(*process);
+        --process_count_;
+        UpdateSignalsDecrementLocked();
+        should_die = IsReadyForDeadTransitionLocked();
+    }
+
+    if (should_die)
+        FinishDeadTransitionUnlocked();
 }
 
 void JobDispatcher::RemoveChildJob(JobDispatcher* job) {
     canary_.Assert();
 
+    bool should_die = false;
+    {
+        Guard<fbl::Mutex> guard{get_lock()};
+        if (!JobDispatcher::ListTraitsRaw::node_state(*job).InContainer())
+            return;
+        jobs_.erase(*job);
+        --job_count_;
+        UpdateSignalsDecrementLocked();
+        should_die = IsReadyForDeadTransitionLocked();
+    }
+
+    if (should_die)
+        FinishDeadTransitionUnlocked();
+}
+
+JobDispatcher::State JobDispatcher::GetState() const {
     Guard<fbl::Mutex> guard{get_lock()};
-    if (!JobDispatcher::ListTraitsRaw::node_state(*job).InContainer())
-        return;
-    jobs_.erase(*job);
-    --job_count_;
-    UpdateSignalsDecrementLocked();
+    return state_;
+}
+
+void JobDispatcher::RemoveFromJobTreesUnlocked() {
+    canary_.Assert();
+
+    if (parent_)
+        parent_->RemoveChildJob(this);
+
+    {
+        Guard<Mutex> guard{AllJobsLock::Get()};
+        if (dll_all_jobs_.InContainer())
+            all_jobs_list_.erase(*this);
+    }
+}
+
+bool JobDispatcher::IsReadyForDeadTransitionLocked() {
+    canary_.Assert();
+    return state_ == State::KILLING && job_count_ == 0 && process_count_ == 0;
+}
+
+void JobDispatcher::FinishDeadTransitionUnlocked() {
+    canary_.Assert();
+
+    // Make sure we're killing from the bottom of the tree up or else parent
+    // jobs could die before their children.
+    //
+    // In particular, this means we have to finish dying before leaving the job
+    // trees, since the last child leaving the tree can trigger its parent to
+    // finish dying.
+    DEBUG_ASSERT(!parent_ || (parent_->GetState() != State::DEAD));
+    {
+        Guard<fbl::Mutex> guard{get_lock()};
+        state_ = State::DEAD;
+        exceptionate_.Shutdown();
+        debug_exceptionate_.Shutdown();
+        UpdateStateLocked(0u, ZX_TASK_TERMINATED);
+    }
+
+    RemoveFromJobTreesUnlocked();
 }
 
 void JobDispatcher::UpdateSignalsDecrementLocked() {
@@ -267,17 +313,12 @@ void JobDispatcher::UpdateSignalsDecrementLocked() {
         set |= ZX_JOB_NO_JOBS;
     }
 
-    if ((job_count_ == 0) && (process_count_ == 0)) {
-        if (state_ == State::KILLING)
-            state_ = State::DEAD;
-
-        if (!parent_) {
-            // There are no userspace process left. From here, there's
-            // no particular context as to whether this was
-            // intentional, or if a core devhost crashed due to a
-            // bug. Either way, shut down the kernel.
-            platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_RESET);
-        }
+    if (!parent_ && (job_count_ == 0) && (process_count_ == 0)) {
+        // There are no userspace process left. From here, there's
+        // no particular context as to whether this was
+        // intentional, or if a core devhost crashed due to a
+        // bug. Either way, shut down the kernel.
+        platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_RESET);
     }
 
     UpdateStateLocked(0u, set);
@@ -306,7 +347,7 @@ JobPolicy JobDispatcher::GetPolicy() const {
     return policy_;
 }
 
-bool JobDispatcher::Kill() {
+bool JobDispatcher::Kill(int64_t return_code) {
     canary_.Assert();
 
     JobList jobs_to_kill;
@@ -315,11 +356,13 @@ bool JobDispatcher::Kill() {
     LiveRefsArray jobs_refs;
     LiveRefsArray proc_refs;
 
+    bool should_die = false;
     {
         Guard<fbl::Mutex> guard{get_lock()};
         if (state_ != State::READY)
             return false;
 
+        return_code_ = return_code;
         state_ = State::KILLING;
         zx_status_t result;
 
@@ -332,16 +375,21 @@ bool JobDispatcher::Kill() {
             procs_to_kill.push_front(ktl::move(proc));
             return ZX_OK;
         });
+
+        should_die = IsReadyForDeadTransitionLocked();
     }
+
+    if (should_die)
+        FinishDeadTransitionUnlocked();
 
     // Since we kill the child jobs first we have a depth-first massacre.
     while (!jobs_to_kill.is_empty()) {
         // TODO(cpu): This recursive call can overflow the stack.
-        jobs_to_kill.pop_front()->Kill();
+        jobs_to_kill.pop_front()->Kill(return_code);
     }
 
     while (!procs_to_kill.is_empty()) {
-        procs_to_kill.pop_front()->Kill();
+        procs_to_kill.pop_front()->Kill(return_code);
     }
 
     return true;
@@ -602,12 +650,27 @@ fbl::RefPtr<ExceptionPort> JobDispatcher::debugger_exception_port() {
     return debugger_exception_port_;
 }
 
+Exceptionate* JobDispatcher::exceptionate(Exceptionate::Type type) {
+    canary_.Assert();
+    return type == Exceptionate::Type::kDebug ? &debug_exceptionate_ : &exceptionate_;
+}
+
 void JobDispatcher::set_kill_on_oom(bool value) {
     Guard<fbl::Mutex> guard{get_lock()};
     kill_on_oom_ = value;
-};
+}
 
 bool JobDispatcher::get_kill_on_oom() const {
     Guard<fbl::Mutex> guard{get_lock()};
     return kill_on_oom_;
+}
+
+void JobDispatcher::GetInfo(zx_info_job_t* info) const {
+    canary_.Assert();
+
+    Guard<fbl::Mutex> guard{get_lock()};
+    info->return_code = return_code_;
+    info->exited = (state_ == State::DEAD);
+    info->kill_on_oom = kill_on_oom_;
+    info->debugger_attached = debugger_exception_port_ != nullptr;
 }

@@ -27,10 +27,6 @@ const size_t kCfgMmio = 1;
 const size_t kRstMmio = 2;
 const size_t kPllMmio = 3;
 
-const size_t kClk81 = 0;
-const size_t kClkPcieA = 1;
-const size_t kClkPort = 2;
-
 zx_status_t AmlPcieDevice::InitProtocols() {
     zx_status_t st;
 
@@ -52,10 +48,14 @@ zx_status_t AmlPcieDevice::InitProtocols() {
         return st;
     }
 
-    st = device_get_protocol(parent_, ZX_PROTOCOL_CLK, &clk_);
-    if (st != ZX_OK) {
-        zxlogf(ERROR, "aml_pcie: failed to get clk protocol, st = %d", st);
-        return st;
+    for (unsigned i = 0; i < kClockCount; i++) {
+        size_t actual;
+        auto status = pdev_get_protocol(&pdev_, ZX_PROTOCOL_CLOCK, i, &clks_[i], sizeof(clks_[i]),
+                                        &actual);
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "aml-cpufreq: failed to get clk protocol\n");
+            return status;
+        }
     }
 
     return st;
@@ -183,7 +183,7 @@ zx_status_t AmlPcieDevice::Init() {
     st = InitMetadata();
     if (st != ZX_OK) return st;
 
-    pcie_ = fbl::make_unique<AmlPcie>(
+    pcie_ = std::make_unique<AmlPcie>(
         *std::move(dbi_),
         *std::move(cfg_),
         *std::move(rst_),
@@ -196,13 +196,13 @@ zx_status_t AmlPcieDevice::Init() {
 
     pcie_->ClearReset(kRstPcieApb | kRstPciePhy);
 
-    st = clk_enable(&clk_, kClk81);
+    st = clock_enable(&clks_[kClk81]);
     if (st != ZX_OK) {
         zxlogf(ERROR, "aml_pcie: failed to init root clock, st = %d\n", st);
         return st;
     }
 
-    st = clk_enable(&clk_, kClkPcieA);
+    st = clock_enable(&clks_[kClkPcieA]);
     if (st != ZX_OK) {
         zxlogf(ERROR, "aml_pcie: failed to init pciea clock, st = %d\n", st);
         return st;
@@ -210,7 +210,7 @@ zx_status_t AmlPcieDevice::Init() {
 
     pcie_->ClearReset(kRstPcieA);
 
-    st = clk_enable(&clk_, kClkPort);
+    st = clock_enable(&clks_[kClkPort]);
     if (st != ZX_OK) {
         zxlogf(ERROR, "aml_pcie: failed to init port clock, st = %d\n", st);
         return st;
@@ -227,6 +227,7 @@ zx_status_t AmlPcieDevice::Init() {
         return st;
     }
 
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     st = zx_pci_add_subtract_io_range(get_root_resource(), false,
                                       atu_io_.cpu_addr, atu_io_.length, true);
     if (st != ZX_OK) {
@@ -234,6 +235,7 @@ zx_status_t AmlPcieDevice::Init() {
         return st;
     }
 
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     st = zx_pci_add_subtract_io_range(get_root_resource(), true,
                                       atu_mem_.cpu_addr, atu_mem_.length, true);
     if (st != ZX_OK) {
@@ -273,6 +275,7 @@ zx_status_t AmlPcieDevice::Init() {
     arg->addr_windows[1].bus_start = 1;
     arg->addr_windows[1].bus_end = 1;
 
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     st = zx_pci_init(get_root_resource(), arg, arg_size);
     if (st != ZX_OK) {
         zxlogf(ERROR, "aml_pcie: failed to init pci bus driver, st = %d\n", st);
@@ -281,11 +284,15 @@ zx_status_t AmlPcieDevice::Init() {
 
     pci_dev_args.ctx = (void*)this;
 
+    dev_ = nullptr;
+/* FIXME this needs to be rewritten to use composite devices
     st = pdev_device_add(&pdev_, 0, &pci_dev_args, &dev_);
     if (st != ZX_OK) {
         zxlogf(ERROR, "aml_pcie: pdev_device_add failed, st = %d\n", st);
         return st;
     }
+*/
+    st = ZX_ERR_NOT_SUPPORTED;
 
     return st;
 }

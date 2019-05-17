@@ -170,6 +170,20 @@ static zx_status_t kpci_get_bti(pci_msg_t* req, kpci_device_t* device, zx_handle
     return pci_rpc_reply(ch, ZX_OK, &bti, req, &resp);
 }
 
+static zx_status_t kpci_connect_sysmem(pci_msg_t* req, kpci_device_t* device, zx_handle_t ch) {
+    pci_msg_t resp = {};
+    if (device->pciroot.ops) {
+        zx_status_t status = pciroot_connect_sysmem(&device->pciroot, req->handle);
+        if (status != ZX_OK) {
+            return status;
+        }
+    } else {
+        zx_handle_close(ch);
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+    return pci_rpc_reply(ch, ZX_OK, NULL, req, &resp);
+}
+
 // All callbacks corresponding to protocol operations match this signature.
 // Rather than passing the outgoing message back to kpci_rxrpc, the callback
 // itself is expected to write to the channel directly. This greatly simplifies
@@ -190,6 +204,7 @@ const rxrpc_cbk_t rxrpc_cbk_tbl[] = {
     [PCI_OP_GET_DEVICE_INFO] = kpci_get_device_info,
     [PCI_OP_GET_AUXDATA] = kpci_get_auxdata,
     [PCI_OP_GET_BTI] = kpci_get_bti,
+    [PCI_OP_CONNECT_SYSMEM] = kpci_connect_sysmem,
     [PCI_OP_MAX] = NULL,
 };
 
@@ -207,6 +222,7 @@ const char* const rxrpc_string_tbl[] = {
     LABEL(PCI_OP_GET_DEVICE_INFO),
     LABEL(PCI_OP_GET_AUXDATA),
     LABEL(PCI_OP_GET_BTI),
+    LABEL(PCI_OP_CONNECT_SYSMEM),
 };
 #undef LABEL
 static_assert(countof(rxrpc_string_tbl) == PCI_OP_MAX, "rpc string table is not contiguous!");
@@ -228,13 +244,17 @@ static zx_status_t kpci_rxrpc(void* ctx, zx_handle_t ch) {
     const char* name = device_get_name(device->zxdev);
     pci_msg_t req;
     uint32_t actual_bytes;
-    zx_status_t st = zx_channel_read(ch, 0, &req, NULL, sizeof(req), 0, &actual_bytes, NULL);
+    zx_handle_t handle = ZX_HANDLE_INVALID;
+    uint32_t actual_handles;
+    zx_status_t st =
+        zx_channel_read(ch, 0, &req, &handle, sizeof(req), 1, &actual_bytes, &actual_handles);
     if (st != ZX_OK) {
         zxlogf(ERROR, "pci[%s]: error reading from channel %d\n", name, st);
         return st;
     }
 
     if (actual_bytes != sizeof(req)) {
+        zx_handle_close(handle);
         zxlogf(ERROR, "pci[%s]: channel read size invalid!\n", name);
         return ZX_ERR_INTERNAL;
     }
@@ -245,6 +265,15 @@ static zx_status_t kpci_rxrpc(void* ctx, zx_handle_t ch) {
         zxlogf(ERROR, "pci[%s]: unsupported rpc op %u\n", name, op);
         st = ZX_ERR_NOT_SUPPORTED;
         goto err;
+    }
+    if (req.ordinal == PCI_OP_CONNECT_SYSMEM) {
+        if (actual_handles > 0) {
+            req.handle = handle;
+            handle = ZX_HANDLE_INVALID;
+        } else {
+            st = ZX_ERR_INVALID_ARGS;
+            goto err;
+        }
     }
 
     zxlogf(SPEW, "pci[%s]: rpc id %u op %s(%u) args '%#02x %#02x %#02x %#02x...'\n", name, id,
@@ -262,6 +291,7 @@ err:;
         .txid = req.txid,
         .ordinal = st,
     };
+    zx_handle_close(handle);
 
     zxlogf(SPEW, "pci[%s]: rpc id %u op %s(%u) error %d\n", name, id, rpc_op_lbl(op), op, st);
     return zx_channel_write(ch, 0, &resp, sizeof(resp), NULL, 0);
@@ -291,6 +321,7 @@ static zx_status_t pci_init_child(zx_device_t* parent, uint32_t index) {
     }
 
     // TODO: What is an 'nth' device in a world where a device may be added/removed via hotplug?
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     zx_status_t status = zx_pci_get_nth_device(get_root_resource(), index, &info, &handle);
     if (status != ZX_OK) {
         return status;
@@ -321,7 +352,7 @@ static zx_status_t pci_init_child(zx_device_t* parent, uint32_t index) {
         {BIND_PCI_SUBCLASS, 0, info.sub_class},
         {BIND_PCI_INTERFACE, 0, info.program_interface},
         {BIND_PCI_REVISION, 0, info.revision_id},
-        {BIND_PCI_BDF_ADDR, 0, BIND_PCI_BDF_PACK(info.bus_id, info.dev_id, info.func_id)},
+        {BIND_TOPO_PCI, 0, BIND_TOPO_PCI_PACK(info.bus_id, info.dev_id, info.func_id)},
     };
 
     // The most important detail here is the handling of DEVICE_ADD_MUST_ISOLATE. With that

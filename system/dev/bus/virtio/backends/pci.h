@@ -5,7 +5,7 @@
 #pragma once
 
 #include "backend.h"
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <optional>
 #include <zircon/thread_annotations.h>
 
@@ -86,7 +86,7 @@ public:
         : PciBackend(pci, info) {}
     // The dtor handles cleanup of allocated bars because we cannot tear down
     // the mappings safely while the virtio device is being used by a driver.
-    virtual ~PciModernBackend(){};
+    virtual ~PciModernBackend(){}
     zx_status_t Init() override;
 
     void DriverStatusOk() override;

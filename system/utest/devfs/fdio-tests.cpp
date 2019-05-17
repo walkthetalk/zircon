@@ -8,7 +8,9 @@
 #include <fbl/unique_fd.h>
 #include <fuchsia/io/c/fidl.h>
 #include <lib/fdio/limits.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <unittest/unittest.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
@@ -20,13 +22,11 @@ bool TestDeviceClone() {
 
     fbl::unique_fd fd(open("/dev/zero", O_RDONLY));
 
-    zx_handle_t handles[FDIO_MAX_HANDLES] = {};
-    uint32_t types[FDIO_MAX_HANDLES] = {};
-    zx_status_t r = fdio_clone_fd(fd.get(), 0, handles, types);
-    ASSERT_EQ(r, 1);
-    ASSERT_NE(handles[0], ZX_HANDLE_INVALID);
-    ASSERT_EQ(types[0], PA_FDIO_REMOTE);
-    zx_handle_close(handles[0]);
+    zx_handle_t handle = ZX_HANDLE_INVALID;
+    zx_status_t status = fdio_fd_clone(fd.get(), &handle);
+    ASSERT_EQ(status, ZX_OK);
+    ASSERT_NE(handle, ZX_HANDLE_INVALID);
+    zx_handle_close(handle);
 
     END_TEST;
 }
@@ -36,13 +36,11 @@ bool TestDeviceTransfer() {
 
     fbl::unique_fd fd(open("/dev/zero", O_RDONLY));
 
-    zx_handle_t handles[FDIO_MAX_HANDLES] = {};
-    uint32_t types[FDIO_MAX_HANDLES] = {};
-    zx_status_t r = fdio_transfer_fd(fd.release(), 0, handles, types);
-    ASSERT_EQ(r, 1);
-    ASSERT_NE(handles[0], ZX_HANDLE_INVALID);
-    ASSERT_EQ(types[0], PA_FDIO_REMOTE);
-    zx_handle_close(handles[0]);
+    zx_handle_t handle = ZX_HANDLE_INVALID;
+    zx_status_t status = fdio_fd_transfer(fd.release(), &handle);
+    ASSERT_EQ(status, ZX_OK);
+    ASSERT_NE(handle, ZX_HANDLE_INVALID);
+    zx_handle_close(handle);
 
     END_TEST;
 }

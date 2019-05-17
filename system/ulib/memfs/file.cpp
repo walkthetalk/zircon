@@ -57,7 +57,13 @@ zx_status_t VnodeFile::Read(void* data, size_t len, size_t off, size_t* out_actu
 zx_status_t VnodeFile::Write(const void* data, size_t len, size_t offset,
                              size_t* out_actual) {
     zx_status_t status;
-    size_t newlen = offset + len;
+    if (offset > kMemfsMaxFileSize) {
+        return ZX_ERR_FILE_BIG;
+    }
+    size_t newlen;
+    if (add_overflow(offset, len, &newlen)) {
+        return ZX_ERR_FILE_BIG;
+    }
     newlen = newlen > kMemfsMaxFileSize ? kMemfsMaxFileSize : newlen;
     if ((status = vfs()->GrowVMO(vmo_, vmo_size_, newlen, &vmo_size_)) != ZX_OK) {
         return status;
@@ -108,8 +114,8 @@ zx_status_t VnodeFile::GetVmo(int flags, zx_handle_t* out_vmo, size_t* out_size)
     rights |= (flags & fuchsia_io_VMO_FLAG_EXEC) ? ZX_RIGHT_EXECUTE : 0;
     zx::vmo result;
     if (flags & fuchsia_io_VMO_FLAG_PRIVATE) {
-        if ((status = vmo_.clone(ZX_VMO_CLONE_COPY_ON_WRITE, 0, length_,
-                                 &result)) != ZX_OK) {
+        if ((status = vmo_.create_child(ZX_VMO_CHILD_COPY_ON_WRITE, 0, length_,
+                                        &result)) != ZX_OK) {
             return status;
         }
 

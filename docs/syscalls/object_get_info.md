@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-object_get_info - query information about an object
+Query information about an object.
 
 ## SYNOPSIS
 
@@ -113,6 +113,29 @@ typedef struct zx_info_process_handle_stats {
     // The number of outstanding handles to kernel objects of each type.
     uint32_t handle_count[ZX_OBJ_TYPE_LAST];
 } zx_info_process_handle_stats_t;
+```
+
+### ZX_INFO_JOB
+
+*handle* type: **Job**
+
+*buffer* type: `zx_info_job_t[1]`
+
+```
+typedef struct zx_info_job {
+    // The job's return code; only valid if |exited| is true.
+    // If the job was killed, it will be one of the ZX_TASK_RETCODE values.
+    int64_t return_code;
+
+    // If true, the job has exited and |return_code| is valid.
+    bool exited;
+
+    // True if the ZX_PROP_JOB_KILL_ON_OOM property was set.
+    bool kill_on_oom;
+
+    // True if a debugger is attached to the job.
+    bool debugger_attached;
+} zx_info_job_t;
 ```
 
 ### ZX_INFO_PROCESS
@@ -322,10 +345,10 @@ typedef struct zx_info_vmo {
     // The size of this VMO.
     uint64_t size_bytes;
 
-    // If this VMO is a clone, the koid of its parent. Otherwise, zero.
+    // If this VMO is a child, the koid of its parent. Otherwise, zero.
     zx_koid_t parent_koid;
 
-    // The number of clones of this VMO, if any.
+    // The number of children of this VMO, if any.
     size_t num_children;
 
     // The number of times this VMO is currently mapped into VMARs.
@@ -345,11 +368,6 @@ typedef struct zx_info_vmo {
     // If |flags & ZX_INFO_VMO_VIA_HANDLE|, the handle rights.
     // Undefined otherwise.
     zx_rights_t handle_rights;
-
-    // VMO creation options. This is a bitmask of
-    // kResizable    = (1u << 0);
-    // kContiguous   = (1u << 1);
-    uint32_t create_options;
 
     // VMO mapping cache policy. One of ZX_CACHE_POLICY_*
     uint32_t cache_policy;
@@ -544,11 +562,11 @@ typedef struct zx_info_vmo {
     // would consume if mapped.
     uint64_t size_bytes;
 
-    // If this VMO is a clone, the koid of its parent. Otherwise, zero.
-    // See |flags| for the type of clone.
+    // If this VMO is a child , the koid of its parent. Otherwise, zero.
+    // See |flags| for the type of child.
     zx_koid_t parent_koid;
 
-    // The number of clones of this VMO, if any.
+    // The number of child of this VMO, if any.
     size_t num_children;
 
     // The number of times this VMO is currently mapped into VMARs.
@@ -585,11 +603,12 @@ the VMOs of arbitrary processes by koid.
 
 *buffer* type: `zx_info_kmem_stats_t[1]`
 
-Returns information about kernel memory usage. It can be expensive to gather.
+Returns information about kernel memory usage.
 
 ```
 typedef struct zx_info_kmem_stats {
     // The total amount of physical memory available to the system.
+    // Note, the values below may not exactly add up to this total.
     size_t total_bytes;
 
     // The amount of unallocated memory.
@@ -677,6 +696,8 @@ typedef struct zx_info_bti {
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
 If *topic* is **ZX_INFO_PROCESS**, *handle* must be of type **ZX_OBJ_TYPE_PROCESS** and have **ZX_RIGHT_INSPECT**.
+
+If *topic* is **ZX_INFO_JOB**, *handle* must be of type **ZX_OBJ_TYPE_JOB** and have **ZX_RIGHT_INSPECT**.
 
 If *topic* is **ZX_INFO_PROCESS_THREADS**, *handle* must be of type **ZX_OBJ_TYPE_PROCESS** and have **ZX_RIGHT_ENUMERATE**.
 

@@ -8,16 +8,16 @@
 #include <assert.h>
 #include <map>
 #include <stdint.h>
+#include <string_view>
 
 #include "error_reporter.h"
 #include "source_manager.h"
-#include "string_view.h"
 #include "token.h"
 
 namespace fidl {
 
 // The lexer does not own the data it operates on. It merely takes a
-// StringView and produces a stream of tokens and possibly a failure
+// std::string_view and produces a stream of tokens and possibly a failure
 // partway through.
 class Lexer {
 public:
@@ -25,13 +25,13 @@ public:
     // simplifies advancing to the next character.
     Lexer(const SourceFile& source_file, ErrorReporter* error_reporter)
         : source_file_(source_file), error_reporter_(error_reporter) {
-        assert(data()[data().size() - 1] == 0);
         keyword_table_ = {
 #define KEYWORD(Name, Spelling) {Spelling, Token::Subkind::k##Name},
 #include "fidl/token_definitions.inc"
 #undef KEYWORD
         };
         current_ = data().data();
+        end_of_file_ = current_ + data().size();
         previous_end_ = token_start_ = current_;
     }
 
@@ -39,12 +39,12 @@ public:
     Token LexNoComments();
 
 private:
-    StringView data() { return source_file_.data(); }
+    std::string_view data() { return source_file_.data(); }
 
     constexpr char Peek() const;
     void Skip();
     char Consume();
-    StringView Reset(Token::Kind kind);
+    std::string_view Reset(Token::Kind kind);
     Token Finish(Token::Kind kind);
 
     void SkipWhitespace();
@@ -57,10 +57,11 @@ private:
     Token LexCommentOrDocComment();
 
     const SourceFile& source_file_;
-    std::map<StringView, Token::Subkind> keyword_table_;
+    std::map<std::string_view, Token::Subkind> keyword_table_;
     ErrorReporter* error_reporter_;
 
     const char* current_ = nullptr;
+    const char* end_of_file_ = nullptr;
     const char* token_start_ = nullptr;
     const char* previous_end_ = nullptr;
     size_t token_size_ = 0u;

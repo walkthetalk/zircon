@@ -6,6 +6,7 @@
 #define ZIRCON_SYSTEM_HOST_FIDL_INCLUDE_FIDL_PARSER_H_
 
 #include <memory>
+#include <optional>
 
 #include "error_reporter.h"
 #include "lexer.h"
@@ -28,7 +29,7 @@ private:
 
     // ASTScope is a tool to track the start and end source location of each
     // node automatically.  The parser associates each node with the start and
-    // end of its source location.  It also tracks the "gap" is between the the
+    // end of its source location.  It also tracks the "gap" in between the
     // start and the previous interesting source element.  As we walk the tree,
     // we create ASTScope objects that can track the beginning and end of the
     // text associated with the Node being built.  The ASTScope object then
@@ -167,10 +168,11 @@ private:
         };
     }
 
-    bool LookupHandleSubtype(const raw::Identifier* identifier, types::HandleSubtype* subtype_out);
+    bool LookupHandleSubtype(const raw::Identifier* identifier,
+                             std::optional<types::HandleSubtype>* out_handle_subtype);
 
     decltype(nullptr) Fail();
-    decltype(nullptr) Fail(StringView message);
+    decltype(nullptr) Fail(std::string_view message);
 
     std::unique_ptr<raw::Identifier> ParseIdentifier(bool is_discarded = false);
     std::unique_ptr<raw::CompoundIdentifier> ParseCompoundIdentifier();
@@ -180,24 +182,22 @@ private:
     std::unique_ptr<raw::TrueLiteral> ParseTrueLiteral();
     std::unique_ptr<raw::FalseLiteral> ParseFalseLiteral();
     std::unique_ptr<raw::Literal> ParseLiteral();
-    std::unique_ptr<raw::Ordinal> MaybeParseOrdinal();
+    std::unique_ptr<raw::Ordinal> ParseOrdinal();
 
     std::unique_ptr<raw::Constant> ParseConstant();
 
     std::unique_ptr<raw::Attribute> ParseAttribute();
     std::unique_ptr<raw::Attribute> ParseDocComment();
-    std::unique_ptr<raw::AttributeList> ParseAttributeList(std::unique_ptr<raw::Attribute>&& doc_comment, ASTScope& scope);
+    std::unique_ptr<raw::AttributeList> ParseAttributeList(std::unique_ptr<raw::Attribute> doc_comment, ASTScope& scope);
     std::unique_ptr<raw::AttributeList> MaybeParseAttributeList();
 
     std::unique_ptr<raw::Using> ParseUsing();
 
-    std::unique_ptr<raw::IdentifierType> ParseIdentifierType();
-    std::unique_ptr<raw::ArrayType> ParseArrayType();
-    std::unique_ptr<raw::VectorType> ParseVectorType();
-    std::unique_ptr<raw::StringType> ParseStringType();
-    std::unique_ptr<raw::HandleType> ParseHandleType();
-    std::unique_ptr<raw::RequestHandleType> ParseRequestHandleType();
-    std::unique_ptr<raw::Type> ParseType();
+    std::unique_ptr<raw::TypeConstructor> ParseTypeConstructor();
+
+    std::unique_ptr<raw::BitsMember> ParseBitsMember();
+    std::unique_ptr<raw::BitsDeclaration>
+    ParseBitsDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope&);
 
     std::unique_ptr<raw::ConstDeclaration>
     ParseConstDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope&);
@@ -208,10 +208,21 @@ private:
 
     std::unique_ptr<raw::Parameter> ParseParameter();
     std::unique_ptr<raw::ParameterList> ParseParameterList();
-    std::unique_ptr<raw::InterfaceMethod> ParseInterfaceMethod(
-        std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope);
+    std::unique_ptr<raw::InterfaceMethod> ParseProtocolEvent(
+        std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+        std::unique_ptr<raw::Ordinal> ordinal);
+    std::unique_ptr<raw::InterfaceMethod> ParseProtocolMethod(
+        std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+        std::unique_ptr<raw::Ordinal> ordinal,
+        std::unique_ptr<raw::Identifier> method_name);
+    // ParseProtocolMember parses any one protocol member, i.e. an event,
+    // a method, or a compose stanza.
+    void ParseProtocolMember(
+        std::unique_ptr<raw::AttributeList> attributes, ASTScope& scope,
+        std::vector<std::unique_ptr<raw::ComposeProtocol>>* composed_protocols,
+        std::vector<std::unique_ptr<raw::InterfaceMethod>>* methods);
     std::unique_ptr<raw::InterfaceDeclaration>
-    ParseInterfaceDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope&);
+    ParseProtocolDeclaration(std::unique_ptr<raw::AttributeList> attributes, ASTScope&);
 
     std::unique_ptr<raw::StructMember> ParseStructMember();
     std::unique_ptr<raw::StructDeclaration>
@@ -232,7 +243,7 @@ private:
 
     std::unique_ptr<raw::File> ParseFile();
 
-    std::map<StringView, types::HandleSubtype> handle_subtype_table_;
+    std::map<std::string_view, types::HandleSubtype> handle_subtype_table_;
 
     Lexer* lexer_;
     ErrorReporter* error_reporter_;

@@ -10,8 +10,8 @@
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/i2cimpl.h>
 #include <ddk/protocol/platform-device-lib.h>
-#include <ddk/protocol/platform/bus.h>
 #include <ddk/protocol/platform/device.h>
+#include <ddktl/pdev.h>
 
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
@@ -28,6 +28,8 @@ constexpr size_t kMaxTransferSize = UINT16_MAX - 1; // More than enough.
 constexpr size_t kHwFifoSize = 8;
 constexpr uint32_t kEventCompletion = ZX_USER_SIGNAL_0;
 constexpr zx::duration kTimeout = zx::msec(10);
+constexpr uint32_t kAltFunctionGpio = 0;
+constexpr uint32_t kAltFunctionI2c = 1;
 
 uint32_t Mt8167I2c::I2cImplGetBusCount() {
     return bus_count_;
@@ -60,8 +62,9 @@ zx_status_t Mt8167I2c::I2cImplTransact(uint32_t id, const i2c_impl_op_t* ops, si
         // TODO(andresoportus): Add support for HW transaction (write followed by read).
         status = Transact(ops[i].is_read, id, addr, ops[i].data_buffer, ops[i].data_size,
                           ops[i].stop);
-        if (status != ZX_OK) {
-            zxlogf(ERROR, "%s: status %d\n", __FUNCTION__, status);
+        if (status != ZX_OK && bind_finished_) {
+            zxlogf(ERROR, "%s: error in bus id: %u  addr: 0x%X  size: %lu\n", __func__, id, addr,
+                   ops[i].data_size);
             Reset(id);
             return status;
         }
@@ -82,12 +85,6 @@ int Mt8167I2c::IrqThread() {
         auto id = static_cast<uint32_t>(packet.key);
         ZX_ASSERT(id < keys_.size());
         keys_[id].irq.ack();
-        auto st = IntrStatReg::Get().ReadFrom(&keys_[id].mmio);
-        if (st.arb_lost() || st.hs_nacker() || st.ackerr()) {
-            zxlogf(ERROR, "%s: error 0x%08X\n", __func__,
-                   IntrStatReg::Get().ReadFrom(&keys_[id].mmio).reg_value());
-            IntrStatReg::Get().ReadFrom(&keys_[id].mmio).Print();
-        }
         keys_[id].event.signal(0, kEventCompletion);
     }
 }
@@ -144,6 +141,13 @@ zx_status_t Mt8167I2c::Transact(bool is_read, uint32_t id, uint8_t addr, void* b
     }
     auto st = IntrStatReg::Get().ReadFrom(&keys_[id].mmio);
     if (st.arb_lost() || st.hs_nacker() || st.ackerr()) {
+        if (bind_finished_) {
+            zxlogf(ERROR, "%s: I2C error 0x%X\n", __func__,
+                   IntrStatReg::Get().ReadFrom(&keys_[id].mmio).reg_value());
+            if (st.ackerr()) {
+                zxlogf(ERROR, "%s: No I2C ack reply from peripheral\n", __func__);
+            }
+        }
         return ZX_ERR_INTERNAL;
     }
     return ZX_OK;
@@ -191,6 +195,72 @@ int Mt8167I2c::TestThread() {
     }
 #endif
     return 0;
+}
+
+zx_status_t Mt8167I2c::GetI2cGpios(fbl::Array<ddk::GpioProtocolClient>* gpios) {
+    ddk::PDev pdev(parent());
+    if (!pdev.is_valid()) {
+        zxlogf(ERROR, "%s ZX_PROTOCOL_PLATFORM_DEV failed\n", __FUNCTION__);
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    pdev_device_info_t dev_info;
+    zx_status_t status = pdev.GetDeviceInfo(&dev_info);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s pdev_get_device_info failed %d\n", __FUNCTION__, status);
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    fbl::AllocChecker ac;
+    gpios->reset(new (&ac) ddk::GpioProtocolClient[dev_info.gpio_count], dev_info.gpio_count);
+    if (!ac.check()) {
+        zxlogf(ERROR, "%s ZX_ERR_NO_MEMORY\n", __FUNCTION__);
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    for (uint32_t i = 0; i < dev_info.gpio_count; i++) {
+        (*gpios)[i] = pdev.GetGpio(i);
+        if (!(*gpios)[i].is_valid()) {
+            zxlogf(ERROR, "%s ZX_PROTOCOL_GPIO failed\n", __FUNCTION__);
+            return ZX_ERR_NOT_SUPPORTED;
+        }
+    }
+
+    return ZX_OK;
+}
+
+zx_status_t Mt8167I2c::DoDummyTransactions() {
+    fbl::Array<ddk::GpioProtocolClient> gpios;
+    zx_status_t status = GetI2cGpios(&gpios);
+    if (status != ZX_OK || gpios.size() == 0) {
+        return status;
+    }
+
+    for (const ddk::GpioProtocolClient& gpio : gpios) {
+        gpio.SetAltFunction(kAltFunctionGpio);
+    }
+
+    // Do one dummy write on each bus. This works around an issue where the first transaction after
+    // enabling the VGP1 regulator gets a NACK error.
+    // TODO(ZX-3486): Figure out a fix for this instead of working around it.
+    for (uint32_t id = 0; id < bus_count_; id++) {
+        uint8_t byte = 0;
+        i2c_impl_op_t ops = {
+            .address = 0x00,
+            .data_buffer = &byte,
+            .data_size = sizeof(byte),
+            .is_read = false,
+            .stop = true
+        };
+
+        I2cImplTransact(id, &ops, 1);
+    }
+
+    for (const ddk::GpioProtocolClient& gpio : gpios) {
+        gpio.SetAltFunction(kAltFunctionI2c);
+    }
+
+    return ZX_OK;
 }
 
 zx_status_t Mt8167I2c::Bind() {
@@ -244,7 +314,7 @@ zx_status_t Mt8167I2c::Bind() {
         }
         keys_.push_back({ddk::MmioBuffer(mmio), zx::interrupt(), std::move(event)});
 
-        status = pdev_map_interrupt(&pdev, id, keys_[id].irq.reset_and_get_address());
+        status = pdev_get_interrupt(&pdev, id, 0, keys_[id].irq.reset_and_get_address());
         if (status != ZX_OK) {
             return status;
         }
@@ -265,6 +335,13 @@ zx_status_t Mt8167I2c::Bind() {
         return ZX_ERR_INTERNAL;
     }
 
+    status = DoDummyTransactions();
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    bind_finished_ = true;
+
     status = DdkAdd("mt8167-i2c");
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s DdkAdd failed: %d\n", __FUNCTION__, status);
@@ -275,23 +352,6 @@ zx_status_t Mt8167I2c::Bind() {
 
 zx_status_t Mt8167I2c::Init() {
     auto cleanup = fbl::MakeAutoCall([&]() { ShutDown(); });
-
-    pbus_protocol_t pbus;
-    if (device_get_protocol(parent(), ZX_PROTOCOL_PBUS, &pbus) != ZX_OK) {
-        zxlogf(ERROR, "%s ZX_PROTOCOL_PLATFORM_BUS not available\n", __FUNCTION__);
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-    i2c_impl_protocol_t i2c_proto = {
-        .ops = &i2c_impl_protocol_ops_,
-        .ctx = this,
-    };
-    const platform_proxy_cb_t kCallback = {NULL, NULL};
-    auto status = pbus_register_protocol(&pbus, ZX_PROTOCOL_I2C_IMPL, &i2c_proto, sizeof(i2c_proto),
-                                         &kCallback);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s pbus_register_protocol failed: %d\n", __FUNCTION__, status);
-        return status;
-    }
 
 #ifdef TEST_USB_REGS_READ
     auto thunk =
@@ -306,7 +366,7 @@ zx_status_t Mt8167I2c::Init() {
     return ZX_OK;
 }
 
-zx_status_t Mt8167I2c::Create(zx_device_t* parent) {
+zx_status_t Mt8167I2c::Create(void* ctx, zx_device_t* parent) {
     fbl::AllocChecker ac;
     auto dev = fbl::make_unique_checked<Mt8167I2c>(&ac, parent);
     if (!ac.check()) {
@@ -325,8 +385,19 @@ zx_status_t Mt8167I2c::Create(zx_device_t* parent) {
     return ptr->Init();
 }
 
+static zx_driver_ops_t driver_ops = []() {
+    zx_driver_ops_t ops = {};
+    ops.version = DRIVER_OPS_VERSION;
+    ops.bind = Mt8167I2c::Create;
+    return ops;
+}();
+
 } // namespace mt8167_i2c
 
-extern "C" zx_status_t mt8167_i2c_bind(void* ctx, zx_device_t* parent) {
-    return mt8167_i2c::Mt8167I2c::Create(parent);
-}
+// clang-format off
+ZIRCON_DRIVER_BEGIN(mt8167_i2c, mt8167_i2c::driver_ops, "zircon", "0.1", 3)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PDEV),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_MEDIATEK),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_I2C),
+ZIRCON_DRIVER_END(mt8167_i2c)
+// clang-format on

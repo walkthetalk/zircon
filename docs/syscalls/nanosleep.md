@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-nanosleep - high resolution sleep
+High resolution sleep.
 
 ## SYNOPSIS
 
@@ -46,13 +46,11 @@ None.
 
 ## SEE ALSO
 
- - [timer slack]
+ - [timer slack](../timer_slack.md)
  - [`zx_deadline_after()`]
  - [`zx_timer_cancel()`]
  - [`zx_timer_create()`]
  - [`zx_timer_set()`]
-
-[timer slack]: ../timer_slack.md
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 

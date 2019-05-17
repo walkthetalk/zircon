@@ -19,6 +19,7 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_counted_upgradeable.h>
 #include <fbl/ref_ptr.h>
+#include <ktl/type_traits.h>
 #include <ktl/unique_ptr.h>
 #include <ktl/move.h>
 
@@ -31,43 +32,44 @@
 #include <zircon/syscalls/object.h>
 #include <zircon/types.h>
 
-struct CookieJar {
-    zx_koid_t scope_ = ZX_KOID_INVALID;
-    uint64_t cookie_ = 0u;
-};
-
 template <typename T> struct DispatchTag;
+template <typename T> struct CanaryTag;
 
-#define DECLARE_DISPTAG(T, E)               \
-class T;                                    \
-template <> struct DispatchTag<T> {         \
-    static constexpr zx_obj_type_t ID = E;  \
+#define DECLARE_DISPTAG(T, E, M)                \
+class T;                                        \
+template <> struct DispatchTag<T> {             \
+    static constexpr zx_obj_type_t ID = E;      \
+};                                              \
+template <> struct CanaryTag<T> {               \
+    static constexpr uint32_t magic =           \
+        fbl::magic(M);                          \
 };
 
-DECLARE_DISPTAG(ProcessDispatcher, ZX_OBJ_TYPE_PROCESS)
-DECLARE_DISPTAG(ThreadDispatcher, ZX_OBJ_TYPE_THREAD)
-DECLARE_DISPTAG(VmObjectDispatcher, ZX_OBJ_TYPE_VMO)
-DECLARE_DISPTAG(ChannelDispatcher, ZX_OBJ_TYPE_CHANNEL)
-DECLARE_DISPTAG(EventDispatcher, ZX_OBJ_TYPE_EVENT)
-DECLARE_DISPTAG(PortDispatcher, ZX_OBJ_TYPE_PORT)
-DECLARE_DISPTAG(InterruptDispatcher, ZX_OBJ_TYPE_INTERRUPT)
-DECLARE_DISPTAG(PciDeviceDispatcher, ZX_OBJ_TYPE_PCI_DEVICE)
-DECLARE_DISPTAG(LogDispatcher, ZX_OBJ_TYPE_LOG)
-DECLARE_DISPTAG(SocketDispatcher, ZX_OBJ_TYPE_SOCKET)
-DECLARE_DISPTAG(ResourceDispatcher, ZX_OBJ_TYPE_RESOURCE)
-DECLARE_DISPTAG(EventPairDispatcher, ZX_OBJ_TYPE_EVENTPAIR)
-DECLARE_DISPTAG(JobDispatcher, ZX_OBJ_TYPE_JOB)
-DECLARE_DISPTAG(VmAddressRegionDispatcher, ZX_OBJ_TYPE_VMAR)
-DECLARE_DISPTAG(FifoDispatcher, ZX_OBJ_TYPE_FIFO)
-DECLARE_DISPTAG(GuestDispatcher, ZX_OBJ_TYPE_GUEST)
-DECLARE_DISPTAG(VcpuDispatcher, ZX_OBJ_TYPE_VCPU)
-DECLARE_DISPTAG(TimerDispatcher, ZX_OBJ_TYPE_TIMER)
-DECLARE_DISPTAG(IommuDispatcher, ZX_OBJ_TYPE_IOMMU)
-DECLARE_DISPTAG(BusTransactionInitiatorDispatcher, ZX_OBJ_TYPE_BTI)
-DECLARE_DISPTAG(ProfileDispatcher, ZX_OBJ_TYPE_PROFILE)
-DECLARE_DISPTAG(PinnedMemoryTokenDispatcher, ZX_OBJ_TYPE_PMT)
-DECLARE_DISPTAG(SuspendTokenDispatcher, ZX_OBJ_TYPE_SUSPEND_TOKEN)
-DECLARE_DISPTAG(PagerDispatcher, ZX_OBJ_TYPE_PAGER)
+DECLARE_DISPTAG(ProcessDispatcher, ZX_OBJ_TYPE_PROCESS, "PROC")
+DECLARE_DISPTAG(ThreadDispatcher, ZX_OBJ_TYPE_THREAD, "THRD")
+DECLARE_DISPTAG(VmObjectDispatcher, ZX_OBJ_TYPE_VMO, "VMOD")
+DECLARE_DISPTAG(ChannelDispatcher, ZX_OBJ_TYPE_CHANNEL, "CHAN")
+DECLARE_DISPTAG(EventDispatcher, ZX_OBJ_TYPE_EVENT, "EVTD")
+DECLARE_DISPTAG(PortDispatcher, ZX_OBJ_TYPE_PORT, "PORT")
+DECLARE_DISPTAG(InterruptDispatcher, ZX_OBJ_TYPE_INTERRUPT, "INTD")
+DECLARE_DISPTAG(PciDeviceDispatcher, ZX_OBJ_TYPE_PCI_DEVICE, "PCID")
+DECLARE_DISPTAG(LogDispatcher, ZX_OBJ_TYPE_LOG, "LOGD")
+DECLARE_DISPTAG(SocketDispatcher, ZX_OBJ_TYPE_SOCKET, "SOCK")
+DECLARE_DISPTAG(ResourceDispatcher, ZX_OBJ_TYPE_RESOURCE, "RSRD")
+DECLARE_DISPTAG(EventPairDispatcher, ZX_OBJ_TYPE_EVENTPAIR, "EPAI")
+DECLARE_DISPTAG(JobDispatcher, ZX_OBJ_TYPE_JOB, "JOBD")
+DECLARE_DISPTAG(VmAddressRegionDispatcher, ZX_OBJ_TYPE_VMAR, "VARD")
+DECLARE_DISPTAG(FifoDispatcher, ZX_OBJ_TYPE_FIFO, "FIFO")
+DECLARE_DISPTAG(GuestDispatcher, ZX_OBJ_TYPE_GUEST, "GSTD")
+DECLARE_DISPTAG(VcpuDispatcher, ZX_OBJ_TYPE_VCPU, "VCPU")
+DECLARE_DISPTAG(TimerDispatcher, ZX_OBJ_TYPE_TIMER, "TIMR")
+DECLARE_DISPTAG(IommuDispatcher, ZX_OBJ_TYPE_IOMMU, "IOMM")
+DECLARE_DISPTAG(BusTransactionInitiatorDispatcher, ZX_OBJ_TYPE_BTI, "BTID")
+DECLARE_DISPTAG(ProfileDispatcher, ZX_OBJ_TYPE_PROFILE, "PROF")
+DECLARE_DISPTAG(PinnedMemoryTokenDispatcher, ZX_OBJ_TYPE_PMT, "PIMT")
+DECLARE_DISPTAG(SuspendTokenDispatcher, ZX_OBJ_TYPE_SUSPEND_TOKEN, "SUTD")
+DECLARE_DISPTAG(PagerDispatcher, ZX_OBJ_TYPE_PAGER, "PGRD")
+DECLARE_DISPTAG(ExceptionDispatcher, ZX_OBJ_TYPE_EXCEPTION, "EXCD")
 
 #undef DECLARE_DISPTAG
 
@@ -92,10 +94,6 @@ public:
     using fbl::RefCountedUpgradeable<Dispatcher>::Adopt;
     using fbl::RefCountedUpgradeable<Dispatcher>::AddRefMaybeInDestructor;
 
-    // At construction, the object's state tracker is asserting
-    // |signals|.
-    explicit Dispatcher(zx_signals_t signals = 0u);
-
     // Dispatchers are either Solo or Peered. They handle refcounting
     // and locking differently.
     virtual ~Dispatcher();
@@ -115,45 +113,47 @@ public:
     }
 
     // Must be called under the handle table lock.
-    uint32_t current_handle_count() const TA_REQ(Handle::ArenaLock::Get()) {
+    uint32_t current_handle_count() const TA_REQ_SHARED(Handle::ArenaLock::Get()) {
         return handle_count_;
     }
 
-    // The following are only to be called when |is_waitable| reports true.
-
-    using ObserverList = fbl::DoublyLinkedList<StateObserver*, StateObserverListTraits>;
+    using ObserverList = fbl::DoublyLinkedList<StateObserver*, StateObserver::ObserverListTraits>;
 
     // Add an observer.
-    void AddObserver(StateObserver* observer, const StateObserver::CountInfo* cinfo);
-    void AddObserverLocked(StateObserver* observer,
-                           const StateObserver::CountInfo* cinfo) TA_REQ(get_lock());
+    //
+    // Fails when |is_waitable| reports false.
+    //
+    // Be sure to |RemoveObserver| before the Dispatcher is destroyed.
+    virtual zx_status_t AddObserver(StateObserver* observer);
 
-    // Remove an observer (which must have been added).
-    void RemoveObserver(StateObserver* observer);
+    // Remove an observer.
+    //
+    // Returns true if the method removed |observer|, otherwise returns false.
+    //
+    // This method may return false if the observer was never added or has already been removed in
+    // preparation for its destruction.
+    //
+    // It is an error to call this method with an observer that's observing some other Dispatcher.
+    //
+    // May only be called when |is_waitable| reports true.
+    bool RemoveObserver(StateObserver* observer);
 
-    // Called when observers of the handle's state (e.g., waits on the handle) should be
-    // "cancelled", i.e., when a handle (for the object that owns this StateTracker) is being
-    // destroyed or transferred. Returns true if at least one observer was found.
+    // Cancel observers of this object's state (e.g., waits on the object).
+    // Should be called when a handle to this dispatcher is being destroyed.
+    //
+    // May only be called when |is_waitable| reports true.
     void Cancel(const Handle* handle);
 
     // Like Cancel() but issued via via zx_port_cancel().
+    //
+    // Returns true if an observer was canceled.
+    //
+    // May only be called when |is_waitable| reports true.
     bool CancelByKey(const Handle* handle, const void* port, uint64_t key);
-
-    // Dispatchers that support get/set cookie must provide
-    // a CookieJar for those cookies to be stored in.
-    virtual CookieJar* get_cookie_jar() { return nullptr; }
-
-    // Accessors for CookieJars.
-    zx_status_t SetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t cookie);
-    zx_status_t GetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t* cookie);
-    zx_status_t InvalidateCookie(CookieJar* cookiejar);
-    zx_status_t InvalidateCookieLocked(CookieJar* cookiejar) TA_REQ(get_lock());
 
     // Interface for derived classes.
 
     virtual zx_obj_type_t get_type() const = 0;
-
-    virtual zx_status_t add_observer(StateObserver* observer);
 
     virtual zx_status_t user_signal_self(uint32_t clear_mask, uint32_t set_mask) = 0;
     virtual zx_status_t user_signal_peer(uint32_t clear_mask, uint32_t set_mask) = 0;
@@ -186,8 +186,19 @@ public:
     virtual void set_owner(zx_koid_t new_owner) {}
 
 protected:
+    // At construction, the object's state tracker is asserting |signals|.
+    explicit Dispatcher(zx_signals_t signals);
+
+    // Add an observer.
+    //
+    // It is an error to call this when |is_waitable| reports false.
+    void AddObserverLocked(StateObserver* observer,
+                           const StateObserver::CountInfo* cinfo) TA_REQ(get_lock());
+
     // Notify others of a change in state (possibly waking them). (Clearing satisfied signals or
     // setting satisfiable signals should not wake anyone.)
+    //
+    // May only be called when |is_waitable| reports true.
     void UpdateState(zx_signals_t clear_mask, zx_signals_t set_mask);
     void UpdateStateLocked(zx_signals_t clear_mask, zx_signals_t set_mask) TA_REQ(get_lock());
 
@@ -209,13 +220,14 @@ private:
                            Lock<LockType>* lock);
 
     // The common implementation of AddObserver and AddObserverLocked.
+    //
+    // It is an error to call this when |is_waitable| reports false.
     template <typename LockType>
     void AddObserverHelper(StateObserver* observer,
                            const StateObserver::CountInfo* cinfo,
                            Lock<LockType>* lock);
 
-    void UpdateInternalLocked(ObserverList* obs_to_remove,
-                              zx_signals_t signals) TA_REQ(get_lock());
+    fbl::Canary<fbl::magic("DISP")> canary_;
 
     const zx_koid_t koid_;
     uint32_t handle_count_ TA_GUARDED(Handle::ArenaLock::Get());
@@ -233,13 +245,12 @@ private:
 // directly contain their state lock. This is a CRTP template type to permit
 // the lock validator to distinguish between locks in different subclasses of
 // SoloDispatcher.
-template <typename T, zx_rights_t def_rights, zx_signals_t extra_signals = 0u>
+template <typename Self, zx_rights_t def_rights, zx_signals_t extra_signals = 0u>
 class SoloDispatcher : public Dispatcher {
 public:
     static constexpr zx_rights_t default_rights() { return def_rights; }
 
-    // At construction, the object's state tracker is asserting
-    // |signals|.
+    // At construction, the object is asserting |signals|.
     explicit SoloDispatcher(zx_signals_t signals = 0u)
         : Dispatcher(signals) {}
 
@@ -265,8 +276,9 @@ public:
     }
 
 protected:
-    Lock<fbl::Mutex>* get_lock() const final { return &lock_; }
+    Lock<Mutex>* get_lock() const final { return &lock_; }
 
+    const fbl::Canary<CanaryTag<Self>::magic> canary_;
     mutable DECLARE_MUTEX(SoloDispatcher) lock_;
 };
 
@@ -302,7 +314,7 @@ public:
     PeerHolder() = default;
     ~PeerHolder() = default;
 
-    Lock<fbl::Mutex>* get_lock() const { return &lock_; }
+    Lock<Mutex>* get_lock() const { return &lock_; }
 
     mutable DECLARE_MUTEX(PeerHolder) lock_;
 };
@@ -312,8 +324,7 @@ class PeeredDispatcher : public Dispatcher {
 public:
     static constexpr zx_rights_t default_rights() { return def_rights; }
 
-    // At construction, the object's state tracker is asserting
-    // |signals|.
+    // At construction, the object is asserting |signals|.
     explicit PeeredDispatcher(fbl::RefPtr<PeerHolder<Self>> holder,
                               zx_signals_t signals = 0u)
         : Dispatcher(signals),
@@ -367,9 +378,18 @@ public:
         }
     }
 
+    // Returns true if the peer has closed. Once the peer has closed it
+    // will never re-open.
+    bool PeerHasClosed() const {
+        Guard<fbl::Mutex> guard{get_lock()};
+        return peer_ == nullptr;
+    }
+
     Lock<fbl::Mutex>* get_lock() const final { return holder_->get_lock(); }
 
 protected:
+    const fbl::Canary<CanaryTag<Self>::magic> canary_;
+
     zx_koid_t peer_koid_ = 0u;
     fbl::RefPtr<Self> peer_ TA_GUARDED(get_lock());
 
@@ -403,8 +423,8 @@ inline fbl::RefPtr<Dispatcher> DownCastDispatcher(fbl::RefPtr<Dispatcher>* disp)
 // const Dispatcher -> const FooDispatcher
 template <typename T>
 fbl::RefPtr<T> DownCastDispatcher(fbl::RefPtr<const Dispatcher>* disp) {
-    static_assert(fbl::is_const<T>::value, "");
-    return (likely(DispatchTag<typename fbl::remove_const<T>::type>::ID == (*disp)->get_type())) ?
+    static_assert(ktl::is_const<T>::value, "");
+    return (likely(DispatchTag<typename ktl::remove_const<T>::type>::ID == (*disp)->get_type())) ?
             fbl::RefPtr<T>::Downcast(ktl::move(*disp)) :
             nullptr;
 }
@@ -433,8 +453,8 @@ inline Dispatcher* DownCastDispatcher(Dispatcher* disp) {
 // const Dispatcher -> const FooDispatcher
 template <typename T>
 const T* DownCastDispatcher(const Dispatcher* disp) {
-    static_assert(fbl::is_const<T>::value, "");
-    return (likely(DispatchTag<typename fbl::remove_const<T>::type>::ID == disp->get_type())) ?
+    static_assert(ktl::is_const<T>::value, "");
+    return (likely(DispatchTag<typename ktl::remove_const<T>::type>::ID == disp->get_type())) ?
         reinterpret_cast<const T*>(disp) : nullptr;
 }
 

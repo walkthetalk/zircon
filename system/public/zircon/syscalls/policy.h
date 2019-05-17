@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_SYSCALLS_POLICY_H_
+#define SYSROOT_ZIRCON_SYSCALLS_POLICY_H_
 
 #include <zircon/types.h>
 
@@ -42,17 +43,20 @@ typedef struct zx_policy_basic {
 #define ZX_POL_NEW_FIFO                     10u
 #define ZX_POL_NEW_TIMER                    11u
 #define ZX_POL_NEW_PROCESS                  12u
+#define ZX_POL_NEW_PROFILE                  13u
 #ifdef _KERNEL
-#define ZX_POL_MAX                          13u
+#define ZX_POL_MAX                          14u
 #endif
 
 // Policy actions.
-// ZX_POL_ACTION_ALLOW and ZX_POL_ACTION_DENY can be ORed with ZX_POL_ACTION_EXCEPTION.
-// ZX_POL_ACTION_KILL implies ZX_POL_ACTION_DENY.
 #define ZX_POL_ACTION_ALLOW                 0u
 #define ZX_POL_ACTION_DENY                  1u
-#define ZX_POL_ACTION_EXCEPTION             2u
-#define ZX_POL_ACTION_KILL                  5u
+#define ZX_POL_ACTION_ALLOW_EXCEPTION       2u
+#define ZX_POL_ACTION_DENY_EXCEPTION        3u
+#define ZX_POL_ACTION_KILL                  4u
+#ifdef _KERNEL
+#define ZX_POL_ACTION_MAX                   5u
+#endif
 
 // Input structure to use with ZX_JOB_POL_TIMER_SLACK.
 typedef struct zx_policy_timer_slack {
@@ -61,3 +65,5 @@ typedef struct zx_policy_timer_slack {
 } zx_policy_timer_slack_t;
 
 __END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_SYSCALLS_POLICY_H_

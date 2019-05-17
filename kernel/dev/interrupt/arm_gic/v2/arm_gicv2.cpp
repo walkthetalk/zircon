@@ -33,7 +33,6 @@
 #define LOCAL_TRACE 0
 
 #include <arch/arm64.h>
-#define iframe arm64_iframe_short
 #define IFRAME_PC(frame) ((frame)->elr)
 
 static spin_lock_t gicd_lock;
@@ -123,24 +122,6 @@ static int arm_gic_max_cpu() {
 
 static zx_status_t arm_gic_init() {
     uint i;
-    // see if we're gic v2
-    uint rev = 0;
-    uint32_t pidr2 = GICREG(0, GICD_PIDR2);
-    if (pidr2 != 0) {
-        uint rev = BITS_SHIFT(pidr2, 7, 4);
-        if (rev != GICV2) {
-            return ZX_ERR_NOT_FOUND;
-        }
-    } else {
-        // some v2's return a null PIDR2
-        pidr2 = GICREG(0, GICD_V3_PIDR2);
-        rev = BITS_SHIFT(pidr2, 7, 4);
-        if (rev >= GICV3) {
-            // looks like a gic v3
-            return ZX_ERR_NOT_FOUND;
-        }
-        // HACK: if gicv2 and v3 pidr2 seems to be blank, assume we're v2 and continue
-    }
 
     uint32_t typer = GICREG(0, GICD_TYPER);
     uint32_t it_lines_number = BITS_SHIFT(typer, 4, 0);
@@ -258,7 +239,7 @@ static unsigned int gic_remap_interrupt(unsigned int vector) {
     return vector;
 }
 
-static void gic_handle_irq(struct iframe* frame) {
+static void gic_handle_irq(iframe_short_t* frame) {
     // get the current vector
     uint32_t iar = GICREG(0, GICC_IAR);
     unsigned int vector = iar & 0x3ff;
@@ -295,7 +276,7 @@ static void gic_handle_irq(struct iframe* frame) {
     ktrace_tiny(TAG_IRQ_EXIT, (vector << 8) | cpu);
 }
 
-static void gic_handle_fiq(struct iframe* frame) {
+static void gic_handle_fiq(iframe_short_t* frame) {
     PANIC_UNIMPLEMENTED;
 }
 
@@ -451,4 +432,4 @@ static void arm_gic_v2_init(const void* driver_data, uint32_t length) {
     gicv2_hw_interface_register();
 }
 
-LK_PDEV_INIT(arm_gic_v2_init, KDRV_ARM_GIC_V2, arm_gic_v2_init, LK_INIT_LEVEL_PLATFORM_EARLY);
+LK_PDEV_INIT(arm_gic_v2_init, KDRV_ARM_GIC_V2, arm_gic_v2_init, LK_INIT_LEVEL_PLATFORM_EARLY)

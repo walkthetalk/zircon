@@ -90,7 +90,7 @@ ExitInterruptionInformation::ExitInterruptionInformation(const AutoVmcs& vmcs) {
     vector = static_cast<uint8_t>(BITS(int_info, 7, 0));
     interruption_type = static_cast<InterruptionType>(BITS_SHIFT(int_info, 10, 8));
     valid = BIT(int_info, 31);
-};
+}
 
 CrAccessInfo::CrAccessInfo(uint64_t qualification) {
     // From Volume 3, Table 27-3.
@@ -299,6 +299,9 @@ static zx_status_t handle_cpuid(const ExitInfo& exit_info, AutoVmcs* vmcs,
                 1u << X86_FEATURE_IBRS_IBPB.bit |
                 1u << X86_FEATURE_STIBP.bit |
                 1u << X86_FEATURE_SSBD.bit);
+            // Disable support of IA32_ARCH_CAPABILITIES MSR.
+            guest_state->rdx &= ~(
+                1u << X86_FEATURE_ARCH_CAPABILITIES.bit);
             break;
         }
         return ZX_OK;

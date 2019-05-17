@@ -7,10 +7,13 @@
 
 #include <ddk/io-buffer.h>
 #include <ddk/protocol/hidbus.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 #include <hid/boot.h>
 #include <virtio/input.h>
 
 #include "device.h"
+#include "input_kbd.h"
+#include "input_touch.h"
 #include "ring.h"
 
 namespace virtio {
@@ -29,10 +32,11 @@ public:
 
 private:
     // DDK driver hooks
+    static zx_status_t virtio_input_message(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn);
     static void virtio_input_release(void* ctx);
 
     static zx_status_t virtio_input_query(void* ctx, uint32_t options, hid_info_t* info);
-    static zx_status_t virtio_input_start(void* ctx, const hidbus_ifc_t* ifc);
+    static zx_status_t virtio_input_start(void* ctx, const hidbus_ifc_protocol_t* ifc);
     static void virtio_input_stop(void* ctx);
     static zx_status_t virtio_input_get_descriptor(void* ctx, uint8_t desc_type,
                                                    void** data, size_t* len);
@@ -45,14 +49,11 @@ private:
     static zx_status_t virtio_input_get_protocol(void* ctx, uint8_t* protocol);
     static zx_status_t virtio_input_set_protocol(void* ctx, uint8_t protocol);
 
-    zx_status_t Start(const hidbus_ifc_t* ifc);
+    zx_status_t Start(const hidbus_ifc_protocol_t* ifc);
     void Stop();
     zx_status_t Query(uint32_t options, hid_info_t* info);
     zx_status_t GetDescriptor(uint8_t desc_type, void** data, size_t* len);
     void ReceiveEvent(virtio_input_event_t* event);
-
-    void AddKeypressToReport(uint16_t event_code);
-    void RemoveKeypressFromReport(uint16_t event_code);
 
     void SelectConfig(uint8_t select, uint8_t subsel);
 
@@ -65,10 +66,9 @@ private:
 
     uint8_t dev_class_;
     hidbus_protocol_ops_t hidbus_ops_;
-    hidbus_ifc_t hidbus_ifc_;
+    hidbus_ifc_protocol_t hidbus_ifc_;
 
-    hid_boot_kbd_report_t report_;
-
+    std::unique_ptr<HidDevice> hid_device_;
     Ring vring_ = {this};
 };
 

@@ -62,6 +62,10 @@ struct ArgumentFields {
     using NameRef = Field<16, 31>;
 };
 
+struct BoolArgumentFields : ArgumentFields {
+    using Value = Field<32, 32>;
+};
+
 struct Int32ArgumentFields : ArgumentFields {
     using Value = Field<32, 63>;
 };
@@ -100,6 +104,14 @@ struct ProviderSectionMetadataRecordFields : MetadataRecordFields {
 struct ProviderEventMetadataRecordFields : MetadataRecordFields {
     using Id = Field<20, 51>;
     using Event = Field<52, 55>;
+};
+
+struct TraceInfoMetadataRecordFields : MetadataRecordFields {
+    using TraceInfoType = Field<20, 23>;
+};
+
+struct MagicNumberRecordFields : TraceInfoMetadataRecordFields {
+    using Magic = Field<24, 55>;
 };
 
 using InitializationRecordFields = RecordFields;

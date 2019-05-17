@@ -14,11 +14,13 @@
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 
-#include <fbl/vector.h>
 #include <fbl/algorithm.h>
+#include <fbl/vector.h>
+#include <fbl/unique_fd.h>
 #include <lib/fidl/cpp/message.h>
 #include <lib/fidl/cpp/string_view.h>
 #include <lib/fidl/cpp/vector_view.h>
+#include <lib/fzl/fdio.h>
 
 #include <zircon/pixelformat.h>
 #include <zircon/status.h>
@@ -28,6 +30,7 @@
 #include "fuchsia/hardware/display/c/fidl.h"
 #include "virtual-layer.h"
 
+static zx_handle_t device_handle;
 static zx_handle_t dc_handle;
 static bool has_ownership;
 
@@ -47,16 +50,42 @@ static bool wait_for_driver_event(zx_time_t deadline) {
 
 static bool bind_display(fbl::Vector<Display>* displays) {
     printf("Opening controller\n");
-    int vfd = open("/dev/class/display-controller/000", O_RDWR);
-    if (vfd < 0) {
+    fbl::unique_fd fd(open("/dev/class/display-controller/000", O_RDWR));
+    if (!fd) {
         printf("Failed to open display controller (%d)\n", errno);
         return false;
     }
 
-    if (ioctl_display_controller_get_handle(vfd, &dc_handle) != sizeof(zx_handle_t)) {
-        printf("Failed to get display controller handle\n");
+    zx::channel device_server, device_client;
+    zx_status_t status = zx::channel::create(0, &device_server, &device_client);
+    if (status != ZX_OK) {
+        printf("Failed to create device channel %d (%s)\n", status, zx_status_get_string(status));
         return false;
     }
+
+    zx::channel dc_server, dc_client;
+    status = zx::channel::create(0, &dc_server, &dc_client);
+    if (status != ZX_OK) {
+        printf("Failed to create controller channel %d (%s)\n", status,
+               zx_status_get_string(status));
+        return false;
+    }
+
+    fzl::FdioCaller caller(std::move(fd));
+    zx_status_t fidl_status = fuchsia_hardware_display_ProviderOpenController(
+        caller.borrow_channel(), device_server.release(), dc_server.release(), &status);
+    if (fidl_status != ZX_OK) {
+        printf("Failed to call service handle %d (%s)\n", fidl_status,
+               zx_status_get_string(fidl_status));
+        return false;
+    }
+    if (status != ZX_OK) {
+        printf("Failed to open controller %d (%s)\n", status, zx_status_get_string(status));
+        return false;
+    }
+
+    dc_handle = dc_client.release();
+    device_handle = device_client.release();
 
     uint8_t byte_buffer[ZX_CHANNEL_MAX_MSG_BYTES];
     fidl::Message msg(fidl::BytePart(byte_buffer, ZX_CHANNEL_MAX_MSG_BYTES), fidl::HandlePart());
@@ -123,7 +152,7 @@ Display* find_display(fbl::Vector<Display>& displays, const char* id_str) {
     return nullptr;
 }
 
-bool update_display_layers(const fbl::Vector<VirtualLayer*>& layers,
+bool update_display_layers(const fbl::Vector<fbl::unique_ptr<VirtualLayer>>& layers,
                            const Display& display, fbl::Vector<uint64_t>* current_layers) {
     fbl::Vector<uint64_t> new_layers;
 
@@ -220,9 +249,9 @@ bool apply_config() {
     return true;
 }
 
-zx_status_t wait_for_vsync(const fbl::Vector<VirtualLayer*>& layers) {
+zx_status_t wait_for_vsync(const fbl::Vector<fbl::unique_ptr<VirtualLayer>>& layers) {
     zx_time_t deadline = has_ownership
-            ? zx_clock_get(ZX_CLOCK_MONOTONIC) + ZX_MSEC(100) : ZX_TIME_INFINITE;
+            ? zx_clock_get_monotonic() + ZX_MSEC(100) : ZX_TIME_INFINITE;
     if (!wait_for_driver_event(deadline)) {
         return ZX_ERR_STOP;
     }
@@ -286,8 +315,15 @@ int main(int argc, const char* argv[]) {
 
     fbl::Vector<Display> displays;
     fbl::Vector<fbl::Vector<uint64_t>> display_layers;
-    fbl::Vector<VirtualLayer*> layers;
+    fbl::Vector<fbl::unique_ptr<VirtualLayer>> layers;
     int32_t num_frames = 120; // default to 120 frames
+    enum Platform {
+        SIMPLE,
+        INTEL,
+        ARM_MEDIATEK,
+        ARM_AMLOGIC,
+    };
+    Platform platform = INTEL; // default to Intel
 
     if (!bind_display(&displays)) {
         return -1;
@@ -341,56 +377,155 @@ int main(int argc, const char* argv[]) {
             num_frames = atoi(argv[1]);
             argv += 2;
             argc -= 2;
+        } else if (strcmp(argv[0], "--mediatek") == 0) {
+            platform = ARM_MEDIATEK;
+            argv += 1;
+            argc -= 1;
+        } else if (strcmp(argv[0], "--amlogic") == 0) {
+            platform = ARM_AMLOGIC;
+            argv += 1;
+            argc -= 1;
+        } else if (strcmp(argv[0], "--simple") == 0) {
+            platform = SIMPLE;
+            argv += 1;
+            argc -= 1;
         } else {
             printf("Unrecognized argument \"%s\"\n", argv[0]);
             return -1;
         }
     }
 
-    // Color layer which covers all displays
-    ColorLayer layer0(displays);
-    layers.push_back(&layer0);
+    fbl::AllocChecker ac;
+    if (platform == INTEL) {
+        // Intel only supports 90/270 rotation for Y-tiled images, so enable it for testing.
+        constexpr bool kIntelYTiling = true;
 
-    // Layer which covers all displays and uses page flipping.
-    PrimaryLayer layer1(displays);
-    layer1.SetLayerFlipping(true);
-    layer1.SetAlpha(true, .75);
-    layers.push_back(&layer1);
+        // Color layer which covers all displays
+        fbl::unique_ptr<ColorLayer> layer0 = fbl::make_unique_checked<ColorLayer>(&ac, displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layers.push_back(std::move(layer0));
 
-    // Layer which covers the left half of the of the first display
-    // and toggles on and off every frame.
-    PrimaryLayer layer2(&displays[0]);
-    layer2.SetImageDimens(displays[0].mode().horizontal_resolution / 2,
-                          displays[0].mode().vertical_resolution);
-    layer2.SetLayerToggle(true);
-    layer2.SetScaling(true);
-    layers.push_back(&layer2);
+        // Layer which covers all displays and uses page flipping.
+        fbl::unique_ptr<PrimaryLayer> layer1 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer1->SetLayerFlipping(true);
+        layer1->SetAlpha(true, .75);
+        layer1->SetIntelYTiling(kIntelYTiling);
+        layers.push_back(std::move(layer1));
 
-// Intel only supports 3 layers, so add ifdef for quick toggling of the 3rd layer
+        // Layer which covers the left half of the of the first display
+        // and toggles on and off every frame.
+        fbl::unique_ptr<PrimaryLayer> layer2 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      &displays[0]);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer2->SetImageDimens(displays[0].mode().horizontal_resolution / 2,
+                              displays[0].mode().vertical_resolution);
+        layer2->SetLayerToggle(true);
+        layer2->SetScaling(true);
+        layer2->SetIntelYTiling(kIntelYTiling);
+        layers.push_back(std::move(layer2));
+
+    // Intel only supports 3 layers, so add ifdef for quick toggling of the 3rd layer
 #if 1
-    // Layer which is smaller than the display and bigger than its image
-    // and which animates back and forth across all displays and also
-    // its src image and also rotates.
-    PrimaryLayer layer3(displays);
-    // Width is the larger of disp_width/2, display_height/2, but we also need
-    // to make sure that it's less than the smaller display dimension.
-    uint32_t width = fbl::min(fbl::max(displays[0].mode().vertical_resolution / 2,
-                                       displays[0].mode().horizontal_resolution / 2),
-                              fbl::min(displays[0].mode().vertical_resolution,
-                                       displays[0].mode().horizontal_resolution));
-    uint32_t height = fbl::min(displays[0].mode().vertical_resolution / 2,
-                               displays[0].mode().horizontal_resolution / 2);
-    layer3.SetImageDimens(width * 2, height);
-    layer3.SetDestFrame(width, height);
-    layer3.SetSrcFrame(width, height);
-    layer3.SetPanDest(true);
-    layer3.SetPanSrc(true);
-    layer3.SetRotates(true);
-    layers.push_back(&layer3);
+        // Layer which is smaller than the display and bigger than its image
+        // and which animates back and forth across all displays and also
+        // its src image and also rotates.
+        fbl::unique_ptr<PrimaryLayer> layer3 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        // Width is the larger of disp_width/2, display_height/2, but we also need
+        // to make sure that it's less than the smaller display dimension.
+        uint32_t width = fbl::min(fbl::max(displays[0].mode().vertical_resolution / 2,
+                                           displays[0].mode().horizontal_resolution / 2),
+                                  fbl::min(displays[0].mode().vertical_resolution,
+                                           displays[0].mode().horizontal_resolution));
+        uint32_t height = fbl::min(displays[0].mode().vertical_resolution / 2,
+                                   displays[0].mode().horizontal_resolution / 2);
+        layer3->SetImageDimens(width * 2, height);
+        layer3->SetDestFrame(width, height);
+        layer3->SetSrcFrame(width, height);
+        layer3->SetPanDest(true);
+        layer3->SetPanSrc(true);
+        layer3->SetRotates(true);
+        layer3->SetIntelYTiling(kIntelYTiling);
+        layers.push_back(std::move(layer3));
 #else
-    CursorLayer layer4(displays);
-    layers.push_back(&layer4);
+        CursorLayer* layer4 = new CursorLayer(displays);
+        layers.push_back(std::move(layer4));
 #endif
+    } else if (platform == ARM_MEDIATEK) {
+        // Mediatek display test
+        uint32_t width = displays[0].mode().horizontal_resolution;
+        uint32_t height = displays[0].mode().vertical_resolution;
+        fbl::unique_ptr<PrimaryLayer> layer1 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer1->SetAlpha(true, (float)0.2);
+        layer1->SetImageDimens(width, height);
+        layer1->SetSrcFrame(width/2, height/2);
+        layer1->SetDestFrame(width/2, height/2);
+        layer1->SetPanSrc(true);
+        layer1->SetPanDest(true);
+        layers.push_back(std::move(layer1));
+
+        // Layer which covers the left half of the of the first display
+        // and toggles on and off every frame.
+        float alpha2 = (float)0.5;
+        fbl::unique_ptr<PrimaryLayer> layer2 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer2->SetLayerFlipping(true);
+        layer2->SetAlpha(true, alpha2);
+        layers.push_back(std::move(layer2));
+
+        float alpha3 = (float)0.2;
+        fbl::unique_ptr<PrimaryLayer> layer3 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer3->SetAlpha(true, alpha3);
+        layers.push_back(std::move(layer3));
+
+        fbl::unique_ptr<PrimaryLayer> layer4 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        layer4->SetAlpha(true, (float)0.3);
+        layers.push_back(std::move(layer4));
+    } else if (platform == ARM_AMLOGIC) {
+        // Amlogic display test
+        fbl::unique_ptr<PrimaryLayer> layer1 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+
+        layers.push_back(std::move(layer1));
+    } else if (platform == SIMPLE) {
+        // Simple display test
+        fbl::unique_ptr<PrimaryLayer> layer1 = fbl::make_unique_checked<PrimaryLayer>(&ac,
+                                                                                      displays);
+        if (!ac.check()) {
+            return ZX_ERR_NO_MEMORY;
+        }
+
+        layers.push_back(std::move(layer1));
+    }
 
     printf("Initializing layers\n");
     for (auto& layer : layers) {
@@ -443,6 +578,9 @@ int main(int argc, const char* argv[]) {
 
     printf("Done rendering\n");
     zx_nanosleep(zx_deadline_after(ZX_MSEC(500)));
+
+    zx_handle_close(dc_handle);
+    zx_handle_close(device_handle);
 
     return 0;
 }

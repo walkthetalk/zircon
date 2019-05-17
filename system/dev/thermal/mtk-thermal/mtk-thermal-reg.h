@@ -5,6 +5,7 @@
 #pragma once
 
 #include <hwreg/bitfields.h>
+#include <lib/mmio/mmio.h>
 
 namespace thermal {
 
@@ -58,13 +59,6 @@ public:
 
     DEF_FIELD(18, 16, status);
     DEF_FIELD(15, 0, data);
-};
-
-class PmicValidClear : public hwreg::RegisterBase<PmicValidClear, uint32_t> {
-public:
-    static auto Get() { return hwreg::RegisterAddr<PmicValidClear>(0xa8); }
-
-    DEF_BIT(0, valid_clear);
 };
 
 class TempMonCtl0 : public hwreg::RegisterBase<TempMonCtl0, uint32_t> {
@@ -405,6 +399,19 @@ public:
 
 private:
     static constexpr uint32_t kVtsOffset = 3350;
+};
+
+// The following classes represent registers in the (undocumented) INFRACFG block.
+class InfraCfgClkMux : public hwreg::RegisterBase<InfraCfgClkMux, uint32_t> {
+public:
+    static constexpr uint32_t kIfrClk26M         = 0;
+    static constexpr uint32_t kIfrClkArmPll      = 1;
+    static constexpr uint32_t kIfrClkUnivPll     = 2;
+    static constexpr uint32_t kIfrClkMainPllDiv2 = 3;
+
+    static auto Get() { return hwreg::RegisterAddr<InfraCfgClkMux>(0x00); }
+
+    DEF_FIELD(3, 2, ifr_mux_sel);
 };
 
 // The following classes represent registers on the MT6392 PMIC.

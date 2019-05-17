@@ -16,7 +16,9 @@
 
 #include <fbl/unique_ptr.h>
 #include <fs/trace.h>
+#include <fuchsia/hardware/block/c/fidl.h>
 #include <lib/async-loop/cpp/loop.h>
+#include <lib/fdio/fd.h>
 #include <minfs/fsck.h>
 #include <minfs/minfs.h>
 #include <trace-provider/provider.h>
@@ -33,8 +35,8 @@ int Fsck(fbl::unique_ptr<minfs::Bcache> bc, const minfs::MountOptions& options) 
 }
 
 int Mount(fbl::unique_ptr<minfs::Bcache> bc, const minfs::MountOptions& options) {
-    zx_handle_t h = zx_take_startup_handle(PA_HND(PA_USER0, 0));
-    if (h == ZX_HANDLE_INVALID) {
+    zx::channel root(zx_take_startup_handle(FS_HANDLE_ROOT_ID));
+    if (!root) {
         FS_TRACE_ERROR("minfs: Could not access startup handle to mount point\n");
         return ZX_ERR_BAD_STATE;
     }
@@ -42,9 +44,12 @@ int Mount(fbl::unique_ptr<minfs::Bcache> bc, const minfs::MountOptions& options)
     async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
     trace::TraceProvider trace_provider(loop.dispatcher());
 
-    auto loop_quit = [&loop]() { loop.Quit(); };
+    auto loop_quit = [&loop]() {
+        loop.Quit();
+        FS_TRACE_WARN("minfs: Unmounted\n");
+    };
     zx_status_t status;
-    if ((status = MountAndServe(&options, loop.dispatcher(), std::move(bc), zx::channel(h),
+    if ((status = MountAndServe(options, loop.dispatcher(), std::move(bc), std::move(root),
                                 std::move(loop_quit)) != ZX_OK)) {
         if (options.verbose) {
             fprintf(stderr, "minfs: Failed to mount: %d\n", status);
@@ -99,13 +104,22 @@ int usage() {
     return -1;
 }
 
-off_t get_size(int fd) {
-    block_info_t info;
-    if (ioctl_block_get_info(fd, &info) != sizeof(info)) {
-        fprintf(stderr, "error: minfs could not find size of device\n");
-        return 0;
+zx_status_t GetInfo(const fbl::unique_fd& fd, off_t* out_size, bool* out_readonly) {
+    fuchsia_hardware_block_BlockInfo info;
+    const fzl::UnownedFdioCaller connection(fd.get());
+    zx_status_t status;
+    zx_status_t io_status =
+            fuchsia_hardware_block_BlockGetInfo(connection.borrow_channel(), &status, &info);
+    if (io_status != ZX_OK) {
+        status = io_status;
     }
-    return info.block_size * info.block_count;
+    if (status != ZX_OK) {
+        fprintf(stderr, "error: minfs could not find size of device\n");
+        return status;
+    }
+    *out_size = info.block_size * info.block_count;
+    *out_readonly = info.flags & fuchsia_hardware_block_FLAG_READONLY;
+    return ZX_OK;
 }
 
 } // namespace
@@ -139,7 +153,7 @@ int main(int argc, char** argv) {
             options.metrics = true;
             break;
         case 'j':
-            //TODO(planders): Enable journaling here once minfs supports it.
+            // TODO(planders): Enable journaling here once minfs supports it.
             fprintf(stderr, "minfs: Journaling option not supported\n");
             return usage();
         case 'v':
@@ -157,34 +171,38 @@ int main(int argc, char** argv) {
     argc -= optind;
     argv += optind;
 
-    // Block device passed by handle
     if (argc != 1) {
         return usage();
     }
     char* cmd = argv[0];
 
-    fbl::unique_fd fd;
-    fd.reset(FS_FD_BLOCKDEVICE);
-    if (!options.readonly) {
-        block_info_t block_info;
-        zx_status_t status = static_cast<zx_status_t>(ioctl_block_get_info(fd.get(), &block_info));
-        if (status < ZX_OK) {
-            fprintf(stderr, "minfs: Unable to query block device, fd: %d status: 0x%x\n", fd.get(),
-                    status);
-            return -1;
-        }
-        options.readonly = block_info.flags & BLOCK_FLAG_READONLY;
+    // Block device passed by handle
+    zx::channel device = zx::channel(zx_take_startup_handle(FS_HANDLE_BLOCK_DEVICE_ID));
+    int device_fd = -1;
+    zx_status_t status = fdio_fd_create(device.release(), &device_fd);
+    if (status != ZX_OK) {
+        fprintf(stderr, "blobfs: Could not access block device\n");
+        return -1;
+    }
+    fbl::unique_fd fd(device_fd);
+
+    off_t device_size = 0;
+    bool block_readonly = false;
+    status = GetInfo(fd, &device_size, &block_readonly);
+    if (status != ZX_OK) {
+        return status;
     }
 
-    off_t size = get_size(fd.get());
-    if (size == 0) {
+    options.readonly = options.readonly || block_readonly;
+
+    if (device_size == 0) {
         fprintf(stderr, "minfs: failed to access block device\n");
         return usage();
     }
-    size /= minfs::kMinfsBlockSize;
+    size_t block_count = device_size / minfs::kMinfsBlockSize;
 
     fbl::unique_ptr<minfs::Bcache> bc;
-    if (minfs::Bcache::Create(&bc, std::move(fd), (uint32_t)size) < 0) {
+    if (minfs::Bcache::Create(&bc, std::move(fd), static_cast<uint32_t>(block_count)) < 0) {
         fprintf(stderr, "minfs: error: cannot create block cache\n");
         return -1;
     }

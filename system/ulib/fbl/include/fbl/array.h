@@ -2,10 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_ARRAY_H_
+#define FBL_ARRAY_H_
 
 #include <zircon/assert.h>
 #include <fbl/macros.h>
+#include <type_traits>
 
 namespace fbl {
 
@@ -23,6 +25,15 @@ public:
         ptr_ = other.release();
     }
 
+    // Move constructor allowing us to move from Array<T> to Array<const T>
+    template <typename OtherType>
+    Array(Array<OtherType>&& other)
+            : ptr_(nullptr), count_(other.size()) {
+        static_assert(!std::is_const<OtherType>::value && std::is_same<const OtherType, T>::value);
+
+        ptr_ = other.release();
+    }
+
     size_t size() const {
         return count_;
     }
@@ -33,6 +44,16 @@ public:
 
     Array& operator=(Array&& o) {
         auto count = o.count_;
+        reset(o.release(), count);
+        return *this;
+    }
+
+    // Move operator allowing us to move from Array<T> to Array<const T>
+    template <typename OtherType>
+    Array& operator=(Array<OtherType>&& o) {
+        static_assert(!std::is_const<OtherType>::value && std::is_same<const OtherType, T>::value);
+
+        auto count = o.size();
         reset(o.release(), count);
         return *this;
     }
@@ -94,3 +115,5 @@ private:
 };
 
 }  // namespace fbl
+
+#endif  // FBL_ARRAY_H_

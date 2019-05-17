@@ -41,7 +41,7 @@ zx_status_t ProtocolDevice::Create(const pbus_dev_t* pdev, zx_device_t* parent, 
 
 ProtocolDevice::ProtocolDevice(zx_device_t* parent, PlatformBus* bus, const pbus_dev_t* pdev)
     : ProtocolDeviceType(parent), bus_(bus), vid_(pdev->vid), pid_(pdev->pid),
-      did_(pdev->did), resources_(ROOT_DEVICE_ID) {
+      did_(pdev->did), resources_() {
     strlcpy(name_, pdev->name, sizeof(name_));
 }
 
@@ -158,7 +158,6 @@ zx_status_t ProtocolDevice::PDevGetDeviceInfo(pdev_device_info_t* out_info) {
         .mmio_count = static_cast<uint32_t>(resources_.mmio_count()),
         .irq_count = static_cast<uint32_t>(resources_.irq_count()),
         .gpio_count = static_cast<uint32_t>(resources_.gpio_count()),
-        .i2c_channel_count = static_cast<uint32_t>(resources_.i2c_channel_count()),
         .clk_count = static_cast<uint32_t>(resources_.clk_count()),
         .bti_count = static_cast<uint32_t>(resources_.bti_count()),
         .smc_count = static_cast<uint32_t>(resources_.smc_count()),
@@ -257,11 +256,10 @@ zx_status_t ProtocolDevice::Start() {
 
         for (size_t i = 0; i < boot_metadata_count; i++) {
             const auto& metadata = resources_.boot_metadata(i);
-            const void* data;
-            uint32_t length;
-            status = bus_->GetZbiMetadata(metadata.zbi_type, metadata.zbi_extra, &data, &length);
+            fbl::Array<uint8_t> data;
+            status = bus_->GetBootItem(metadata.zbi_type, metadata.zbi_extra, &data);
             if (status == ZX_OK) {
-                status = DdkAddMetadata(metadata.zbi_type, data, length);
+                status = DdkAddMetadata(metadata.zbi_type, data.get(), data.size());
             }
             if (status != ZX_OK) {
                 DdkRemove();

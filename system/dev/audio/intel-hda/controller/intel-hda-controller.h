@@ -7,11 +7,11 @@
 #include <atomic>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/intelhda/dsp.h>
 #include <ddk/protocol/pci.h>
 #include <fbl/intrusive_single_list.h>
 #include <fbl/recycler.h>
 #include <fbl/unique_ptr.h>
+#include <fuchsia/hardware/intel/hda/c/fidl.h>
 #include <lib/fzl/pinned-vmo.h>
 #include <lib/fzl/vmo-mapper.h>
 #include <lib/zx/interrupt.h>
@@ -23,14 +23,14 @@
 #include <dispatcher-pool/dispatcher-interrupt.h>
 #include <dispatcher-pool/dispatcher-wakeup-event.h>
 #include <intel-hda/utils/codec-commands.h>
-#include <intel-hda/utils/intel-hda-registers.h>
 #include <intel-hda/utils/intel-hda-proto.h>
+#include <intel-hda/utils/intel-hda-registers.h>
 #include <intel-hda/utils/utils.h>
 
 #include "codec-cmd-job.h"
 #include "debug-logging.h"
+#include "intel-dsp.h"
 #include "intel-hda-codec.h"
-#include "intel-hda-dsp.h"
 #include "utils.h"
 
 namespace audio {
@@ -44,12 +44,17 @@ public:
     zx_status_t Init(zx_device_t* pci_dev);
 
     // one-liner accessors.
-    const char*                  dev_name() const     { return device_get_name(dev_node_); }
-    zx_device_t*                 dev_node()           { return dev_node_; }
-    const zx_pcie_device_info_t& dev_info() const     { return pci_dev_info_; }
-    unsigned int                 id() const           { return id_; }
-    const char*                  log_prefix() const   { return log_prefix_; }
-    const pci_protocol_t*        pci() const          { return &pci_; }
+    const char*                       dev_name() const   { return device_get_name(dev_node_); }
+    zx_device_t*                      dev_node()         { return dev_node_; }
+    const zx_pcie_device_info_t&      dev_info() const   { return pci_dev_info_; }
+    unsigned int                      id() const         { return id_; }
+    const char*                       log_prefix() const { return log_prefix_; }
+    const pci_protocol_t*             pci() const        { return &pci_; }
+    const fbl::RefPtr<RefCountedBti>& pci_bti() const    { return pci_bti_; }
+
+    const fbl::RefPtr<dispatcher::ExecutionDomain>& default_domain() const {
+        return default_domain_;
+    }
 
     // CORB/RIRB
     zx_status_t QueueCodecCmd(fbl::unique_ptr<CodecCmdJob>&& job) TA_EXCL(corb_lock_);
@@ -85,9 +90,10 @@ private:
     void    ReleaseStreamTagLocked (bool input, uint8_t tag_num)     TA_REQ (stream_pool_lock_);
 
     // Device interface implementation
+    zx_status_t DeviceGetProtocol(uint32_t proto_id, void* protocol);
     void        DeviceShutdown();
     void        DeviceRelease();
-    zx_status_t DeviceIoctl(uint32_t op, void* out_buf, size_t out_len, size_t* out_actual);
+    zx_status_t GetChannel(fidl_txn_t* txn);
 
     // Root device interface implementation
     void RootDeviceRelease();
@@ -107,7 +113,7 @@ private:
     zx_status_t SetupStreamDescriptors() TA_EXCL(stream_pool_lock_);
     zx_status_t SetupCommandBufferSize(uint8_t* size_reg, unsigned int* entry_count);
     zx_status_t SetupCommandBuffer() TA_EXCL(corb_lock_, rirb_lock_);
-    void        ProbeAudioDSP();
+    void        ProbeAudioDSP(zx_device_t* dsp_dev);
 
     zx_status_t ResetCORBRdPtrLocked() TA_REQ(corb_lock_);
 
@@ -198,10 +204,12 @@ private:
     fbl::Mutex codec_lock_;
     fbl::RefPtr<IntelHDACodec> codecs_[HDA_MAX_CODECS];
 
-    fbl::RefPtr<IntelHDADSP> dsp_;
+    fbl::RefPtr<IntelDsp> dsp_;
 
     static std::atomic_uint32_t device_id_gen_;
-    static zx_protocol_device_t  CONTROLLER_DEVICE_THUNKS;
+    static fuchsia_hardware_intel_hda_ControllerDevice_ops_t CONTROLLER_FIDL_THUNKS;
+    static zx_protocol_device_t CONTROLLER_DEVICE_THUNKS;
+    static ihda_codec_protocol_ops_t CODEC_PROTO_THUNKS;
 };
 
 }  // namespace intel_hda

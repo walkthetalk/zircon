@@ -27,13 +27,7 @@ constexpr uint8_t kRegDigitalClipper1     = 0x11;
 // clang-format on
 
 // static
-fbl::unique_ptr<Tas5760> Tas5760::Create(ddk::PDev pdev, uint32_t index) {
-    auto i2c = pdev.GetI2c(index);
-    if (!i2c.is_valid()) {
-        zxlogf(ERROR, "%s pdev_get_protocol failed\n", __func__);
-        return nullptr;
-    }
-
+fbl::unique_ptr<Tas5760> Tas5760::Create(ddk::I2cChannel i2c) {
     fbl::AllocChecker ac;
     auto ptr = fbl::make_unique_checked<Tas5760>(&ac, i2c);
     if (!ac.check()) {
@@ -62,11 +56,14 @@ zx_status_t Tas5760::SetGain(float gain) {
     return status;
 }
 
-bool Tas5760::ValidGain(float gain) {
+bool Tas5760::ValidGain(float gain) const {
     return (gain <= kMaxGain) && (gain >= kMinGain);
 }
 
-zx_status_t Tas5760::Init() {
+zx_status_t Tas5760::Init(std::optional<uint8_t> slot) {
+    if (slot.has_value()) {
+        return ZX_ERR_NOT_SUPPORTED; // Always use L+R (slots 0 and 1).
+    }
     Standby();
     WriteReg(kRegDigitalControl, 0x05);   // no HPF, no boost, Single Speed, Stereo Left Justified.
     WriteReg(kRegVolumeControlCnf, 0x80); // Fade enabled.

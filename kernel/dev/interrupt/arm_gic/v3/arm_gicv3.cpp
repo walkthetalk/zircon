@@ -325,7 +325,7 @@ static unsigned int gic_remap_interrupt(unsigned int vector) {
 }
 
 // called from assembly
-static void gic_handle_irq(iframe* frame) {
+static void gic_handle_irq(iframe_short_t* frame) {
     // get the current vector
     uint32_t iar = gic_read_iar();
     unsigned vector = iar & 0x3ff;
@@ -366,7 +366,7 @@ static void gic_handle_irq(iframe* frame) {
     ktrace_tiny(TAG_IRQ_EXIT, (vector << 8) | cpu);
 }
 
-static void gic_handle_fiq(iframe* frame) {
+static void gic_handle_fiq(iframe_short_t* frame) {
     PANIC_UNIMPLEMENTED;
 }
 
@@ -569,4 +569,4 @@ static void arm_gic_v3_init(const void* driver_data, uint32_t length) {
     LTRACE_EXIT;
 }
 
-LK_PDEV_INIT(arm_gic_v3_init, KDRV_ARM_GIC_V3, arm_gic_v3_init, LK_INIT_LEVEL_PLATFORM_EARLY);
+LK_PDEV_INIT(arm_gic_v3_init, KDRV_ARM_GIC_V3, arm_gic_v3_init, LK_INIT_LEVEL_PLATFORM_EARLY)

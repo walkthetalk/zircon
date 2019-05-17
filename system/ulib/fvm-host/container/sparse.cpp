@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <inttypes.h>
+#include <safemath/checked_math.h>
 #include <utility>
 
 #include "fvm-host/container.h"
@@ -202,13 +203,79 @@ zx_status_t SparseContainer::Verify() const {
         }
     }
 
-    if (end != disk_size_) {
+    if (end < 0 || static_cast<size_t>(end) != disk_size_) {
         fprintf(stderr, "Header + extent sizes (%" PRIu64 ") do not match sparse file size "
                 "(%zu)\n", end, disk_size_);
         return ZX_ERR_IO_DATA_INTEGRITY;
     }
 
     return ZX_OK;
+}
+
+// TODO(auradkar): Iteration over partition is copy pasted several times in this file.
+//                 Iteration can be made more common code.
+zx_status_t SparseContainer::PartitionsIterator(UsedSize_f* used_size_f, uint64_t* out_size) const {
+    uint64_t total_size = 0;
+    uint64_t size = 0;
+
+    CheckValid();
+
+    if (image_.flags & fvm::kSparseFlagLz4) {
+        // Decompression must occur before verification, since all contents must be available
+        // reading superblock.
+        fprintf(stderr, "SparseContainer: Found compressed container; contents cannot be"
+                        " read\n");
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    if (image_.magic != fvm::kSparseFormatMagic) {
+        fprintf(stderr, "SparseContainer: Bad magic\n");
+        return ZX_ERR_IO;
+    }
+
+    xprintf("Slice size is %" PRIu64 "\n", image_.slice_size);
+    xprintf("Found %" PRIu64 " partitions\n", image_.partition_count);
+
+    off_t start = 0;
+    off_t end = image_.header_length;
+    for (unsigned i = 0; i < image_.partition_count; i++) {
+        fbl::Vector<size_t> extent_lengths;
+        start = end;
+        xprintf("Found partition %u with %u extents\n", i, partitions_[i].descriptor.extent_count);
+
+        for (unsigned j = 0; j < partitions_[i].descriptor.extent_count; j++) {
+            extent_lengths.push_back(partitions_[i].extents[j].extent_length);
+            end += partitions_[i].extents[j].extent_length;
+        }
+
+        zx_status_t status;
+        disk_format_t part;
+        if ((status = Format::Detect(fd_.get(), start, &part)) != ZX_OK) {
+            return status;
+        }
+
+        if ((status = used_size_f(fd_, start, end, extent_lengths, part, &size)) != ZX_OK) {
+            const char* name = reinterpret_cast<const char*>(partitions_[i].descriptor.name);
+            fprintf(stderr, "%s used_size returned an error.\n", name);
+            return status;
+        }
+        total_size += size;
+    }
+
+    *out_size = total_size;
+    return ZX_OK;
+}
+
+zx_status_t SparseContainer::UsedDataSize(uint64_t* out_size) const {
+    return PartitionsIterator(Format::UsedDataSize, out_size);
+}
+
+zx_status_t SparseContainer::UsedInodes(uint64_t* out_inodes) const {
+    return PartitionsIterator(Format::UsedInodes, out_inodes);
+}
+
+zx_status_t SparseContainer::UsedSize(uint64_t* out_size) const {
+    return PartitionsIterator(Format::UsedSize, out_size);
 }
 
 zx_status_t SparseContainer::CheckDiskSize(uint64_t target_disk_size) const {
@@ -335,30 +402,36 @@ zx_status_t SparseContainer::Commit() {
     return ZX_OK;
 }
 
-zx_status_t SparseContainer::Pave(const char* path, size_t disk_offset, size_t disk_size) {
+zx_status_t SparseContainer::Pave(
+    fbl::unique_ptr<fvm::host::FileWrapper> wrapper, size_t disk_offset, size_t disk_size) {
     if (disk_size == 0) {
-        // If target disk does not already exist, create it.
         if (disk_offset > 0) {
             fprintf(stderr, "Cannot specify offset without length\n");
             return ZX_ERR_INVALID_ARGS;
         }
 
-        fbl::unique_fd fd(open(path, O_CREAT | O_EXCL | O_WRONLY, 0644));
-
-        if (!fd) {
-            return ZX_ERR_IO;
-        }
-
         disk_size = CalculateDiskSize();
 
-        if (ftruncate(fd.get(), disk_size) < 0) {
-            return ZX_ERR_IO;
+        // Truncate file to size we expect. Some files wrapped by FileWrapper may not support
+        // truncate, e.g. block devices.
+        zx_status_t status = wrapper->Truncate(disk_size);
+        if (status != ZX_OK && status != ZX_ERR_NOT_SUPPORTED) {
+            return status;
+        }
+
+        if (wrapper->Size() < static_cast<ssize_t>(disk_size)) {
+            fprintf(stderr, "FileWrapper reported size as %ld bytes. Expected at least %lu bytes",
+                    wrapper->Size(), disk_size);
+            return ZX_ERR_BUFFER_TOO_SMALL;
         }
     }
 
     fbl::unique_ptr<SparsePaver> paver;
-    zx_status_t status = SparsePaver::Create(path, slice_size_, disk_offset, disk_size, &paver);
+    zx_status_t status = SparsePaver::Create(std::move(wrapper), slice_size_,
+                                             disk_offset, disk_size, &paver);
+
     if (status != ZX_OK) {
+        fprintf(stderr, "Failed to create SparsePaver\n");
         return status;
     }
 
@@ -398,7 +471,8 @@ size_t SparseContainer::SliceCount() const {
     return slices;
 }
 
-zx_status_t SparseContainer::AddPartition(const char* path, const char* type_name) {
+zx_status_t SparseContainer::AddPartition(const char* path, const char* type_name,
+                                          FvmReservation* reserve) {
     fbl::unique_ptr<Format> format;
     zx_status_t status;
 
@@ -407,8 +481,7 @@ zx_status_t SparseContainer::AddPartition(const char* path, const char* type_nam
         return status;
     }
 
-    if ((status = AllocatePartition(std::move(format))) != ZX_OK) {
-        fprintf(stderr, "Sparse partition allocation failed\n");
+    if ((status = AllocatePartition(std::move(format), reserve)) != ZX_OK) {
         return status;
     }
 
@@ -432,16 +505,17 @@ zx_status_t SparseContainer::Decompress(const char* path) {
     return reader_->WriteDecompressed(std::move(fd));
 }
 
-zx_status_t SparseContainer::AllocatePartition(fbl::unique_ptr<Format> format) {
+zx_status_t SparseContainer::AllocatePartition(fbl::unique_ptr<Format> format,
+                                               FvmReservation* reserve) {
     SparsePartitionInfo partition;
     format->GetPartitionInfo(&partition.descriptor);
     partition.descriptor.magic = fvm::kPartitionDescriptorMagic;
     partition.descriptor.extent_count = 0;
     image_.header_length += sizeof(fvm::partition_descriptor_t);
-    uint32_t part_index = image_.partition_count;
+    uint32_t part_index = safemath::checked_cast<uint32_t>(image_.partition_count);
 
     zx_status_t status;
-    if ((status = format->MakeFvmReady(SliceSize(), part_index)) != ZX_OK) {
+    if ((status = format->MakeFvmReady(SliceSize(), part_index, reserve)) != ZX_OK) {
         return status;
     }
 
@@ -509,7 +583,10 @@ zx_status_t SparseContainer::PrepareWrite(size_t max_len) {
 zx_status_t SparseContainer::WriteData(const void* data, size_t length) {
     if ((flags_ & fvm::kSparseFlagLz4) != 0) {
         return compression_.Compress(data, length);
-    } else if (write(fd_.get(), data, length) != length) {
+    }
+
+    ssize_t result = write(fd_.get(), data, length);
+    if (result < 0 || static_cast<size_t>(result) != length) {
         return ZX_ERR_IO;
     }
 
@@ -527,8 +604,8 @@ zx_status_t SparseContainer::CompleteWrite() {
         return status;
     }
 
-    if (write(fd_.get(), compression_.GetData(), compression_.GetLength())
-        != compression_.GetLength()) {
+    ssize_t result = write(fd_.get(), compression_.GetData(), compression_.GetLength());
+    if (result < 0 || static_cast<size_t>(result) != compression_.GetLength()) {
         return ZX_ERR_IO;
     }
 

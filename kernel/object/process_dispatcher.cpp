@@ -20,6 +20,7 @@
 #include <vm/vm_aspace.h>
 #include <vm/vm_object.h>
 
+#include <lib/counters.h>
 #include <lib/crypto/global_prng.h>
 #include <lib/ktrace.h>
 
@@ -38,56 +39,79 @@
 
 #define LOCAL_TRACE 0
 
-static zx_handle_t map_handle_to_value(const Handle* handle, uint32_t mixer) {
-    // Ensure that the last bit of the result is not zero, and make sure
-    // we don't lose any base_value bits or make the result negative
-    // when shifting.
-    DEBUG_ASSERT((mixer & ((1<<31) | 0x1)) == 0);
-    DEBUG_ASSERT((handle->base_value() & 0xc0000000) == 0);
+KCOUNTER(dispatcher_process_create_count, "dispatcher.process.create")
+KCOUNTER(dispatcher_process_destroy_count, "dispatcher.process.destroy")
 
-    auto handle_id = (handle->base_value() << 1) | 0x1;
+// TODO(johngro): move this into handle.h one we have updated externals to no
+// longer depend on the MSB of the handle being 0.  See WEB-33
+constexpr uint32_t kHandleReservedBits = 2;
+constexpr uint32_t kHandleMustBeOneMask = ((0x1u << kHandleReservedBits) - 1);
+static_assert(kHandleMustBeOneMask == ZX_HANDLE_FIXED_BITS_MASK,
+              "kHandleMustBeOneMask must match ZX_HANDLE_FIXED_BITS_MASK!");
+
+static zx_handle_t map_handle_to_value(const Handle* handle, uint32_t mixer) {
+    // Ensure that the last two bits of the result is not zero, and make sure we
+    // don't lose any base_value bits when shifting.
+    constexpr uint32_t kBaseValueMustBeZeroMask =
+        (kHandleMustBeOneMask << ((sizeof(handle->base_value()) * 8) - kHandleReservedBits));
+
+    DEBUG_ASSERT((mixer & kHandleMustBeOneMask) == 0);
+    DEBUG_ASSERT((handle->base_value() & kBaseValueMustBeZeroMask) == 0);
+
+    auto handle_id = (handle->base_value() << kHandleReservedBits) | kHandleMustBeOneMask;
+
+    // TODO(johngro): remove this when we can, See WEB-33
+#if 0
     return static_cast<zx_handle_t>(mixer ^ handle_id);
+#else
+    zx_handle_t ret = static_cast<zx_handle_t>(mixer ^ handle_id);
+    DEBUG_ASSERT((ret & 0x80000000) == 0);
+    return ret;
+#endif
 }
 
 static Handle* map_value_to_handle(zx_handle_t value, uint32_t mixer) {
-    auto handle_id = (static_cast<uint32_t>(value) ^ mixer) >> 1;
+    // Validate that the "must be one" bits are actually one.
+    if ((value & kHandleMustBeOneMask) != kHandleMustBeOneMask) {
+        return nullptr;
+    }
+
+    uint32_t handle_id = (static_cast<uint32_t>(value) ^ mixer) >> kHandleReservedBits;
     return Handle::FromU32(handle_id);
 }
 
 zx_status_t ProcessDispatcher::Create(
     fbl::RefPtr<JobDispatcher> job, fbl::StringPiece name, uint32_t flags,
-    fbl::RefPtr<Dispatcher>* dispatcher, zx_rights_t* rights,
-    fbl::RefPtr<VmAddressRegionDispatcher>* root_vmar_disp,
+    KernelHandle<ProcessDispatcher>* handle, zx_rights_t* rights,
+    KernelHandle<VmAddressRegionDispatcher>* root_vmar_handle,
     zx_rights_t* root_vmar_rights) {
     fbl::AllocChecker ac;
-    fbl::RefPtr<ProcessDispatcher> process =
-        fbl::AdoptRef(new (&ac) ProcessDispatcher(job, name, flags));
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) ProcessDispatcher(job, name, flags)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    if (!job->AddChildProcess(process))
-        return ZX_ERR_BAD_STATE;
-
-    zx_status_t result = process->Initialize();
+    zx_status_t result = new_handle.dispatcher()->Initialize();
     if (result != ZX_OK)
         return result;
 
-    fbl::RefPtr<VmAddressRegion> vmar(process->aspace()->RootVmar());
-
     // Create a dispatcher for the root VMAR.
-    fbl::RefPtr<Dispatcher> new_vmar_dispatcher;
-    result = VmAddressRegionDispatcher::Create(vmar, ARCH_MMU_FLAG_PERM_USER,
-                                               &new_vmar_dispatcher,
+    KernelHandle<VmAddressRegionDispatcher> new_vmar_handle;
+    result = VmAddressRegionDispatcher::Create(new_handle.dispatcher()->aspace()->RootVmar(),
+                                               ARCH_MMU_FLAG_PERM_USER,
+                                               &new_vmar_handle,
                                                root_vmar_rights);
-    if (result != ZX_OK) {
-        process->aspace_->Destroy();
+    if (result != ZX_OK)
         return result;
+
+    // Only now that the process has been fully created and initialized can we register it with its
+    // parent job. We don't want anyone to see it in a partially initalized state.
+    if (!job->AddChildProcess(new_handle.dispatcher())) {
+        return ZX_ERR_BAD_STATE;
     }
 
     *rights = default_rights();
-    *dispatcher = ktl::move(process);
-    *root_vmar_disp = DownCastDispatcher<VmAddressRegionDispatcher>(
-            &new_vmar_dispatcher);
+    *handle = ktl::move(new_handle);
+    *root_vmar_handle = ktl::move(new_vmar_handle);
 
     return ZX_OK;
 }
@@ -95,17 +119,24 @@ zx_status_t ProcessDispatcher::Create(
 ProcessDispatcher::ProcessDispatcher(fbl::RefPtr<JobDispatcher> job,
                                      fbl::StringPiece name,
                                      uint32_t flags)
-  : job_(ktl::move(job)), policy_(job_->GetPolicy()),
-    name_(name.data(), name.length()) {
+    : job_(ktl::move(job)), policy_(job_->GetPolicy()), exceptionate_(ExceptionPort::Type::PROCESS),
+      debug_exceptionate_(ExceptionPort::Type::DEBUGGER), name_(name.data(), name.length()) {
     LTRACE_ENTRY_OBJ;
+
+    kcounter_add(dispatcher_process_create_count, 1);
 
     // Generate handle XOR mask with top bit and bottom two bits cleared
     uint32_t secret;
     auto prng = crypto::GlobalPRNG::GetInstance();
     prng->Draw(&secret, sizeof(secret));
 
-    // Handle values cannot be negative values, so we mask the high bit.
-    handle_rand_ = (secret << 2) & INT_MAX;
+    // Handle values must always have the low kHandleReservedBits set.  Do not
+    // ever attempt to toggle these bits using the handle_rand_ xor mask.
+    handle_rand_ = secret << kHandleReservedBits;
+
+    // TODO(johngro): remove this once we have updated externals to no longer
+    // depend on the MSB of the handle being 0.  See WEB-33
+    handle_rand_ &= ~0x80000000U;
 }
 
 ProcessDispatcher::~ProcessDispatcher() {
@@ -117,9 +148,12 @@ ProcessDispatcher::~ProcessDispatcher() {
     DEBUG_ASSERT(handles_.is_empty());
     DEBUG_ASSERT(exception_port_ == nullptr);
     DEBUG_ASSERT(debugger_exception_port_ == nullptr);
+    DEBUG_ASSERT(!aspace_ || aspace_->is_destroyed());
+
+    kcounter_add(dispatcher_process_destroy_count, 1);
 
     // Remove ourselves from the parent job's raw ref to us. Note that this might
-    // have beeen called when transitioning State::DEAD. The Job can handle double calls.
+    // have been called when transitioning State::DEAD. The Job can handle double calls.
     job_->RemoveChildProcess(this);
 
     LTRACE_EXIT_OBJ;
@@ -196,7 +230,7 @@ void ProcessDispatcher::Exit(int64_t retcode) {
     __UNREACHABLE;
 }
 
-void ProcessDispatcher::Kill() {
+void ProcessDispatcher::Kill(int64_t retcode) {
     LTRACE_ENTRY_OBJ;
 
     // ZX-880: Call RemoveChildProcess outside of |get_lock()|.
@@ -210,10 +244,8 @@ void ProcessDispatcher::Kill() {
             return;
 
         if (state_ != State::DYING) {
-            // If there isn't an Exit already in progress, set a nonzero exit
-            // status so e.g. crashing tests don't appear to have succeeded.
             DEBUG_ASSERT(retcode_ == 0);
-            retcode_ = -1;
+            retcode_ = retcode;
         }
 
         // if we have no threads, enter the dead state directly
@@ -389,12 +421,17 @@ void ProcessDispatcher::FinishDeadTransition() {
     DEBUG_ASSERT(!completely_dead_);
     completely_dead_ = true;
 
+    // It doesn't matter whether the lock is held or not while shutting down
+    // the exceptionates, this is just the most convenient place to do it.
+    exceptionate_.Shutdown();
+    debug_exceptionate_.Shutdown();
+
     // clean up the handle table
     LTRACEF_LEVEL(2, "cleaning up handle table on proc %p\n", this);
 
     fbl::DoublyLinkedList<Handle*> to_clean;
     {
-        Guard<fbl::Mutex> guard{&handle_table_lock_};
+        Guard<BrwLockPi, BrwLockPi::Writer> guard{&handle_table_lock_};
         for (auto& handle : handles_) {
             handle.set_process_id(ZX_KOID_INVALID);
         }
@@ -412,8 +449,9 @@ void ProcessDispatcher::FinishDeadTransition() {
 
     LTRACEF_LEVEL(2, "done cleaning up handle table on proc %p\n", this);
 
-    // tear down the address space
-    aspace_->Destroy();
+    // Tear down the address space. It may not exist if Initialize() failed.
+    if (aspace_)
+        aspace_->Destroy();
 
     // signal waiter
     LTRACEF_LEVEL(2, "signaling waiters\n");
@@ -430,9 +468,6 @@ void ProcessDispatcher::FinishDeadTransition() {
     // consistent, and JobDispatcher::EnumerateChildren's order makes
     // sense. We don't need |get_lock()| when calling RemoveChildProcess
     // here. ZX-880
-    // RemoveChildProcess is called soon after releasing |get_lock()| so that
-    // the semantics of signaling ZX_JOB_NO_PROCESSES match that of
-    // ZX_TASK_TERMINATED.
     job_->RemoveChildProcess(this);
 }
 
@@ -451,17 +486,19 @@ Handle* ProcessDispatcher::GetHandleLocked(zx_handle_t handle_value,
     if (handle && handle->process_id() == get_koid())
         return handle;
 
-    // Handle lookup failed.  We potentially generate an exception,
-    // depending on the job policy.  Note that we don't use the return
-    // value from QueryBasicPolicy() here: ZX_POL_ACTION_ALLOW and
-    // ZX_POL_ACTION_DENY are equivalent for ZX_POL_BAD_HANDLE.
-    if (likely(!skip_policy))
-        QueryBasicPolicy(ZX_POL_BAD_HANDLE);
+    if (likely(!skip_policy)) {
+        // Handle lookup failed.  We potentially generate an exception or kill the process,
+        // depending on the job policy. Note that we don't use the return value from
+        // EnforceBasicPolicy() here: ZX_POL_ACTION_ALLOW and ZX_POL_ACTION_DENY are equivalent for
+        // ZX_POL_BAD_HANDLE.
+        __UNUSED auto result = EnforceBasicPolicy(ZX_POL_BAD_HANDLE);
+    }
+
     return nullptr;
 }
 
 void ProcessDispatcher::AddHandle(HandleOwner handle) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Writer> guard{&handle_table_lock_};
     AddHandleLocked(ktl::move(handle));
 }
 
@@ -470,8 +507,14 @@ void ProcessDispatcher::AddHandleLocked(HandleOwner handle) {
     handles_.push_front(handle.release());
 }
 
+HandleOwner ProcessDispatcher::RemoveHandleLocked(Handle* handle) {
+    handle->set_process_id(ZX_KOID_INVALID);
+    handles_.erase(*handle);
+    return HandleOwner(handle);
+}
+
 HandleOwner ProcessDispatcher::RemoveHandle(zx_handle_t handle_value) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Writer> guard{&handle_table_lock_};
     return RemoveHandleLocked(handle_value);
 }
 
@@ -479,50 +522,25 @@ HandleOwner ProcessDispatcher::RemoveHandleLocked(zx_handle_t handle_value) {
     auto handle = GetHandleLocked(handle_value);
     if (!handle)
         return nullptr;
-
-    handle->set_process_id(ZX_KOID_INVALID);
-    handles_.erase(*handle);
-
-    return HandleOwner(handle);
+    return RemoveHandleLocked(handle);
 }
 
-
-zx_status_t ProcessDispatcher::RemoveHandles(user_in_ptr<const zx_handle_t> user_handles,
-                                             size_t num_handles) {
+zx_status_t ProcessDispatcher::RemoveHandles(const zx_handle_t* handles, size_t num_handles) {
     zx_status_t status = ZX_OK;
-    size_t offset = 0;
-    while (offset < num_handles) {
-        // We process |num_handles| in chunks of |kMaxMessageHandles|
-        // because we don't have a limit on how large |num_handles|
-        // can be.
-        auto chunk_size = fbl::min<size_t>(num_handles - offset, kMaxMessageHandles);
+    Guard<BrwLockPi, BrwLockPi::Writer> guard{handle_table_lock()};
 
-        zx_handle_t handles[kMaxMessageHandles];
-
-        // If we fail |copy_array_from_user|, then we might discard some, but
-        // not all, of the handles |user_handles| specified.
-        if (user_handles.copy_array_from_user(handles, chunk_size, offset) != ZX_OK)
-            return status;
-
-        {
-            Guard<fbl::Mutex> guard{handle_table_lock()};
-            for (size_t ix = 0; ix != chunk_size; ++ix) {
-                if (handles[ix] == ZX_HANDLE_INVALID)
-                    continue;
-                auto handle = RemoveHandleLocked(handles[ix]);
-                if (!handle)
-                    status = ZX_ERR_BAD_HANDLE;
-            }
-        }
-
-        offset += chunk_size;
+    for (size_t ix = 0; ix != num_handles; ++ix) {
+        if (handles[ix] == ZX_HANDLE_INVALID)
+            continue;
+        auto handle = RemoveHandleLocked(handles[ix]);
+        if (!handle)
+            status = ZX_ERR_BAD_HANDLE;
     }
-
     return status;
 }
 
 zx_koid_t ProcessDispatcher::GetKoidForHandle(zx_handle_t handle_value) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{&handle_table_lock_};
     Handle* handle = GetHandleLocked(handle_value);
     if (!handle)
         return ZX_KOID_INVALID;
@@ -532,7 +550,7 @@ zx_koid_t ProcessDispatcher::GetKoidForHandle(zx_handle_t handle_value) {
 zx_status_t ProcessDispatcher::GetDispatcherInternal(zx_handle_t handle_value,
                                                      fbl::RefPtr<Dispatcher>* dispatcher,
                                                      zx_rights_t* rights) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{&handle_table_lock_};
     Handle* handle = GetHandleLocked(handle_value);
     if (!handle)
         return ZX_ERR_BAD_HANDLE;
@@ -543,26 +561,8 @@ zx_status_t ProcessDispatcher::GetDispatcherInternal(zx_handle_t handle_value,
     return ZX_OK;
 }
 
-zx_status_t ProcessDispatcher::GetDispatcherWithRightsInternal(zx_handle_t handle_value,
-                                                               zx_rights_t desired_rights,
-                                                               fbl::RefPtr<Dispatcher>* dispatcher_out,
-                                                               zx_rights_t* out_rights) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
-    Handle* handle = GetHandleLocked(handle_value);
-    if (!handle)
-        return ZX_ERR_BAD_HANDLE;
-
-    if (!handle->HasRights(desired_rights))
-        return ZX_ERR_ACCESS_DENIED;
-
-    *dispatcher_out = handle->dispatcher();
-    if (out_rights)
-        *out_rights = handle->rights();
-    return ZX_OK;
-}
-
 zx_status_t ProcessDispatcher::GetInfo(zx_info_process_t* info) {
-    memset(info, 0, sizeof(*info));
+    canary_.Assert();
 
     State state;
     // retcode_ depends on the state: make sure they're consistent.
@@ -756,6 +756,11 @@ void ProcessDispatcher::OnExceptionPortRemoval(
     }
 }
 
+Exceptionate* ProcessDispatcher::exceptionate(Exceptionate::Type type) {
+    canary_.Assert();
+    return type == Exceptionate::Type::kDebug ? &debug_exceptionate_ : &exceptionate_;
+}
+
 uint32_t ProcessDispatcher::ThreadCount() const {
     canary_.Assert();
 
@@ -828,14 +833,31 @@ zx_status_t ProcessDispatcher::set_debug_addr(uintptr_t addr) {
     return ZX_OK;
 }
 
-zx_status_t ProcessDispatcher::QueryBasicPolicy(uint32_t condition) const {
-    auto action = policy_.QueryBasicPolicy(condition);
-    if (action & ZX_POL_ACTION_EXCEPTION) {
+zx_status_t ProcessDispatcher::EnforceBasicPolicy(uint32_t condition) {
+    const auto action = policy_.QueryBasicPolicy(condition);
+    switch (action) {
+    case ZX_POL_ACTION_ALLOW:
+        // Not calling IncrementCounter here because this is the common case (fast path).
+        return ZX_OK;
+    case ZX_POL_ACTION_DENY:
+        JobPolicy::IncrementCounter(action, condition);
+        return ZX_ERR_ACCESS_DENIED;
+    case ZX_POL_ACTION_ALLOW_EXCEPTION:
         thread_signal_policy_exception();
-    }
-    // TODO(cpu): check for the ZX_POL_KILL bit and return an error code
-    // that abigen understands as termination.
-    return (action & ZX_POL_ACTION_DENY) ? ZX_ERR_ACCESS_DENIED : ZX_OK;
+        JobPolicy::IncrementCounter(action, condition);
+        return ZX_OK;
+    case ZX_POL_ACTION_DENY_EXCEPTION:
+        thread_signal_policy_exception();
+        JobPolicy::IncrementCounter(action, condition);
+        return ZX_ERR_ACCESS_DENIED;
+    case ZX_POL_ACTION_KILL:
+        Kill(ZX_TASK_RETCODE_POLICY_KILL);
+        JobPolicy::IncrementCounter(action, condition);
+        // Because we've killed, this return value will never make it out to usermode. However,
+        // callers of this method will see and act on it.
+        return ZX_ERR_ACCESS_DENIED;
+    };
+    panic("unexpected policy action %u\n", action);
 }
 
 TimerSlack ProcessDispatcher::GetTimerSlackPolicy() const {
@@ -863,24 +885,30 @@ const char* StateToString(ProcessDispatcher::State state) {
 }
 
 bool ProcessDispatcher::IsHandleValid(zx_handle_t handle_value) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{&handle_table_lock_};
     return (GetHandleLocked(handle_value) != nullptr);
 }
 
 bool ProcessDispatcher::IsHandleValidNoPolicyCheck(zx_handle_t handle_value) {
-    Guard<fbl::Mutex> guard{&handle_table_lock_};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{&handle_table_lock_};
     return (GetHandleLocked(handle_value, true) != nullptr);
 }
 
-void ProcessDispatcher::OnProcessStartForJobDebugger(ThreadDispatcher *t) {
+void ProcessDispatcher::OnProcessStartForJobDebugger(ThreadDispatcher *t,
+                                                     const arch_exception_context_t* context) {
     auto job = job_;
     while (job) {
       auto port = job->debugger_exception_port();
       if (port) {
-        port->OnProcessStartForDebugger(t);
+        port->OnProcessStartForDebugger(t, context);
         break;
-      } else {
-        job = job->parent();
       }
+
+      if (t->HandleSingleShotException(job->exceptionate(Exceptionate::Type::kDebug),
+                                       ZX_EXCP_PROCESS_STARTING, *context)) {
+          break;
+      }
+
+      job = job->parent();
     }
 }

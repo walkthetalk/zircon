@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_METADATA_H_
+#define DDK_METADATA_H_
 
 #include <assert.h>
 #include <zircon/boot/image.h>
@@ -39,6 +40,11 @@ static_assert(DEVICE_METADATA_PARTITION_MAP == ZBI_TYPE_DRV_PARTITION_MAP, "");
 // type: char[ZBI_BOARD_NAME_LEN]
 #define DEVICE_METADATA_BOARD_NAME                0x4E524F42 // BORN
 
+// Platform board private data (for board driver)
+// type: ???
+#define DEVICE_METADATA_BOARD_PRIVATE             0x524F426D // mBOR
+static_assert(DEVICE_METADATA_BOARD_PRIVATE == ZBI_TYPE_DRV_BOARD_PRIVATE, "");
+
 // Interrupt controller type (for sysinfo driver)
 // type: uint8_t
 #define DEVICE_METADATA_INTERRUPT_CONTROLLER_TYPE 0x43544E49 // INTC
@@ -46,10 +52,46 @@ static_assert(DEVICE_METADATA_PARTITION_MAP == ZBI_TYPE_DRV_PARTITION_MAP, "");
 // GUID map (for GPT driver)
 // type: array of guid_map_t
 #define DEVICE_METADATA_GUID_MAP                  0x44495547 // GUID
-#define DEVICE_METADATA_GUID_MAP_MAX_ENTRIES      8
+#define DEVICE_METADATA_GUID_MAP_MAX_ENTRIES      16
 
+// list of buttons_button_config_t
 #define DEVICE_METADATA_BUTTONS_BUTTONS           0x424E5442 // BTNB
+
+// list of buttons_gpio_config_t
 #define DEVICE_METADATA_BUTTONS_GPIOS             0x474E5442 // BTNG
+
+// list of char[ZX_MAX_NAME_LEN]
+#define DEVICE_METADATA_NAME                      0x454D414E // NAME
+
+// type: fuchsia_hardware_thermal_ThermalDeviceInfo
+#define DEVICE_METADATA_THERMAL_CONFIG            0x54485243 // THRC
+
+// type: array of gpio_pin_t
+#define DEVICE_METADATA_GPIO_PINS                 0x4F495047 // GPIO
+
+// type: array of power_domain_t
+#define DEVICE_METADATA_POWER_DOMAINS             0x52574F50  // POWR
+
+// type: clock_id_t
+#define DEVICE_METADATA_CLOCK_IDS                 0x4B4F4C43 // CLOK
+
+// type: vendor specific eMMC configuration
+#define DEVICE_METADATA_EMMC_CONFIG               0x434D4D45 // EMMC
+
+// type: vendor specific Wifi configuration
+#define DEVICE_METADATA_WIFI_CONFIG               0x49464957 // WIFI
+
+// type: eth_dev_metadata_t
+#define DEVICE_METADATA_ETH_MAC_DEVICE            0x43414D45 // EMAC
+
+// type: eth_dev_metadata_t
+#define DEVICE_METADATA_ETH_PHY_DEVICE            0x59485045 // EPHY
+
+// type: array of i2c_channel_t
+#define DEVICE_METADATA_I2C_CHANNELS              0x43433249 // I2CC
+
+// type: display_driver_t
+#define DEVICE_METADATA_DISPLAY_DEVICE            0x4C505344 // DSPL
 
 // Metadata types that have least significant byte set to lowercase 'd'
 // signify private driver data.
@@ -61,3 +103,5 @@ static_assert(DEVICE_METADATA_PARTITION_MAP == ZBI_TYPE_DRV_PARTITION_MAP, "");
 static inline bool is_private_metadata(uint32_t type) {
     return ((type & DEVICE_METADATA_PRIVATE_MASK) == DEVICE_METADATA_PRIVATE);
 }
+
+#endif  // DDK_METADATA_H_

@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef HW_SDMMC_H_
+#define HW_SDMMC_H_
 
 #include <ddk/device.h>
 #include <zircon/compiler.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 //
 // Common SD/MMC defines
@@ -71,6 +72,9 @@ __BEGIN_CDECLS;
 #define SD_VOLTAGE_SWITCH_FLAGS             SDMMC_RESP_R1
 #define SD_APP_SEND_SCR_FLAGS               SDMMC_RESP_R1 | SDMMC_RESP_DATA_PRESENT | \
                                             SDMMC_CMD_READ
+#define SD_APP_SET_BUS_WIDTH_FLAGS          SDMMC_RESP_R1
+#define SD_APP_SEND_OP_COND_FLAGS           SDMMC_RESP_R3
+
 // MMC Commands
 #define MMC_SEND_OP_COND_FLAGS              SDMMC_RESP_R3
 #define MMC_SET_RELATIVE_ADDR_FLAGS         SDMMC_RESP_R1
@@ -102,6 +106,9 @@ __BEGIN_CDECLS;
 #define SD_VOLTAGE_SWITCH             11
 #define SD_APP_SEND_SCR               51
 #define SD_SEND_TUNING_BLOCK          19
+
+#define SD_APP_SET_BUS_WIDTH          6
+#define SD_APP_SEND_OP_COND           41
 
 // MMC Commands
 #define MMC_SEND_OP_COND              1
@@ -171,4 +178,6 @@ __BEGIN_CDECLS;
 #define MMC_STATUS_EXCEPTION_EVENT      (1 << 6)
 #define MMC_STATUS_APP_CMD              (1 << 5)
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // HW_SDMMC_H_

@@ -209,7 +209,6 @@ public:
             // of the first field, and the report id.
             dev->report[ifr] = {};
             dev->report[ifr].report_id = report_id.report_id;
-            dev->report[ifr].first_field = &dest_fields[ix];
 
             dev->report[ifr].input_fields = input_fields_start;
             dev->report[ifr].output_fields = output_fields_start;
@@ -253,9 +252,15 @@ public:
                 ++ix;
             }
 
-            // Update the report ReportDescriptor with the final information.
-            dev->report[ifr].count = field_count;
+            // If we haven't seen any fields reset the size to 0.
+            if (input_count == 0)
+                input_bit_sz = 0;
+            if (output_count == 0)
+                output_bit_sz = 0;
+            if (feature_count == 0)
+                feature_bit_sz = 0;
 
+            // Update the report ReportDescriptor with the final information.
             dev->report[ifr].input_count = input_count;
             dev->report[ifr].input_byte_sz = DIV_ROUND_UP(input_bit_sz, 8);
 
@@ -265,9 +270,6 @@ public:
             dev->report[ifr].feature_count = feature_count;
             dev->report[ifr].feature_byte_sz = DIV_ROUND_UP(feature_bit_sz, 8);
 
-            // TODO(dgilhooley) Fix this by removing byte_sz entirely when this change lands.
-            dev->report[ifr].byte_sz =
-                dev->report[ifr].input_byte_sz;
             ++ifr;
         }
 
@@ -346,6 +348,13 @@ public:
                 type,
                 flags,
                 curr_col};
+
+            // If physical min/max are zero they should be set to logical values.
+            if (field.attr.phys_mm.min == 0 &&
+                field.attr.phys_mm.max == 0) {
+                field.attr.phys_mm.min = field.attr.logc_mm.min;
+                field.attr.phys_mm.max = field.attr.logc_mm.max;
+            }
 
             fbl::AllocChecker ac;
             fields_.push_back(field, &ac);
@@ -557,18 +566,18 @@ private:
         }
 
         uint32_t next_usage() {
-            uint32_t usage;
+            int64_t usage;
             if (usages_ == nullptr) {
-                usage = static_cast<uint32_t>(usage_range_.min + index_);
-                if (usage > static_cast<uint32_t>(usage_range_.max))
+                usage = usage_range_.min + index_;
+                if (usage > usage_range_.max)
                     usage = usage_range_.max;
             } else {
                 usage = (index_ < usages_->size()) ? (*usages_)[index_] : last_usage_;
-                last_usage_ = usage;
+                last_usage_ = static_cast<uint32_t>(usage);
             }
             if (!is_array_)
                 ++index_;
-            return usage;
+            return static_cast<uint32_t>(usage);
         }
 
     private:
@@ -721,25 +730,6 @@ ParseResult ParseReportDescriptor(
 void FreeDeviceDescriptor(DeviceDescriptor* dev_desc) {
     // memory was allocated via ParseState::Alloc()
     impl::ParseState::Free(dev_desc);
-}
-
-ReportField* GetFirstInputField(const DeviceDescriptor* dev_desc,
-                                size_t* field_count) {
-    if (dev_desc == nullptr)
-        return nullptr;
-
-    auto rep_count = dev_desc->rep_count;
-
-    for (size_t ix = 0; ix != rep_count; ix++) {
-        auto fields = dev_desc->report[ix].first_field;
-        if (fields[0].type == hid::kInput) {
-            *field_count = dev_desc->report[ix].count;
-            return &fields[0];
-        }
-    }
-
-    *field_count = 0u;
-    return nullptr;
 }
 
 Collection* GetAppCollection(const ReportField* field) {

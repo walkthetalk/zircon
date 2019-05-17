@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef HW_SDIO_H_
+#define HW_SDIO_H_
 
 #include <ddk/device.h>
 #include <zircon/compiler.h>
@@ -45,7 +46,7 @@
 // IO_RW_EXTENDED Fields
 #define SDIO_IO_RW_EXTD_BYTE_BLK_COUNT_LOC      0
 #define SDIO_IO_RW_EXTD_BYTE_BLK_COUNT_MASK     0x000001ff
-#define SDIO_IO_RW_EXTD_MAX_BLKS_PER_CMD        511 // 9 bits
+#define SDIO_IO_RW_EXTD_MAX_BLKS_PER_CMD        511u // 9 bits
 #define SDIO_IO_RW_EXTD_REG_ADDR_LOC            9
 #define SDIO_IO_RW_EXTD_REG_ADDR_MASK           0x03fffe00
 #define SDIO_IO_RW_EXTD_OP_CODE_INCR            0x04000000
@@ -192,3 +193,4 @@ static const uint32_t sdio_cis_tpl_funce_tran_speed_val[16] =
 static const uint32_t sdio_cis_tpl_funce_tran_speed_unit[8] =
     {1, 10, 100, 1000, 0, 0, 0, 0 }; //Kbit/sec
 
+#endif  // HW_SDIO_H_

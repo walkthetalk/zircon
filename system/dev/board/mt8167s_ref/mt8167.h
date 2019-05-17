@@ -15,6 +15,7 @@
 #include <threads.h>
 
 #include <ddk/usb-peripheral-config.h>
+#include <soc/mt8167/mt8167-power.h>
 
 namespace board_mt8167 {
 
@@ -22,12 +23,14 @@ namespace board_mt8167 {
 enum {
     BTI_BOARD,
     BTI_DISPLAY,
-    BTI_EMMC,
-    BTI_SDIO,
+    BTI_MSDC0,
+    BTI_MSDC1,
+    BTI_MSDC2,
     BTI_USB,
     BTI_AUDIO_OUT,
     BTI_AUDIO_IN,
     BTI_SYSMEM,
+    BTI_GPU,
 };
 
 class Mt8167;
@@ -38,35 +41,46 @@ class Mt8167 : public Mt8167Type {
 public:
     explicit Mt8167(zx_device_t* parent, pbus_protocol_t* pbus, pdev_board_info_t* board_info)
         : Mt8167Type(parent), pbus_(pbus), board_info_(*board_info) {}
+    virtual ~Mt8167() = default;
 
     static zx_status_t Create(zx_device_t* parent);
 
     // Device protocol implementation.
     void DdkRelease();
 
+    // Visible for testing.
+    int Thread();
+
+protected:
+    explicit Mt8167(zx_device_t* parent) : Mt8167Type(parent) {}
+
+    virtual zx_status_t Vgp1Enable();
+
+    virtual zx_status_t Msdc0Init();
+    virtual zx_status_t Msdc2Init();
+    virtual zx_status_t SocInit();
+    virtual zx_status_t SysmemInit();
+    virtual zx_status_t GpioInit();
+    virtual zx_status_t GpuInit();
+    virtual zx_status_t DisplayInit();
+    virtual zx_status_t I2cInit();
+    virtual zx_status_t ButtonsInit();
+    virtual zx_status_t ClkInit();
+    virtual zx_status_t UsbInit();
+    virtual zx_status_t ThermalInit();
+    virtual zx_status_t TouchInit();
+    virtual zx_status_t BacklightInit();
+    virtual zx_status_t AudioInit();
+
+    ddk::PBusProtocolClient pbus_;
+
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(Mt8167);
 
     zx_status_t Start();
-    zx_status_t EmmcInit();
-    zx_status_t SdioInit();
-    zx_status_t SocInit();
-    zx_status_t SysmemInit();
-    zx_status_t GpioInit();
-    zx_status_t GpuInit();
-    zx_status_t DisplayInit();
-    zx_status_t I2cInit();
-    zx_status_t ButtonsInit();
-    zx_status_t ClkInit();
-    zx_status_t UsbInit();
-    zx_status_t ThermalInit();
-    zx_status_t TouchInit();
-    zx_status_t SensorsInit();
-    zx_status_t BacklightInit();
-    zx_status_t AudioInit();
-    int Thread();
 
-    ddk::PBusProtocolClient pbus_;
+    zx_status_t PowerInit();
+
     gpio_impl_protocol_t gpio_impl_;
     pdev_board_info_t board_info_;
     thrd_t thread_;
@@ -74,7 +88,3 @@ private:
 };
 
 } // namespace board_mt8167
-
-__BEGIN_CDECLS
-zx_status_t mt8167_bind(void* ctx, zx_device_t* parent);
-__END_CDECLS

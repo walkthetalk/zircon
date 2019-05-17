@@ -6,9 +6,10 @@
 
 #include <zircon/assert.h>
 
+#include <ftl_private.h>
+#include "kprivate/fsprivate.h"
 #include "kprivate/ndm.h"
 #include "posix.h"
-#include "utils/modules.h"
 
 namespace ftl {
 
@@ -100,7 +101,7 @@ NdmBaseDriver::~NdmBaseDriver() {
     RemoveNdmVolume();
 }
 
-const char* NdmBaseDriver::CreateNdmVolume(const Volume* ftl_volume, const VolumeOptions& options) {
+bool NdmBaseDriver::IsNdmDataPresent(const VolumeOptions& options) {
     NDMDrvr driver = {};
     driver.num_blocks = options.num_blocks;
     driver.max_bad_blocks = options.max_bad_blocks;
@@ -121,21 +122,43 @@ const char* NdmBaseDriver::CreateNdmVolume(const Volume* ftl_volume, const Volum
     driver.erase_block = EraseBlock;
     driver.is_block_bad = IsBadBlockImpl;
 
+    SetFsErrCode(NDM_OK);
     ndm_ = ndmAddDev(&driver);
+    return ndm_ || GetFsErrCode() != NDM_NO_META_BLK;
+}
+
+bool NdmBaseDriver::BadBbtReservation() const {
+    if (ndm_) {
+        return false;
+    }
+    FsErrorCode error = static_cast<FsErrorCode>(GetFsErrCode());
+    switch (error) {
+        case NDM_TOO_MANY_IBAD:
+        case NDM_TOO_MANY_RBAD:
+        case NDM_RBAD_LOCATION:
+            return true;
+        default:
+            return false;
+    }
+}
+
+const char* NdmBaseDriver::CreateNdmVolume(const Volume* ftl_volume, const VolumeOptions& options) {
     if (!ndm_) {
-        return "FTL: ndmAddDev failed";
+        IsNdmDataPresent(options);
     }
 
-    if (ndmSetNumPartitions(ndm_, 1)) {
-        return "FTL: ndmSetNumPartitions failed";
+    if (!ndm_) {
+        return "ndmAddDev failed";
+    }
+
+    if (ndmSetNumPartitions(ndm_, 1) != 0) {
+        return "ndmSetNumPartitions failed";
     }
 
     NDMPartition partition = {};
     partition.num_blocks = ndmGetNumVBlocks(ndm_) - partition.first_block;
-    partition.type = XFS_VOL;
-
-    if (ndmWritePartition(ndm_, &partition, 0, "ftl")) {
-        return "FTL: ndmWritePartition failed";
+    if (ndmWritePartition(ndm_, &partition, 0, "ftl") != 0) {
+        return "ndmWritePartition failed";
     }
 
     FtlNdmVol ftl = {};
@@ -146,8 +169,8 @@ const char* NdmBaseDriver::CreateNdmVolume(const Volume* ftl_volume, const Volum
     ftl.extra_free = 6;  // Over-provision 6% of the device.
     xfs.ftl_volume = const_cast<Volume*>(ftl_volume);
 
-    if (ndmAddVolXfsFTL(ndm_, 0, &ftl, &xfs)) {
-        return "FTL: ndmAddVolXfsFTL failed";
+    if (ndmAddVolFTL(ndm_, 0, &ftl, &xfs) != 0) {
+        return "ndmAddVolFTL failed";
     }
 
     return nullptr;
@@ -159,6 +182,14 @@ bool NdmBaseDriver::RemoveNdmVolume() {
         return true;
     }
     return false;
+}
+
+bool NdmBaseDriver::SaveBadBlockData() {
+    return ndmExtractBBL(ndm_) >= 0 ? true : false;
+}
+
+bool NdmBaseDriver::RestoreBadBlockData() {
+    return ndmInsertBBL(ndm_) == 0 ? true : false;
 }
 
 bool NdmBaseDriver::IsEmptyPageImpl(const uint8_t* data, uint32_t data_len, const uint8_t* spare,
@@ -185,7 +216,7 @@ bool InitModules() {
     if (!g_init_performed) {
         // Unfortunately, module initialization is a global affair, and there is
         // no cleanup. At least, make sure no re-initialization takes place.
-        if (NdmModule(kInitMod) != nullptr || FsModule(kInitMod) != nullptr) {
+        if (NdmInit() != 0 || FtlInit() != 0) {
             return false;
         }
         g_init_performed = true;

@@ -4,19 +4,16 @@
 
 #pragma once
 
-#include <ddk/mmio-buffer.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/vector.h>
-#include <unittest/unittest.h>
-
-void mmio_fake_read(uintptr_t base, size_t size, zx_off_t off, void* value);
-void mmio_fake_write(uintptr_t base, size_t size, const void* value, zx_off_t off);
+#include <zxtest/zxtest.h>
 
 namespace ddk_mock {
 
 // Mocks a single MMIO register. This class is intended to be used with a ddk::MmioBuffer;
-// operations on an instance of that class will be directed to the mock through mmio_fake_read and
-// mmio_fake_write if TEST_MMIO_FAKE is defined. The base address used by the MmioBuffer should be
-// an array of MockMmioReg objects. See the following example test:
+// operations on an instance of that class will be directed to the mock if the mock-mmio-reg library
+// is a dependency of the test. The base address used by the MmioBuffer should be an array of
+// MockMmioReg objects. See the following example test:
 //
 // ddk_mock::MockMmioReg register_array[number_of_registers];
 // ddk_mock::MockMmioRegRegion mock_registers(register_array, register_size, number_of_registers);
@@ -57,22 +54,17 @@ public:
 
     // Writes to the mocked register. This method is expected to be called (indirectly) by the code
     // under test.
-    bool Write(uint64_t value) {
-        BEGIN_HELPER;
-
+    void Write(uint64_t value) {
         last_value_ = value;
 
         if (write_expectations_index_ >= write_expectations_.size()) {
-            return true;
+            return;
         }
 
         MmioExpectation& exp = write_expectations_[write_expectations_index_++];
-        if (exp.match == MmioExpectation::Match::kAny) {
-            return true;
+        if (exp.match != MmioExpectation::Match::kAny) {
+            EXPECT_EQ(exp.value, value);
         }
-
-        EXPECT_EQ(exp.value, value);
-        END_HELPER;
     }
 
     // Matches a register read and returns the specified value.
@@ -138,12 +130,10 @@ public:
 
     // Removes all expectations and resets the default value. The presence of any outstanding
     // expectations causes a test failure.
-    bool VerifyAndClear() {
-        BEGIN_HELPER;
+    void VerifyAndClear() {
         EXPECT_GE(read_expectations_index_, read_expectations_.size());
         EXPECT_GE(write_expectations_index_, write_expectations_.size());
         Clear();
-        END_HELPER;
     }
 
 private:

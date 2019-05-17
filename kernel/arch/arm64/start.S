@@ -157,6 +157,11 @@ FUNCTION(_start)
     /* mark page tables as set up, so secondary cpus can fall through */
     adr_global tmp, page_tables_not_ready
     str     wzr, [tmp]
+
+    /* make sure it's flushed */
+    dc      cvac, tmp
+    dmb     sy
+
     b       .Lpage_tables_ready
 
 .Lmmu_enable_secondary:
@@ -183,7 +188,6 @@ FUNCTION(_start)
     /* (SMP extensions) non-shareable, inner write-back write-allocate */
     movlit  tmp, MMU_TCR_FLAGS_IDENT
     msr     tcr_el1, tmp
-
     isb
 
     /* Write ttbr with phys addr of the translation table */
@@ -195,7 +199,7 @@ FUNCTION(_start)
     mrs     tmp, sctlr_el1
 
     /* Turn on the MMU */
-    orr     tmp, tmp, #0x1
+    orr     tmp, tmp, #(1<<0)
 
     /* Write back SCTLR */
     msr     sctlr_el1, tmp
@@ -205,13 +209,12 @@ FUNCTION(_start)
     // Map our current physical PC to the virtual PC and jump there.
     // PC = next_PC - __code_start + kernel_vaddr
     adr     tmp, .Lmmu_on_vaddr
-    adr     tmp2, __code_start
+    adr_global tmp2, __code_start
     sub     tmp, tmp, tmp2
     add     tmp, tmp, kernel_vaddr
     br      tmp
 
 .Lmmu_on_vaddr:
-
     /* Disable trampoline page-table in ttbr0 */
     movlit  tmp, MMU_TCR_FLAGS_KERNEL
     msr     tcr_el1, tmp

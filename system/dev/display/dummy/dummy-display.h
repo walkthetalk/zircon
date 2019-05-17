@@ -14,6 +14,7 @@
 
 #include <ddk/debug.h>
 #include <ddk/driver.h>
+#include <ddk/protocol/sysmem.h>
 
 #include <ddktl/device.h>
 #include <ddktl/protocol/display/controller.h>
@@ -39,8 +40,10 @@ public:
 
     // Required functions needed to implement Display Controller Protocol
     void DisplayControllerImplSetDisplayControllerInterface(
-        const display_controller_interface_t* intf);
+        const display_controller_interface_protocol_t* intf);
     zx_status_t DisplayControllerImplImportVmoImage(image_t* image, zx::vmo vmo, size_t offset);
+    zx_status_t DisplayControllerImplImportImage(image_t* image, zx_unowned_handle_t handle,
+                                                 uint32_t index);
     void DisplayControllerImplReleaseImage(image_t* image);
     uint32_t DisplayControllerImplCheckConfiguration(const display_config_t** display_configs,
                                                      size_t display_count,
@@ -50,6 +53,13 @@ public:
                                                  size_t display_count);
     uint32_t DisplayControllerImplComputeLinearStride(uint32_t width, zx_pixel_format_t format);
     zx_status_t DisplayControllerImplAllocateVmo(uint64_t size, zx::vmo* vmo_out);
+    zx_status_t DisplayControllerImplGetSysmemConnection(zx::channel connection);
+    zx_status_t DisplayControllerImplSetBufferCollectionConstraints(const image_t* config,
+                                                                    uint32_t collection);
+    zx_status_t DisplayControllerImplGetSingleBufferFramebuffer(zx::vmo* out_vmo,
+                                                                uint32_t* out_stride) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 
     // Required functions for DeviceType
     void DdkUnbind();
@@ -59,6 +69,8 @@ private:
     zx_status_t SetupDisplayInterface();
     int VSyncThread();
     void PopulateAddedDisplayArgs(added_display_args_t* args);
+
+    sysmem_protocol_t sysmem_ = {};
 
     std::atomic_bool vsync_shutdown_flag_ = false;
 
@@ -72,7 +84,7 @@ private:
     bool current_image_valid_ TA_GUARDED(display_lock_);
 
     // Display controller related data
-    ddk::DisplayControllerInterfaceClient dc_intf_ TA_GUARDED(display_lock_);
+    ddk::DisplayControllerInterfaceProtocolClient dc_intf_ TA_GUARDED(display_lock_);
 };
 
 } // namespace dummy_display

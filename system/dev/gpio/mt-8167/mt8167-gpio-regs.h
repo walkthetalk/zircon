@@ -3,23 +3,9 @@
 // found in the LICENSE file.
 
 #include <hwreg/bitfields.h>
+#include <lib/mmio/mmio.h>
 #include <soc/mt8167/mt8167-hw.h>
 #include <zircon/types.h>
-
-// Define weak specialization methods that can be overridden in tests. There is a slight performance
-// hit as doing this prevents the MMIO accesses from being inlined.
-template <>
-template <>
-__WEAK uint16_t ddk::MmioBuffer::Read<uint16_t>(zx_off_t offs) const {
-    return *reinterpret_cast<volatile uint16_t*>(ptr_ + offs);
-}
-
-template <>
-template <>
-__WEAK void ddk::MmioBuffer::Write<uint16_t>(uint16_t val, zx_off_t offs) const {
-    *reinterpret_cast<volatile uint16_t*>(ptr_ + offs) = val;
-    hw_mb();
-}
 
 namespace {
 // There are 2 sets of GPIO Pull settings register banks, those under GPIO and those under IOCFG.

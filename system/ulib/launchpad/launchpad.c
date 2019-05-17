@@ -6,15 +6,11 @@
 #include <launchpad/vmo.h>
 #include "elf.h"
 
-#include <zircon/assert.h>
-#include <zircon/dlfcn.h>
-#include <zircon/process.h>
-#include <zircon/processargs.h>
-#include <zircon/stack.h>
-#include <zircon/syscalls.h>
-#include <ldmsg/ldmsg.h>
-#include <lib/fdio/io.h>
 #include <assert.h>
+#include <ldmsg/ldmsg.h>
+#include <lib/elf-psabi/sp.h>
+#include <lib/fdio/io.h>
+#include <lib/zircon-internal/default_stack_size.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -23,6 +19,11 @@
 #include <string.h>
 #include <sys/param.h>
 #include <threads.h>
+#include <zircon/assert.h>
+#include <zircon/dlfcn.h>
+#include <zircon/process.h>
+#include <zircon/processargs.h>
+#include <zircon/syscalls.h>
 
 enum special_handles {
     HND_LDSVC_LOADER,
@@ -113,6 +114,7 @@ void launchpad_destroy(launchpad_t* lp) {
     free(lp->script_args);
     free(lp->args);
     free(lp->env);
+    free(lp->names);
     free(lp);
 }
 
@@ -326,31 +328,6 @@ zx_status_t launchpad_add_handles(launchpad_t* lp, size_t n,
         }
     }
     return status;
-}
-
-//TODO: use transfer_fd here and eliminate fdio_pipe_half()
-zx_status_t launchpad_add_pipe(launchpad_t* lp, int* fd_out, int target_fd) {
-    zx_handle_t handle;
-    uint32_t id;
-    int fd;
-
-    if (lp->error)
-        return lp->error;
-    if ((target_fd < 0) || (target_fd >= FDIO_MAX_FD)) {
-        return lp_error(lp, ZX_ERR_INVALID_ARGS, "add_pipe: invalid target fd");
-    }
-    zx_status_t status;
-    if ((status = fdio_pipe_half(&handle, &id)) < 0) {
-        return lp_error(lp, status, "add_pipe: failed to create pipe");
-    }
-    fd = status;
-    if ((status = launchpad_add_handle(lp, handle, PA_HND(PA_HND_TYPE(id), target_fd))) < 0) {
-        close(fd);
-        zx_handle_close(handle);
-        return status;
-    }
-    *fd_out = fd;
-    return ZX_OK;
 }
 
 static void check_elf_stack_size(launchpad_t* lp, elf_load_info_t* elf) {
@@ -1204,7 +1181,7 @@ zx_handle_close failed on low address space reservation VMAR");
     result->root_vmar = root_vmar;
     result->thread = thread;
     result->entry = lp->entry;
-    result->sp = sp;
+    result->stack = sp;
     result->bootstrap = bootstrap;
     result->vdso_base = lp->vdso_base;
     result->base = lp->base;
@@ -1247,7 +1224,7 @@ static zx_status_t launchpad_start(launchpad_t* lp, zx_handle_t* process_out) {
     if (status != ZX_OK)
         return status;
 
-    status = zx_process_start(data.process, data.thread, data.entry, data.sp,
+    status = zx_process_start(data.process, data.thread, data.entry, data.stack,
                               data.bootstrap, data.vdso_base);
 
     zx_handle_close(data.thread);
@@ -1301,16 +1278,6 @@ zx_status_t launchpad_load_from_file(launchpad_t* lp, const char* path) {
         return launchpad_file_load_with_vdso(lp, vmo);
     } else {
         return lp_error(lp, status, "launchpad_vmo_from_file failure");
-    }
-}
-
-zx_status_t launchpad_load_from_fd(launchpad_t* lp, int fd) {
-    zx_handle_t vmo;
-    zx_status_t status = fdio_get_vmo_clone(fd, &vmo);
-    if (status == ZX_OK) {
-        return launchpad_file_load_with_vdso(lp, vmo);
-    } else {
-        return status;
     }
 }
 

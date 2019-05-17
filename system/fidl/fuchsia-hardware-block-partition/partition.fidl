@@ -7,7 +7,7 @@ using zx;
 using fuchsia.hardware.block as block;
 
 const uint32 GUID_LENGTH = 16;
-const uint32 NAME_LENGTH = 24;
+const uint32 NAME_LENGTH = 128;
 
 // A Globally Unique IDentifier, which may be utilized to identify
 // a partition.
@@ -18,7 +18,9 @@ struct GUID {
 // Partition describes a region of one or more block devices, labelled
 // with distinguishing identifiers.
 [Layout = "Simple", FragileBase]
-interface Partition : block.Block {
+protocol Partition {
+    compose block.Block;
+
     // Gets the type GUID of the partition (if one exists).
     // If the partition has no type GUID, ZX_ERR_NOT_SUPPORTED is returned.
     GetTypeGuid() -> (zx.status status, GUID? guid);

@@ -6,11 +6,13 @@
 #include <audio-utils/audio-input.h>
 #include <audio-utils/audio-output.h>
 #include <fbl/algorithm.h>
+#include <fbl/unique_fd.h>
+#include <fuchsia/hardware/audio/c/fidl.h>
 #include <limits>
 #include <fbl/auto_call.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <lib/fdio/io.h>
+#include <lib/fzl/fdio.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/handle.h>
 #include <lib/zx/vmar.h>
@@ -108,23 +110,21 @@ zx_status_t AudioDeviceStream::Open() {
     if (stream_ch_ != ZX_HANDLE_INVALID)
         return ZX_ERR_BAD_STATE;
 
-    int fd = ::open(name(), O_RDONLY);
-    if (fd < 0) {
-        printf("Failed to open \"%s\" (res %d)\n", name(), fd);
-        return fd;
+    fbl::unique_fd fd{::open(name(), O_RDONLY)};
+    if (!fd.is_valid()) {
+        printf("Failed to open \"%s\"\n", name());
+        return ZX_ERR_NOT_FOUND;
     }
 
-    ssize_t res = ::fdio_ioctl(fd, AUDIO_IOCTL_GET_CHANNEL,
-                               nullptr, 0,
-                               &stream_ch_, sizeof(stream_ch_));
-    ::close(fd);
+    fzl::FdioCaller dev(std::move(fd));
+    zx_status_t res = fuchsia_hardware_audio_DeviceGetChannel(dev.borrow_channel(),
+                                                              stream_ch_.reset_and_get_address());
 
-    if (res != sizeof(stream_ch_)) {
-        printf("Failed to obtain channel (res %zd)\n", res);
-        return static_cast<zx_status_t>(res);
+    if (res != ZX_OK) {
+        printf("Failed to obtain channel (res %d)\n", res);
     }
 
-    return ZX_OK;
+    return res;
 }
 
 zx_status_t AudioDeviceStream::GetSupportedFormats(
@@ -209,7 +209,7 @@ zx_status_t AudioDeviceStream::GetSupportedFormats(
             return res;
         }
 
-        res = stream_ch_.read(0u, &resp, sizeof(resp), &rxed, nullptr, 0, nullptr);
+        res = stream_ch_.read(0u, &resp, nullptr, sizeof(resp), 0, &rxed, nullptr);
         if (res != ZX_OK) {
             printf("Failed to read next response after processing %u/%u formats (res %d)\n",
                     processed_formats, expected_formats, res);
@@ -340,7 +340,8 @@ zx_status_t AudioDeviceStream::GetString(audio_stream_string_id_t id,
 }
 
 zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
-    zx_time_t deadline = zx_deadline_after(ZX_SEC(static_cast<double>(duration)));
+    const double duration_ns = static_cast<double>(duration) * ZX_SEC(1);
+    const zx_time_t deadline = zx_deadline_after(static_cast<zx_duration_t>(duration_ns));
     audio_stream_cmd_plug_detect_resp resp;
     zx_status_t res = GetPlugState(&resp, true);
     if (res != ZX_OK)
@@ -391,7 +392,7 @@ zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
 
             audio_stream_plug_detect_notify_t state;
             uint32_t bytes_read;
-            res = stream_ch_.read(0, &state, sizeof(state), &bytes_read, nullptr, 0, nullptr);
+            res = stream_ch_.read(0, &state, nullptr, sizeof(state), 0, &bytes_read, nullptr);
             if (res != ZX_OK) {
                 printf("Read failure while waiting for plug notification (res %d)\n", res);
                 break;

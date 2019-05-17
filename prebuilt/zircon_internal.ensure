@@ -7,7 +7,7 @@ $ParanoidMode CheckPresence
 
 # ADSP SST Firmware
 @Subdir firmware/intel-adsp-sst
-fuchsia_internal/firmware/intel-adsp-sst git_revision:8fc2d4e55685bf73b6f7752383da9067404a74bb
+fuchsia_internal/firmware/intel-adsp-sst NC0gy5Ej51GElpWUQXzO6Q1d5hPLV4Z4c1mbhDLuhfcC
 
 # Broadcom BCM4345C4 Firmware
 @Subdir firmware/bluetooth/bcm4345c4
@@ -24,3 +24,12 @@ fuchsia_internal/firmware/fx3-flash c8whlpMnrQukCMf01_Yyi1F0nHK2g7A5fIwMXcDRyk4C
 # FX3 USB Bootloader Firmware
 @Subdir firmware/fx3-boot
 fuchsia_internal/firmware/fx3-boot pWauzviAyLDgNPkMyKQV-p8N5kCiG5P_QeMVgRZ-pykC
+
+# Mediatek MT7668 Firmware
+@Subdir firmware/bluetooth/mt7668
+fuchsia_internal/firmware/bluetooth/mt7668 git_revision:ed8b2eb6b877e93afb8a9f9281b93a7b91df0f09
+
+# Keysafe TA Firmware
+@Subdir firmware/optee/keysafe
+fuchsia_internal/firmware/optee/keysafe pWqiofIR0BiNAOrXf7fMtmk1AsoHp92kxRcKD9Twmw8C
+

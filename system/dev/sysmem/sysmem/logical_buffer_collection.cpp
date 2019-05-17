@@ -11,6 +11,7 @@
 
 #include <lib/image-format/image_format.h>
 #include <limits.h> // PAGE_SIZE
+#include <limits> // std::numeric_limits
 #include <zircon/assert.h>
 
 namespace {
@@ -36,11 +37,22 @@ template <typename T> bool IsNonZeroPowerOf2(T value) {
 // TODO(dustingreen): Switch to FIDL C++ generated code (preferred) and remove
 // this, or fully implement something like this for all fields that need 0 to
 // imply a default value that isn't 0.
-template <typename T> T FieldDefault1(T value) {
-    if (value == 0) {
-        return 1;
+template <typename T> void FieldDefault1(T* value) {
+    if (*value == 0) {
+        *value = 1;
     }
-    return value;
+}
+
+template <typename T> void FieldDefaultMax(T* value) {
+    if (*value == 0) {
+        *value = std::numeric_limits<T>::max();
+    }
+}
+
+// This exists just to document the meaning for now, to make the conversion more
+// clear when we switch from FIDL struct to FIDL table.
+template <typename T> void FieldDefaultZero(T* value) {
+    // no-op
 }
 
 template <typename T> T AlignUp(T value, T divisor) {
@@ -295,7 +307,7 @@ void LogicalBufferCollection::MaybeAllocate() {
     }
     // Sweep looking for any views that haven't set constraints.
     for (auto& [key, value] : collection_views_) {
-        if (!key->set_constraints_seen()) {
+        if (!key->is_set_constraints_seen()) {
             return;
         }
     }
@@ -313,6 +325,21 @@ void LogicalBufferCollection::TryAllocate() {
     // last collection view disappeared we would have run ~this which would have
     // cleared the Post() canary so this method woudn't be running.
     ZX_DEBUG_ASSERT(!collection_views_.empty());
+
+    // Currently only BufferCollection(s) that have already done a clean Close()
+    // have their constraints in constraints_list_.  Now we want all the rest of
+    // the constraints represented in collection_views_ to be in
+    // constraints_list_ so we can just process constraints_list_ in
+    // CombineConstraints().  These can't be moved, only cloned, because the
+    // still-alive BufferCollection(s) will still want to refer to their
+    // constraints at least for GetUsageBasedRightsAttenuation() purposes.
+    for (auto& [key, value] : collection_views_) {
+        ZX_DEBUG_ASSERT(key->is_set_constraints_seen());
+        if (key->constraints()) {
+            constraints_list_.emplace_back(
+                BufferCollectionConstraintsClone(key->constraints()));
+        }
+    }
 
     if (!CombineConstraints()) {
         // It's impossible to combine the constraints due to incompatible
@@ -378,7 +405,7 @@ void LogicalBufferCollection::SendAllocationResult() {
 
     for (auto& [key, value] : collection_views_) {
         // May as well assert since we can.
-        ZX_DEBUG_ASSERT(key->set_constraints_seen());
+        ZX_DEBUG_ASSERT(key->is_set_constraints_seen());
         key->OnBuffersAllocated();
     }
 
@@ -429,7 +456,16 @@ void LogicalBufferCollection::BindSharedCollectionInternal(
 
             // At this point we know the collection_ptr is cleanly done (Close()
             // was sent from client) and can be removed from the set of tracked
-            // collections.
+            // collections.  We keep the collection's constraints (if any), as
+            // those are still relevant - this lets a participant do
+            // SetConstraints() followed by Close() followed by closing the
+            // participant's BufferCollection channel, which is convenient for
+            // some participants.
+
+            if (collection_ptr->is_set_constraints_seen()) {
+                constraints_list_.emplace_back(collection_ptr->TakeConstraints());
+            }
+
             auto self = collection_ptr->parent_shared();
             ZX_DEBUG_ASSERT(self.get() == this);
             collection_views_.erase(collection_ptr);
@@ -445,49 +481,68 @@ void LogicalBufferCollection::BindSharedCollectionInternal(
 
 bool LogicalBufferCollection::CombineConstraints() {
     // This doesn't necessarily mean that any of the collection_views_ have
-    // non-null constraints though.
+    // set non-null constraints though.  We do require that at least one
+    // participant (probably the initiator) retains an open channel to its
+    // BufferCollection until allocation is done, else allocation won't be
+    // attempted.
     ZX_DEBUG_ASSERT(!collection_views_.empty());
 
+    // We also know that all the constraints are in constraints_list_ now,
+    // including all constraints from collection_views_.
+    ZX_DEBUG_ASSERT(!constraints_list_.empty());
+
     auto iter =
-        std::find_if(collection_views_.begin(), collection_views_.end(),
-                     [](auto& pair) { return !!pair.first->constraints(); });
-    if (iter == collection_views_.end()) {
+        std::find_if(constraints_list_.begin(), constraints_list_.end(),
+                     [](auto& item) { return !!item; });
+    if (iter == constraints_list_.end()) {
         // This is a failure.  At least one participant must provide
         // constraints.
         return false;
     }
 
-    if (!CheckBufferCollectionConstraints(iter->first->constraints())) {
+    if (!CheckSanitizeBufferCollectionConstraints(iter->get())) {
         return false;
     }
 
     Constraints result =
-        BufferCollectionConstraintsClone(iter->first->constraints());
+        BufferCollectionConstraintsClone(iter->get());
     ++iter;
 
-    for (; iter != collection_views_.end(); ++iter) {
-        if (!iter->first->constraints()) {
+    for (; iter != constraints_list_.end(); ++iter) {
+        if (!iter->get()) {
             continue;
         }
-        if (!CheckBufferCollectionConstraints(iter->first->constraints())) {
+        if (!CheckSanitizeBufferCollectionConstraints(iter->get())) {
             return false;
         }
         if (!AccumulateConstraintBufferCollection(result.get(),
-                                                  iter->first->constraints())) {
+                                                  iter->get())) {
             // This is a failure.  The space of permitted settings contains no
             // points.
             return false;
         }
     }
 
-    SanitizeBufferCollectionConstraints(result.get());
+    if (!CheckSanitizeBufferCollectionConstraints(result.get())) {
+      return false;
+    }
 
     constraints_ = std::move(result);
     return true;
 }
 
-bool LogicalBufferCollection::CheckBufferCollectionConstraints(
-    const fuchsia_sysmem_BufferCollectionConstraints* constraints) {
+// Nearly all constraint checks must go under here or under ::Allocate() (not in
+// the Accumulate* methods), else we could fail to notice a single participant
+// providing unsatisfiable constraints, where no Accumulate* happens.  The
+// constraint checks that are present under Accumulate* are commented explaining
+// why it's ok for them to be there.
+bool LogicalBufferCollection::CheckSanitizeBufferCollectionConstraints(
+    fuchsia_sysmem_BufferCollectionConstraints* constraints) {
+    FieldDefaultMax(&constraints->max_buffer_count);
+    if (constraints->min_buffer_count > constraints->max_buffer_count) {
+        LogError("min_buffer_count > max_buffer_count");
+        return false;
+    }
     // At least one usage bit must be specified by any participant that
     // specifies constraints.
     if (constraints->usage.cpu == 0 && constraints->usage.vulkan == 0 &&
@@ -495,8 +550,14 @@ bool LogicalBufferCollection::CheckBufferCollectionConstraints(
         LogError("At least one usage bit must be set.");
         return false;
     }
+    if (constraints->has_buffer_memory_constraints) {
+        if (!CheckSanitizeBufferMemoryConstraints(
+                &constraints->buffer_memory_constraints)) {
+            return false;
+        }
+    }
     for (uint32_t i = 0; i < constraints->image_format_constraints_count; ++i) {
-        if (!CheckImageFormatConstraints(
+        if (!CheckSanitizeImageFormatConstraints(
                 &constraints->image_format_constraints[i])) {
             return false;
         }
@@ -504,19 +565,82 @@ bool LogicalBufferCollection::CheckBufferCollectionConstraints(
     return true;
 }
 
-bool LogicalBufferCollection::CheckImageFormatConstraints(
-    const fuchsia_sysmem_ImageFormatConstraints* constraints) {
+bool LogicalBufferCollection::CheckSanitizeBufferMemoryConstraints(
+    fuchsia_sysmem_BufferMemoryConstraints* constraints) {
+    if (!constraints->ram_domain_supported &&
+        !constraints->cpu_domain_supported) {
+        LogError("Neither RAM nor CPU coherency domains supported");
+        return false;
+    }
+    if (constraints->min_size_bytes > constraints->max_size_bytes) {
+        LogError("min_size_bytes > max_size_bytes");
+        return false;
+    }
+    if (constraints->secure_required && !constraints->secure_permitted) {
+        LogError("secure_required && !secure_permitted");
+        return false;
+    }
+    return true;
+}
+
+bool LogicalBufferCollection::CheckSanitizeImageFormatConstraints(
+    fuchsia_sysmem_ImageFormatConstraints* constraints) {
+    FieldDefault1(&constraints->coded_width_divisor);
+    FieldDefault1(&constraints->coded_height_divisor);
+    FieldDefault1(&constraints->bytes_per_row_divisor);
+    FieldDefault1(&constraints->start_offset_divisor);
+    FieldDefault1(&constraints->display_width_divisor);
+    FieldDefault1(&constraints->display_height_divisor);
+
+    FieldDefaultMax(&constraints->required_min_coded_width);
+    FieldDefaultZero(&constraints->required_max_coded_width);
+    FieldDefaultMax(&constraints->required_min_coded_height);
+    FieldDefaultZero(&constraints->required_max_coded_height);
+    FieldDefaultMax(&constraints->required_min_bytes_per_row);
+    FieldDefaultZero(&constraints->required_max_bytes_per_row);
+
+    uint32_t min_bytes_per_row_given_min_width =
+        ImageFormatStrideBytesPerWidthPixel(&constraints->pixel_format) *
+                                            constraints->min_coded_width;
+    constraints->min_bytes_per_row = std::max(
+        constraints->min_bytes_per_row,
+        min_bytes_per_row_given_min_width);
+
     if (constraints->pixel_format.type ==
         fuchsia_sysmem_PixelFormatType_INVALID) {
         LogError("PixelFormatType INVALID not allowed");
         return false;
     }
-    if (constraints->pixel_format.has_format_modifier) {
-        LogError("has_format_modifier == true not yet implemented");
+    if (!ImageFormatIsSupported(&constraints->pixel_format)) {
+        LogError("Unsupported pixel format");
         return false;
     }
+
     if (!constraints->color_spaces_count) {
         LogError("color_spaces_count == 0 not allowed");
+        return false;
+    }
+    if (constraints->layers != 1) {
+        LogError("layers != 1 is not yet implemented");
+        return false;
+    }
+
+    if (constraints->min_coded_width > constraints->max_coded_width) {
+        LogError("min_coded_width > max_coded_width");
+        return false;
+    }
+    if (constraints->min_coded_height > constraints->max_coded_height) {
+        LogError("min_coded_height > max_coded_height");
+        return false;
+    }
+    if (constraints->min_bytes_per_row > constraints->max_bytes_per_row) {
+        LogError("min_bytes_per_row > max_bytes_per_row");
+        return false;
+    }
+    if (constraints->min_coded_width * constraints->min_coded_height >
+        constraints->max_coded_width_times_coded_height) {
+        LogError("min_coded_width * min_coded_height > "
+                 "max_coded_width_times_coded_height");
         return false;
     }
     if (constraints->layers != 1) {
@@ -534,6 +658,15 @@ bool LogicalBufferCollection::CheckImageFormatConstraints(
     }
     if (!IsNonZeroPowerOf2(constraints->bytes_per_row_divisor)) {
         LogError("non-power-of-2 bytes_per_row_divisor not supported");
+        return false;
+    }
+    if (!IsNonZeroPowerOf2(constraints->start_offset_divisor)) {
+        LogError("non-power-of-2 start_offset_divisor not supported");
+        return false;
+    }
+    if (constraints->start_offset_divisor > PAGE_SIZE) {
+        LogError(
+            "support for start_offset_divisor > PAGE_SIZE not yet implemented");
         return false;
     }
     if (!IsNonZeroPowerOf2(constraints->display_width_divisor)) {
@@ -556,6 +689,39 @@ bool LogicalBufferCollection::CheckImageFormatConstraints(
             return false;
         }
     }
+
+    ZX_DEBUG_ASSERT(constraints->required_min_coded_width != 0);
+    if (constraints->required_min_coded_width < constraints->min_coded_width) {
+        LogError("required_min_coded_width < min_coded_width");
+        return false;
+    }
+    if (constraints->required_max_coded_width > constraints->max_coded_width) {
+        LogError("required_max_coded_width > max_coded_width");
+        return false;
+    }
+    ZX_DEBUG_ASSERT(constraints->required_min_coded_height != 0);
+    if (constraints->required_min_coded_height <
+        constraints->min_coded_height) {
+        LogError("required_min_coded_height < min_coded_height");
+        return false;
+    }
+    if (constraints->required_max_coded_height >
+        constraints->max_coded_height) {
+        LogError("required_max_coded_height > max_coded_height");
+        return false;
+    }
+    ZX_DEBUG_ASSERT(constraints->required_min_bytes_per_row != 0);
+    if (constraints->required_min_bytes_per_row <
+        constraints->min_bytes_per_row) {
+        LogError("required_min_bytes_per_row < min_bytes_per_row");
+        return false;
+    }
+    if (constraints->required_max_bytes_per_row >
+        constraints->max_bytes_per_row) {
+        LogError("required_max_bytes_per_row > max_bytes_per_row");
+        return false;
+    }
+
     // TODO(dustingreen): Check compatibility of color_space[] entries vs. the
     // pixel_format.  In particular, 2020 and 2100 don't have 8 bpp, only 10 or
     // 12 bpp, while a given PixelFormat.type is a specific bpp.  There's
@@ -563,22 +729,6 @@ bool LogicalBufferCollection::CheckImageFormatConstraints(
     // PixelFormat.type that's 8 bpp for example.
 
     return true;
-}
-
-void LogicalBufferCollection::SanitizeBufferCollectionConstraints(
-    fuchsia_sysmem_BufferCollectionConstraints* constraints) {
-    for (uint32_t i = 0; i < constraints->image_format_constraints_count; ++i) {
-        // Ensure min_bytes_per_row is sufficient to fit min_coded_width.
-        fuchsia_sysmem_ImageFormatConstraints* image_format_constraints =
-            &constraints->image_format_constraints[i];
-        uint32_t min_bytes_per_row_given_min_width =
-            ImageFormatStrideBytesPerWidthPixel(
-                &image_format_constraints->pixel_format) *
-            image_format_constraints->min_coded_width;
-        image_format_constraints->min_bytes_per_row =
-            std::max(image_format_constraints->min_bytes_per_row,
-                     min_bytes_per_row_given_min_width);
-    }
 }
 
 LogicalBufferCollection::Constraints
@@ -614,6 +764,15 @@ bool LogicalBufferCollection::AccumulateConstraintBufferCollection(
     acc->min_buffer_count_for_shared_slack =
         std::max(acc->min_buffer_count_for_shared_slack,
                  c->min_buffer_count_for_shared_slack);
+
+    acc->min_buffer_count = std::max(
+        acc->min_buffer_count, c->min_buffer_count);
+    // 0 is replaced with 0xFFFFFFFF in
+    // CheckSanitizeBufferCollectionConstraints.
+    ZX_DEBUG_ASSERT(acc->max_buffer_count != 0);
+    ZX_DEBUG_ASSERT(c->max_buffer_count != 0);
+    acc->max_buffer_count = std::min(
+        acc->max_buffer_count, c->max_buffer_count);
 
     if (!acc->has_buffer_memory_constraints) {
         if (c->has_buffer_memory_constraints) {
@@ -679,21 +838,25 @@ bool LogicalBufferCollection::AccumulateConstraintBufferMemory(
     fuchsia_sysmem_BufferMemoryConstraints* acc,
     const fuchsia_sysmem_BufferMemoryConstraints* c) {
     acc->min_size_bytes = std::max(acc->min_size_bytes, c->min_size_bytes);
+
+    // Don't permit 0 as the overall min_size_bytes; that would be nonsense.  No
+    // particular initiator should feel that it has to specify 1 in this field;
+    // that's just built into sysmem instead.  While a VMO will have a minimum
+    // actual size of page size, we do permit treating buffers as if they're 1
+    // byte, mainly for testing reasons, and to avoid any unnecessary dependence
+    // or assumptions re. page size.
+    acc->min_size_bytes = std::max(acc->min_size_bytes, 1u);
     acc->max_size_bytes = std::min(acc->max_size_bytes, c->max_size_bytes);
-    if (acc->min_size_bytes > acc->max_size_bytes) {
-        LogError("min_size_bytes > max_size_bytes");
-        return false;
-    }
 
     acc->physically_contiguous_required = acc->physically_contiguous_required ||
                                           c->physically_contiguous_required;
 
     acc->secure_required = acc->secure_required || c->secure_required;
     acc->secure_permitted = acc->secure_permitted && c->secure_permitted;
-    if (acc->secure_required && !acc->secure_permitted) {
-        LogError("secure_required && !secure_permitted");
-        return false;
-    }
+
+    acc->ram_domain_supported = acc->ram_domain_supported && c->ram_domain_supported;
+    acc->cpu_domain_supported = acc->cpu_domain_supported && c->cpu_domain_supported;
+
     return true;
 }
 
@@ -740,6 +903,11 @@ bool LogicalBufferCollection::AccumulateConstraintImageFormats(
     }
 
     if (!*acc_count) {
+        // It's ok for this check to be under Accumulate* because it's permitted
+        // for a given participant to have zero image_format_constraints_count.
+        // It's only when the count becomes non-zero then drops back to zero
+        // (checked here), or if we end up with no image format constraints and
+        // no buffer constraints (checked in ::Allocate()), that we care.
         LogError("all pixel_format(s) eliminated");
         return false;
     }
@@ -767,45 +935,20 @@ bool LogicalBufferCollection::AccumulateConstraintImageFormat(
 
     acc->min_coded_width = std::max(acc->min_coded_width, c->min_coded_width);
     acc->max_coded_width = std::min(acc->max_coded_width, c->max_coded_width);
-    if (acc->min_coded_width > acc->max_coded_width) {
-        LogError("min_coded_width > max_coded_width");
-        return false;
-    }
-
     acc->min_coded_height =
         std::max(acc->min_coded_height, c->min_coded_height);
     acc->max_coded_height =
         std::min(acc->max_coded_height, c->max_coded_height);
-    if (acc->min_coded_height > acc->max_coded_height) {
-        LogError("min_coded_height > max_coded_height");
-        return false;
-    }
-
     acc->min_bytes_per_row =
         std::max(acc->min_bytes_per_row, c->min_bytes_per_row);
     acc->max_bytes_per_row =
         std::min(acc->max_bytes_per_row, c->max_bytes_per_row);
-    if (acc->min_bytes_per_row > acc->max_bytes_per_row) {
-        LogError("min_bytes_per_row > max_bytes_per_row");
-        return false;
-    }
-
     acc->max_coded_width_times_coded_height =
         std::min(acc->max_coded_width_times_coded_height,
                  c->max_coded_width_times_coded_height);
-    if (acc->min_coded_width * acc->min_coded_height >
-        acc->max_coded_width_times_coded_height) {
-        LogError("min_coded_width * min_coded_height > "
-                 "max_coded_width_times_coded_height");
-        return false;
-    }
 
     // Checked previously.
     ZX_DEBUG_ASSERT(acc->layers == 1);
-    if (acc->layers != 1) {
-        LogError("layers != 1 is not yet implemented");
-        return false;
-    }
 
     acc->coded_width_divisor =
         std::max(acc->coded_width_divisor, c->coded_width_divisor);
@@ -830,16 +973,35 @@ bool LogicalBufferCollection::AccumulateConstraintImageFormat(
     acc->start_offset_divisor =
         std::max(acc->start_offset_divisor,
                  ImageFormatSampleAlignment(&acc->pixel_format));
-    if (acc->start_offset_divisor > PAGE_SIZE) {
-        LogError(
-            "support for start_offset_divisor > PAGE_SIZE not yet implemented");
-        return false;
-    }
 
     acc->display_width_divisor =
         std::max(acc->display_width_divisor, c->display_width_divisor);
     acc->display_height_divisor =
         std::max(acc->display_height_divisor, c->display_height_divisor);
+
+    // The required_ space is accumulated by taking the union, and must be fully
+    // within the non-required_ space, else fail.  For example, this allows a
+    // video decoder to indicate that it's capable of outputting a wide range of
+    // output dimensions, but that it has specific current dimensions that are
+    // presently required_ (min == max) for decode to proceed.
+    ZX_DEBUG_ASSERT(acc->required_min_coded_width != 0);
+    ZX_DEBUG_ASSERT(c->required_min_coded_width != 0);
+    acc->required_min_coded_width = std::min(
+        acc->required_min_coded_width, c->required_min_coded_width);
+    acc->required_max_coded_width = std::max(
+        acc->required_max_coded_width, c->required_max_coded_width);
+    ZX_DEBUG_ASSERT(acc->required_min_coded_height != 0);
+    ZX_DEBUG_ASSERT(c->required_min_coded_height != 0);
+    acc->required_min_coded_height = std::min(
+        acc->required_min_coded_height, c->required_min_coded_height);
+    acc->required_max_coded_height = std::max(
+        acc->required_max_coded_height, c->required_max_coded_height);
+    ZX_DEBUG_ASSERT(acc->required_min_bytes_per_row != 0);
+    ZX_DEBUG_ASSERT(c->required_min_bytes_per_row != 0);
+    acc->required_min_bytes_per_row = std::min(
+        acc->required_min_bytes_per_row, c->required_min_bytes_per_row);
+    acc->required_max_bytes_per_row = std::max(
+        acc->required_max_bytes_per_row, c->required_max_bytes_per_row);
 
     return true;
 }
@@ -872,6 +1034,9 @@ bool LogicalBufferCollection::AccumulateConstraintColorSpaces(
     }
 
     if (!*acc_count) {
+        // It's ok for this check to be under Accumulate* because it's also
+        // under CheckSanitize().  It's fine to provide a slightly more helpful
+        // error message here and early out here.
         LogError("Zero color_space overlap");
         return false;
     }
@@ -882,6 +1047,22 @@ bool LogicalBufferCollection::AccumulateConstraintColorSpaces(
 bool LogicalBufferCollection::IsColorSpaceEqual(
     const fuchsia_sysmem_ColorSpace& a, const fuchsia_sysmem_ColorSpace& b) {
     return a.type == b.type;
+}
+
+static fuchsia_sysmem_CoherencyDomain
+GetCoherencyDomain(const fuchsia_sysmem_BufferCollectionConstraints* constraints) {
+    if (!constraints->has_buffer_memory_constraints)
+        return fuchsia_sysmem_CoherencyDomain_Cpu;
+
+    if (!constraints->buffer_memory_constraints.ram_domain_supported)
+        return fuchsia_sysmem_CoherencyDomain_Cpu;
+    if (!constraints->buffer_memory_constraints.cpu_domain_supported)
+        return fuchsia_sysmem_CoherencyDomain_Ram;
+
+    // Display controllers generally aren't cache coherent.
+    // TODO - base on the system in use.
+    return constraints->usage.display != 0 ? fuchsia_sysmem_CoherencyDomain_Ram
+                                           : fuchsia_sysmem_CoherencyDomain_Cpu;
 }
 
 BufferCollection::BufferCollectionInfo
@@ -895,9 +1076,24 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
     BufferCollection::BufferCollectionInfo result(
         BufferCollection::BufferCollectionInfo::Default);
 
-    result->buffer_count = constraints_->min_buffer_count_for_camping +
-                           constraints_->min_buffer_count_for_dedicated_slack +
-                           constraints_->min_buffer_count_for_shared_slack;
+    uint32_t min_buffer_count =
+        constraints_->min_buffer_count_for_camping +
+        constraints_->min_buffer_count_for_dedicated_slack +
+        constraints_->min_buffer_count_for_shared_slack;
+    min_buffer_count = std::max(
+        min_buffer_count, constraints_->min_buffer_count);
+    uint32_t max_buffer_count = constraints_->max_buffer_count;
+    if (min_buffer_count > max_buffer_count) {
+      LogError("aggregate min_buffer_count > aggregate max_buffer_count - "
+               "min: %u max: %u", min_buffer_count, max_buffer_count);
+      *allocation_result = ZX_ERR_NOT_SUPPORTED;
+      return BufferCollection::BufferCollectionInfo(
+          BufferCollection::BufferCollectionInfo::Null);
+    }
+
+    result->buffer_count = min_buffer_count;
+    ZX_DEBUG_ASSERT(result->buffer_count <= max_buffer_count);
+
     uint64_t min_size_bytes = 0;
     uint64_t max_size_bytes = std::numeric_limits<uint64_t>::max();
 
@@ -937,6 +1133,7 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
         min_size_bytes = buffer_constraints->min_size_bytes;
         max_size_bytes = buffer_constraints->max_size_bytes;
     }
+    buffer_settings->coherency_domain = GetCoherencyDomain(constraints_.get());
 
     // It's allowed for zero participants to have any ImageFormatConstraint(s),
     // in which case the combined constraints_ will have zero (and that's fine,
@@ -950,7 +1147,7 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
         uint32_t best_index = 0;
         for (uint32_t i = 1; i < constraints_->image_format_constraints_count;
              ++i) {
-            if (CompareImageFormatConstraintsByIndex(i, best_index) > 0) {
+            if (CompareImageFormatConstraintsByIndex(i, best_index) < 0) {
                 best_index = i;
             }
         }
@@ -975,7 +1172,7 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
 
         min_image.coded_width =
             AlignUp(constraints->min_coded_width,
-                    FieldDefault1(constraints->coded_width_divisor));
+                    constraints->coded_width_divisor);
         if (min_image.coded_width > constraints->max_coded_width) {
             LogError(
                 "coded_width_divisor caused coded_width > max_coded_width");
@@ -985,7 +1182,7 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
         }
         min_image.coded_height =
             AlignUp(constraints->min_coded_height,
-                    FieldDefault1(constraints->coded_height_divisor));
+                    constraints->coded_height_divisor);
         if (min_image.coded_height > constraints->max_coded_height) {
             LogError(
                 "coded_height_divisor caused coded_height > max_coded_height");
@@ -995,7 +1192,7 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
         }
         min_image.bytes_per_row =
             AlignUp(constraints->min_bytes_per_row,
-                    FieldDefault1(constraints->bytes_per_row_divisor));
+                    constraints->bytes_per_row_divisor);
         if (min_image.bytes_per_row > constraints->max_bytes_per_row) {
             LogError("bytes_per_row_divisor caused bytes_per_row > "
                      "max_bytes_per_row");
@@ -1072,6 +1269,11 @@ LogicalBufferCollection::Allocate(zx_status_t* allocation_result) {
 
     // Now that min_size_bytes accounts for any ImageFormatConstraints, we can
     // just allocate min_size_bytes buffers.
+    //
+    // If an initiator (or a participant) wants to force buffers to be larger
+    // than the size implied by minimum image dimensions, the initiator can use
+    // BufferMemorySettings.min_size_bytes to force allocated buffers to be
+    // large enough.
     buffer_settings->size_bytes = static_cast<uint32_t>(min_size_bytes);
 
     for (uint32_t i = 0; i < result->buffer_count; ++i) {
@@ -1106,7 +1308,8 @@ zx_status_t LogicalBufferCollection::AllocateVmo(
         }
 
         zx::vmo raw_vmo;
-        zx_status_t status = allocator->Allocate(settings->buffer_settings.size_bytes, &raw_vmo);
+        zx_status_t status = allocator->Allocate(
+            settings->buffer_settings.size_bytes, &raw_vmo);
         if (status != ZX_OK) {
             LogError("Protected allocate failed - size_bytes: %u "
                      "status: %d",
@@ -1167,6 +1370,19 @@ zx_status_t LogicalBufferCollection::AllocateVmo(
     return ZX_OK;
 }
 
+static int32_t clamp_difference(int32_t a, int32_t b) {
+    int32_t raw_result = a - b;
+
+    int32_t cooked_result = raw_result;
+    if (cooked_result > 0) {
+        cooked_result = 1;
+    } else if (cooked_result < 0) {
+        cooked_result = -1;
+    }
+    ZX_DEBUG_ASSERT(cooked_result == 0 || cooked_result == 1 || cooked_result == -1);
+    return cooked_result;
+}
+
 // 1 means a > b, 0 means ==, -1 means a < b.
 //
 // TODO(dustingreen): Pay attention to constraints_->usage, by checking any
@@ -1178,25 +1394,24 @@ int32_t LogicalBufferCollection::CompareImageFormatConstraintsTieBreaker(
     // If there's not any cost difference, fall back to choosing the
     // pixel_format that has the larger type enum value as a tie-breaker.
 
-    // For now, require that there's no format modifier.  Later we'll want to
-    // tie break based on that information also.
-    ZX_DEBUG_ASSERT(!a->pixel_format.has_format_modifier);
-    ZX_DEBUG_ASSERT(!b->pixel_format.has_format_modifier);
+    int32_t result = clamp_difference(static_cast<int32_t>(a->pixel_format.type),
+                                      static_cast<int32_t>(b->pixel_format.type));
 
-    int32_t raw_result = static_cast<int32_t>(a->pixel_format.type) -
-                         static_cast<int32_t>(b->pixel_format.type);
+    if (result != 0)
+        return result;
 
-    int32_t cooked_result = raw_result;
-    if (cooked_result > 0) {
-        cooked_result = 1;
-    } else if (cooked_result < 0) {
-        cooked_result = -1;
+    result = clamp_difference(static_cast<int32_t>(a->pixel_format.has_format_modifier),
+                              static_cast<int32_t>(b->pixel_format.has_format_modifier));
+
+    if (result != 0)
+        return result;
+
+    if (a->pixel_format.has_format_modifier && b->pixel_format.has_format_modifier) {
+        result = clamp_difference(static_cast<int32_t>(a->pixel_format.format_modifier.value),
+                                  static_cast<int32_t>(b->pixel_format.format_modifier.value));
     }
 
-    ZX_DEBUG_ASSERT(cooked_result == 0 || cooked_result == 1 ||
-                    cooked_result == -1);
-
-    return cooked_result;
+    return result;
 }
 
 int32_t LogicalBufferCollection::CompareImageFormatConstraintsByIndex(

@@ -8,7 +8,7 @@
 #include <ddk/protocol/platform/bus.h>
 #include <ddk/protocol/platform/device.h>
 
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 
 #include <fbl/algorithm.h>
 
@@ -22,6 +22,7 @@ zx_status_t Mt8167::SocInit() {
     zx_status_t status;
     mmio_buffer_t mmio;
     status = mmio_buffer_init_physical(&mmio, MT8167_SOC_BASE, MT8167_SOC_SIZE,
+                                       // Please do not use get_root_resource() in new code. See ZX-1467.
                                        get_root_resource(), ZX_CACHE_POLICY_UNCACHED_DEVICE);
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s: mmio_buffer_init_physical failed %d \n", __FUNCTION__, status);
@@ -46,7 +47,7 @@ zx_status_t Mt8167::SocInit() {
         L, L, L, L, L, H, H, L, L, L, L, L, L, L, L, L, // 160.
         L, L, L, L, R, L, L, L, L, L, L, L, L, L, L, L, // 176.
         L, R, L, L, L, L, L, L, L, L, R, L, L, L, L, L, // 192.
-        L, L, L, L, L, L, L, L, L, H, L, L, L, L, L, R, // 208.
+        L, L, L, L, L, L, L, L, L, L, L, L, L, L, L, R, // 208.
         R, R, L, L, L, L, L, L, L, L, L, R, L, H, H, H, // 224.
         H, L, L, L, R, R, L, H, H, H, H                 // 240 (first is 240, last is 250).
     };

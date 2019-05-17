@@ -23,6 +23,8 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <object/dispatcher.h>
+#include <object/handle.h>
+#include <object/interrupt_dispatcher.h>
 #include <sys/types.h>
 
 class PciInterruptDispatcher;
@@ -31,8 +33,8 @@ class PciDeviceDispatcher final
     : public SoloDispatcher<PciDeviceDispatcher, ZX_DEFAULT_PCI_DEVICE_RIGHTS> {
 public:
     static zx_status_t Create(uint32_t index,
-                              zx_pcie_device_info_t*    out_info,
-                              fbl::RefPtr<Dispatcher>* out_dispatcher,
+                              zx_pcie_device_info_t* out_info,
+                              KernelHandle<PciDeviceDispatcher>* out_handle,
                               zx_rights_t* out_rights);
 
     ~PciDeviceDispatcher() final;
@@ -50,7 +52,7 @@ public:
     zx_status_t GetConfig(pci_config_info_t* out);
     zx_status_t ResetDevice();
     zx_status_t MapInterrupt(int32_t which_irq,
-                             fbl::RefPtr<Dispatcher>* interrupt_dispatcher,
+                             KernelHandle<InterruptDispatcher>* interrupt_handle,
                              zx_rights_t* rights);
     zx_status_t QueryIrqModeCaps(zx_pci_irq_mode_t mode, uint32_t* out_max_irqs);
     zx_status_t SetIrqMode(zx_pci_irq_mode_t mode, uint32_t requested_irq_count);
@@ -63,9 +65,6 @@ private:
 
     PciDeviceDispatcher(const PciDeviceDispatcher &) = delete;
     PciDeviceDispatcher& operator=(const PciDeviceDispatcher &) = delete;
-
-    fbl::Canary<fbl::magic("PCID")> canary_;
-
     // Lock protecting upward facing APIs.  Generally speaking, this lock is
     // held for the duration of most of our dispatcher API implementations.  It
     // is unsafe to ever attempt to acquire this lock during a callback from the

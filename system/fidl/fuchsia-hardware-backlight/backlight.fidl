@@ -12,10 +12,10 @@ struct State {
 };
 
 [Layout = "Simple"]
-interface Device {
+protocol Device {
     // Gets the current backlight brightness
-    1: GetState() -> (State state);
+    GetState() -> (State state);
 
     // Sets the current backlight brightness
-    2: SetState(State state);
+    SetState(State state);
 };

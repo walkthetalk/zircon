@@ -15,6 +15,8 @@
 #include <object/handle.h>
 #include <object/message_packet.h>
 #include <object/process_dispatcher.h>
+#include <object/user_handles.h>
+
 #include <zircon/syscalls/policy.h>
 #include <zircon/types.h>
 
@@ -26,14 +28,14 @@
 
 #define LOCAL_TRACE 0
 
-KCOUNTER(channel_msg_0_bytes,   "kernel.channel.bytes.0");
-KCOUNTER(channel_msg_64_bytes,  "kernel.channel.bytes.64");
-KCOUNTER(channel_msg_256_bytes, "kernel.channel.bytes.256");
-KCOUNTER(channel_msg_1k_bytes,  "kernel.channel.bytes.1k");
-KCOUNTER(channel_msg_4k_bytes,  "kernel.channel.bytes.4k");
-KCOUNTER(channel_msg_16k_bytes, "kernel.channel.bytes.16k");
-KCOUNTER(channel_msg_64k_bytes, "kernel.channel.bytes.64k");
-KCOUNTER(channel_msg_received,  "kernel.channel.messages");
+KCOUNTER(channel_msg_0_bytes,   "channel.bytes.0")
+KCOUNTER(channel_msg_64_bytes,  "channel.bytes.64")
+KCOUNTER(channel_msg_256_bytes, "channel.bytes.256")
+KCOUNTER(channel_msg_1k_bytes,  "channel.bytes.1k")
+KCOUNTER(channel_msg_4k_bytes,  "channel.bytes.4k")
+KCOUNTER(channel_msg_16k_bytes, "channel.bytes.16k")
+KCOUNTER(channel_msg_64k_bytes, "channel.bytes.64k")
+KCOUNTER(channel_msg_received,  "channel.messages")
 
 static void record_recv_msg_sz(uint32_t size) {
     kcounter_add(channel_msg_received, 1);
@@ -56,22 +58,22 @@ zx_status_t sys_channel_create(uint32_t options,
         return ZX_ERR_INVALID_ARGS;
 
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_CHANNEL);
+    zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_CHANNEL);
     if (res != ZX_OK)
         return res;
 
-    fbl::RefPtr<Dispatcher> mpd0, mpd1;
+    KernelHandle<ChannelDispatcher> handle0, handle1;
     zx_rights_t rights;
-    zx_status_t result = ChannelDispatcher::Create(&mpd0, &mpd1, &rights);
+    zx_status_t result = ChannelDispatcher::Create(&handle0, &handle1, &rights);
     if (result != ZX_OK)
         return result;
 
-    uint64_t id0 = mpd0->get_koid();
-    uint64_t id1 = mpd1->get_koid();
+    uint64_t id0 = handle0.dispatcher()->get_koid();
+    uint64_t id1 = handle1.dispatcher()->get_koid();
 
-    result = out0->make(ktl::move(mpd0), rights);
+    result = out0->make(ktl::move(handle0), rights);
     if (result == ZX_OK)
-        result = out1->make(ktl::move(mpd1), rights);
+        result = out1->make(ktl::move(handle1), rights);
     if (result == ZX_OK)
         ktrace(TAG_CHANNEL_CREATE, (uint32_t)id0, (uint32_t)id1, options, 0);
     return result;
@@ -236,37 +238,29 @@ static zx_status_t channel_call_epilogue(ProcessDispatcher* up,
     return ZX_OK;
 }
 
+
 // Consumes all handles whether it succeeds or not.
+template <typename UserHandles>
 static zx_status_t msg_put_handles(ProcessDispatcher* up, MessagePacket* msg,
-                                   user_in_ptr<const zx_handle_t> user_handles,
+                                   UserHandles user_handles,
                                    uint32_t num_handles,
                                    Dispatcher* channel) {
     DEBUG_ASSERT(num_handles <= kMaxMessageHandles); // This must be checked before calling.
 
-    zx_handle_t handles[kMaxMessageHandles];
-    if (user_handles.copy_array_from_user(handles, num_handles) != ZX_OK)
-        return ZX_ERR_INVALID_ARGS;
-
-    zx_status_t status = ZX_OK;
+    typename UserHandles::ValueType handles[kMaxMessageHandles] = {};
+    zx_status_t status = user_handles.copy_array_from_user(handles, num_handles);
+    if (status != ZX_OK)
+        return status;
 
     {
-        Guard<fbl::Mutex> guard{up->handle_table_lock()};
+        Guard<BrwLockPi, BrwLockPi::Writer> guard{up->handle_table_lock()};
 
         for (size_t ix = 0; ix != num_handles; ++ix) {
-            auto handle = up->RemoveHandleLocked(handles[ix]).release();
-
-            if (status == ZX_OK) {
-                if (!handle) {
-                    status = ZX_ERR_BAD_HANDLE;
-                } else {
-                    // You may not write a channel endpoint handle into that channel
-                    // endpoint.
-                    if (handle->dispatcher().get() == channel)
-                        status = ZX_ERR_NOT_SUPPORTED;
-
-                    if (!handle->HasRights(ZX_RIGHT_TRANSFER))
-                        status = ZX_ERR_ACCESS_DENIED;
-                }
+            Handle* handle = nullptr;
+            auto inner_status = get_handle_for_message_locked(up, channel, handles[ix], &handle);
+            if ((inner_status != ZX_OK)  && (status == ZX_OK)) {
+                // Latch the first error encountered. It will be what the function returns.
+                status = inner_status;
             }
 
             msg->mutable_handles()[ix] = handle;
@@ -277,16 +271,16 @@ static zx_status_t msg_put_handles(ProcessDispatcher* up, MessagePacket* msg,
     return status;
 }
 
-// zx_status_t zx_channel_write
-zx_status_t sys_channel_write(zx_handle_t handle_value, uint32_t options,
-                              user_in_ptr<const void> user_bytes, uint32_t num_bytes,
-                              user_in_ptr<const zx_handle_t> user_handles, uint32_t num_handles) {
+template <typename UserHandles>
+static zx_status_t channel_write(zx_handle_t handle_value, uint32_t options,
+                                 user_in_ptr<const void> user_bytes, uint32_t num_bytes,
+                                 UserHandles user_handles, uint32_t num_handles) {
     LTRACEF("handle %x bytes %p num_bytes %u handles %p num_handles %u options 0x%x\n",
-            handle_value, user_bytes.get(), num_bytes, user_handles.get(), num_handles, options);
+        handle_value, user_bytes.get(), num_bytes, user_handles.get(), num_handles, options);
 
     auto up = ProcessDispatcher::GetCurrent();
 
-    auto cleanup = fbl::MakeAutoCall([&]() { up->RemoveHandles(user_handles, num_handles); });
+    auto cleanup = fbl::MakeAutoCall([&]() { RemoveUserHandles(user_handles, num_handles, up); });
 
     if (options != 0u) {
         return ZX_ERR_INVALID_ARGS;
@@ -304,10 +298,6 @@ zx_status_t sys_channel_write(zx_handle_t handle_value, uint32_t options,
         return status;
     }
 
-    // msg_put_handles() always consumes all handles (or there are zero handles,
-    // and so there's nothing to be done).
-    cleanup.cancel();
-
     if (num_handles > 0u) {
         status = msg_put_handles(up, msg.get(), user_handles, num_handles,
                                  static_cast<Dispatcher*>(channel.get()));
@@ -315,12 +305,41 @@ zx_status_t sys_channel_write(zx_handle_t handle_value, uint32_t options,
             return status;
     }
 
+    cleanup.cancel();
+
     status = channel->Write(up->get_koid(), ktl::move(msg));
     if (status != ZX_OK)
         return status;
 
     ktrace(TAG_CHANNEL_WRITE, (uint32_t)channel->get_koid(), num_bytes, num_handles, 0);
     return ZX_OK;
+}
+
+// zx_status_t zx_channel_write
+zx_status_t sys_channel_write(zx_handle_t handle_value, uint32_t options,
+                              user_in_ptr<const void> user_bytes, uint32_t num_bytes,
+                              user_in_ptr<const zx_handle_t> user_handles,
+                              uint32_t num_handles) {
+    LTRACEF("handle %x bytes %p num_bytes %u handles %p num_handles %u options 0x%x\n",
+        handle_value, user_bytes.get(), num_bytes, user_handles.get(), num_handles, options);
+
+    return channel_write(
+        handle_value, options, user_bytes, num_bytes, user_handles, num_handles);
+}
+
+// zx_status_t zx_channel_write_etc
+zx_status_t sys_channel_write_etc(zx_handle_t handle_value, uint32_t options,
+                                  user_in_ptr<const void> user_bytes, uint32_t num_bytes,
+                                  user_inout_ptr<zx_handle_disposition_t> user_handles,
+                                  uint32_t num_handles) {
+
+    LTRACEF("handle %x bytes %p num_bytes %u handles %p num_handles %u options 0x%x\n",
+        handle_value, user_bytes.get(), num_bytes, user_handles.get(), num_handles, options);
+
+    // TODO(cpu):finish implementation of get_handle_for_message_locked() and
+    // get_user_handles_to_consume() for this syscall to work.
+    return channel_write(
+        handle_value, options, user_bytes, num_bytes, user_handles, num_handles);
 }
 
 // zx_status_t zx_channel_call_noretry
@@ -343,7 +362,7 @@ zx_status_t sys_channel_call_noretry(zx_handle_t handle_value, uint32_t options,
 
     auto up = ProcessDispatcher::GetCurrent();
 
-    auto cleanup = fbl::MakeAutoCall([&]() { up->RemoveHandles(user_handles, num_handles); });
+    auto cleanup = fbl::MakeAutoCall([&]() { RemoveUserHandles(user_handles, num_handles, up); });
 
     if (options || num_bytes < sizeof(zx_txid_t)) {
         return ZX_ERR_INVALID_ARGS;

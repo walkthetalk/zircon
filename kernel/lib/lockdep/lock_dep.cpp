@@ -19,7 +19,7 @@
 #include <new>
 #include <string.h>
 
-#include <fbl/atomic.h>
+#include <ktl/atomic.h>
 #include <lockdep/lockdep.h>
 
 // Always assert to catch changes when lockdep is not enabled.
@@ -113,9 +113,9 @@ inline lockdep::ThreadLockState* ToThreadLockState(lockdep_state_t* state) {
 
 STATIC_COMMAND_START
 STATIC_COMMAND("lockdep", "kernel lock diagnostics", &CommandLockDep)
-STATIC_COMMAND_END(lockdep);
+STATIC_COMMAND_END(lockdep)
 
-LK_INIT_HOOK(lockdep, LockDepInit, LK_INIT_LEVEL_THREADING);
+LK_INIT_HOOK(lockdep, LockDepInit, LK_INIT_LEVEL_THREADING)
 
 namespace lockdep {
 
@@ -134,7 +134,7 @@ void SystemLockValidationError(AcquiredLockEntry* bad_entry,
     const uint64_t user_pid = current_thread->user_pid;
     const uint64_t user_tid = current_thread->user_tid;
 
-    printf("\nZIRCON KERNEL PANIC\n");
+    printf("\nZIRCON KERNEL OOPS\n");
     printf("Lock validation failed for thread %p pid %" PRIu64 " tid %" PRIu64 " (%s:%s):\n",
            current_thread, user_pid, user_tid, owner_name, current_thread->name);
     printf("Reason: %s\n", ToString(result));
@@ -145,13 +145,6 @@ void SystemLockValidationError(AcquiredLockEntry* bad_entry,
            LockClassState::GetName(conflicting_entry->id()),
            conflicting_entry->order());
     printf("caller=%p frame=%p\n", caller_address, caller_frame);
-    printf("BUILDID %s\n", version.buildid);
-
-    // Log the ELF build ID in the format the symbolizer scripts understand.
-    if (version.elf_build_id[0] != '\0') {
-        printf("dso: id=%s base=%#lx name=zircon.elf\n",
-               version.elf_build_id, (uintptr_t)__code_start);
-    }
 
     thread_print_current_backtrace_at_frame(caller_frame);
     printf("\n");

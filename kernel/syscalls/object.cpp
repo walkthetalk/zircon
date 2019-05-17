@@ -20,11 +20,12 @@
 
 #include <object/bus_transaction_initiator_dispatcher.h>
 #include <object/diagnostics.h>
+#include <object/exception_dispatcher.h>
 #include <object/handle.h>
 #include <object/job_dispatcher.h>
 #include <object/process_dispatcher.h>
-#include <object/resource_dispatcher.h>
 #include <object/resource.h>
+#include <object/resource_dispatcher.h>
 #include <object/socket_dispatcher.h>
 #include <object/thread_dispatcher.h>
 #include <object/vm_address_region_dispatcher.h>
@@ -163,7 +164,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // grab a reference to the dispatcher
         fbl::RefPtr<ProcessDispatcher> process;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &process);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         // build the info structure
@@ -180,7 +181,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // grab a reference to the dispatcher
         fbl::RefPtr<ProcessDispatcher> process;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_ENUMERATE, &process);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         // Getting the list of threads is inherently racy (unless the
@@ -219,7 +220,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
     case ZX_INFO_JOB_PROCESSES: {
         fbl::RefPtr<JobDispatcher> job;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_ENUMERATE, &job);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         size_t max = buffer_size / sizeof(zx_koid_t);
@@ -251,7 +252,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // grab a reference to the dispatcher
         fbl::RefPtr<ThreadDispatcher> thread;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &thread);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         // build the info structure
@@ -271,7 +272,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // grab a reference to the dispatcher
         fbl::RefPtr<ThreadDispatcher> thread;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &thread);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         // build the info structure
@@ -291,7 +292,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // grab a reference to the dispatcher
         fbl::RefPtr<ThreadDispatcher> thread;
         auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &thread);
-        if (error < 0)
+        if (error != ZX_OK)
             return error;
 
         // build the info structure
@@ -311,9 +312,8 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // Grab a reference to the dispatcher. Only supports processes for
         // now, but could support jobs or threads in the future.
         fbl::RefPtr<ProcessDispatcher> process;
-        auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT,
-                                                 &process);
-        if (error < 0)
+        auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &process);
+        if (error != ZX_OK)
             return error;
 
         // Build the info structure.
@@ -390,7 +390,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // lookup the dispatcher from handle
         fbl::RefPtr<VmObjectDispatcher> vmo;
         zx_status_t status = up->GetDispatcher(handle, &vmo);
-        if (status < 0)
+        if (status != ZX_OK)
             return status;
         auto vmos = _buffer.reinterpret<zx_info_vmo_t>();
         zx_info_vmo_t entry;
@@ -446,7 +446,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         user_out_ptr<zx_info_cpu_stats_t> cpu_buf = _buffer.reinterpret<zx_info_cpu_stats_t>();
 
         for (unsigned int i = 0; i < static_cast<unsigned int>(num_to_copy); i++) {
-            const auto cpu = &percpu[i];
+            const auto* cpu = &percpu::Get(i);
 
             // copy the per cpu stats from the kernel percpu structure
             // NOTE: it's technically racy to read this without grabbing a lock
@@ -464,7 +464,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
                 bool is_idle = mp_is_cpu_idle(i);
                 if (is_idle) {
                     zx_duration_t recent_idle = zx_time_sub_time(
-                        current_time(), percpu[i].idle_thread.last_started_running);
+                        current_time(), cpu->idle_thread.last_started_running);
                     idle_time = zx_duration_add_duration(idle_time, recent_idle);
                 }
                 stats.idle_time = idle_time;
@@ -509,46 +509,54 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
         // TODO: figure out a better handle to hang this off to and push this copy code into
         // that dispatcher.
 
-        size_t state_count[VM_PAGE_STATE_COUNT_] = {};
-        pmm_count_total_states(state_count);
-
-        size_t total = 0;
-        for (int i = 0; i < VM_PAGE_STATE_COUNT_; i++) {
-            total += state_count[i];
+        // |get_count| returns an estimate so the sum of the counts may not equal the total.
+        uint64_t state_count[VM_PAGE_STATE_COUNT_] = {};
+        for (uint32_t i = 0; i < VM_PAGE_STATE_COUNT_; i++) {
+            state_count[i] = vm_page_t::get_count(vm_page_state(i));
         }
 
-        size_t unused_size = 0;
-        size_t free_heap_bytes = 0;
+        uint64_t unused_size = 0;
+        uint64_t free_heap_bytes = 0;
         heap_get_info(&unused_size, &free_heap_bytes);
 
         // Note that this intentionally uses uint64_t instead of
         // size_t in case we ever have a 32-bit userspace but more
         // than 4GB physical memory.
         zx_info_kmem_stats_t stats = {};
-        stats.total_bytes = total * PAGE_SIZE;
-        size_t other_bytes = stats.total_bytes;
+        stats.total_bytes = pmm_count_total_bytes();
+
+        // Holds the sum of bytes in the broken out states. This sum could be less than the total
+        // because we aren't counting all possible states (e.g. VM_PAGE_STATE_ALLOC). This sum could
+        // be greater than the total because per-state counts are approximate.
+        uint64_t sum_bytes = 0;
 
         stats.free_bytes = state_count[VM_PAGE_STATE_FREE] * PAGE_SIZE;
-        other_bytes -= stats.free_bytes;
+        sum_bytes += stats.free_bytes;
 
         stats.wired_bytes = state_count[VM_PAGE_STATE_WIRED] * PAGE_SIZE;
-        other_bytes -= stats.wired_bytes;
+        sum_bytes += stats.wired_bytes;
 
         stats.total_heap_bytes = state_count[VM_PAGE_STATE_HEAP] * PAGE_SIZE;
-        other_bytes -= stats.total_heap_bytes;
+        sum_bytes += stats.total_heap_bytes;
         stats.free_heap_bytes = free_heap_bytes;
 
         stats.vmo_bytes = state_count[VM_PAGE_STATE_OBJECT] * PAGE_SIZE;
-        other_bytes -= stats.vmo_bytes;
+        sum_bytes += stats.vmo_bytes;
 
         stats.mmu_overhead_bytes = state_count[VM_PAGE_STATE_MMU] * PAGE_SIZE;
-        other_bytes -= stats.mmu_overhead_bytes;
+        sum_bytes += stats.mmu_overhead_bytes;
 
         stats.ipc_bytes = state_count[VM_PAGE_STATE_IPC] * PAGE_SIZE;
-        other_bytes -= stats.ipc_bytes;
+        sum_bytes += stats.ipc_bytes;
 
-        // All other VM_PAGE_STATE_* counts get lumped into other_bytes.
-        stats.other_bytes = other_bytes;
+        // Is there unaccounted memory?
+        if (stats.total_bytes > sum_bytes) {
+            // Everything else gets counted as "other".
+            stats.other_bytes = stats.total_bytes - sum_bytes;
+        } else {
+            // One or more of our per-state counts may have been off. We'll ignore it.
+            stats.other_bytes = 0;
+        }
 
         return single_record_result(
             _buffer, buffer_size, _actual, _avail, &stats, sizeof(stats));
@@ -605,7 +613,7 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
             return status;
 
         zx_info_process_handle_stats_t info = {};
-        static_assert(fbl::count_of(info.handle_count) >= ZX_OBJ_TYPE_LAST,
+        static_assert(fbl::count_of(info.handle_count) >= ZX_OBJ_TYPE_UPPER_BOUND,
                       "Need room for each handle type.");
 
         process->ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
@@ -626,6 +634,19 @@ zx_status_t sys_object_get_info(zx_handle_t handle, uint32_t topic,
 
         zx_info_socket_t info = {};
         socket->GetInfo(&info);
+
+        return single_record_result(
+            _buffer, buffer_size, _actual, _avail, &info, sizeof(info));
+    }
+
+    case ZX_INFO_JOB: {
+        fbl::RefPtr<JobDispatcher> job;
+        auto error = up->GetDispatcherWithRights(handle, ZX_RIGHT_INSPECT, &job);
+        if (error != ZX_OK)
+            return error;
+
+        zx_info_job info = {};
+        job->GetInfo(&info);
 
         return single_record_result(
             _buffer, buffer_size, _actual, _avail, &info, sizeof(info));
@@ -692,6 +713,20 @@ zx_status_t sys_object_get_property(zx_handle_t handle_value, uint32_t property,
             return ZX_ERR_WRONG_TYPE;
         size_t value = socket->GetWriteThreshold();
         return _value.reinterpret<size_t>().copy_to_user(value);
+    }
+    case ZX_PROP_EXCEPTION_STATE: {
+        if (size < sizeof(uint32_t)) {
+            return ZX_ERR_BUFFER_TOO_SMALL;
+        }
+        auto exception = DownCastDispatcher<ExceptionDispatcher>(&dispatcher);
+        if (!exception) {
+            return ZX_ERR_WRONG_TYPE;
+        }
+
+        bool resume_on_close;
+        exception->GetResumeThreadOnClose(&resume_on_close);
+        return _value.reinterpret<uint32_t>().copy_to_user(
+            resume_on_close ? ZX_EXCEPTION_STATE_HANDLED : ZX_EXCEPTION_STATE_TRY_NEXT);
     }
     default:
         return ZX_ERR_INVALID_ARGS;
@@ -820,6 +855,28 @@ zx_status_t sys_object_set_property(zx_handle_t handle_value, uint32_t property,
         }
         return ZX_OK;
     }
+    case ZX_PROP_EXCEPTION_STATE: {
+        if (size < sizeof(uint32_t)) {
+            return ZX_ERR_BUFFER_TOO_SMALL;
+        }
+        auto exception = DownCastDispatcher<ExceptionDispatcher>(&dispatcher);
+        if (!exception) {
+            return ZX_ERR_WRONG_TYPE;
+        }
+        uint32_t value = 0;
+        zx_status_t status = _value.reinterpret<const uint32_t>().copy_from_user(&value);
+        if (status != ZX_OK) {
+            return status;
+        }
+        if (value == ZX_EXCEPTION_STATE_HANDLED) {
+            exception->SetResumeThreadOnClose(true);
+        } else if (value == ZX_EXCEPTION_STATE_TRY_NEXT) {
+            exception->SetResumeThreadOnClose(false);
+        } else {
+            return ZX_ERR_INVALID_ARGS;
+        }
+        return ZX_OK;
+    }
     }
 
     return ZX_ERR_INVALID_ARGS;
@@ -895,45 +952,4 @@ zx_status_t sys_object_get_child(zx_handle_t handle, uint64_t koid,
     }
 
     return ZX_ERR_WRONG_TYPE;
-}
-
-// zx_status_t zx_object_set_cookie
-zx_status_t sys_object_set_cookie(zx_handle_t handle, zx_handle_t hscope, uint64_t cookie) {
-    auto up = ProcessDispatcher::GetCurrent();
-
-    zx_koid_t scope = up->GetKoidForHandle(hscope);
-    if (scope == ZX_KOID_INVALID)
-        return ZX_ERR_BAD_HANDLE;
-
-    fbl::RefPtr<Dispatcher> dispatcher;
-    auto status = up->GetDispatcher(handle, &dispatcher);
-    if (status != ZX_OK)
-        return status;
-
-    return dispatcher->SetCookie(dispatcher->get_cookie_jar(), scope, cookie);
-}
-
-// zx_status_t zx_object_get_cookie
-zx_status_t sys_object_get_cookie(zx_handle_t handle, zx_handle_t hscope, user_out_ptr<uint64_t> _cookie) {
-    auto up = ProcessDispatcher::GetCurrent();
-
-    zx_koid_t scope = up->GetKoidForHandle(hscope);
-    if (scope == ZX_KOID_INVALID)
-        return ZX_ERR_BAD_HANDLE;
-
-    fbl::RefPtr<Dispatcher> dispatcher;
-    auto status = up->GetDispatcher(handle, &dispatcher);
-    if (status != ZX_OK)
-        return status;
-
-    uint64_t cookie;
-    status = dispatcher->GetCookie(dispatcher->get_cookie_jar(), scope, &cookie);
-    if (status != ZX_OK)
-        return status;
-
-    status = _cookie.copy_to_user(cookie);
-    if (status != ZX_OK)
-        return status;
-
-    return ZX_OK;
 }

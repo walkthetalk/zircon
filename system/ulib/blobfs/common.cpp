@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits>
+#include <safemath/checked_math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,11 @@
 #include <fs/trace.h>
 
 #ifdef __Fuchsia__
-#include <fs/fvm.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <fuchsia/hardware/block/volume/c/fidl.h>
+#include <fvm/client.h>
+#include <lib/fdio/directory.h>
+#include <lib/fzl/fdio.h>
 #endif
 
 #include <blobfs/common.h>
@@ -27,6 +32,40 @@ using digest::Digest;
 using digest::MerkleTree;
 
 namespace blobfs {
+
+namespace {
+// Dumps the content of superblock to |out|. Does nothing if |out| is nullptr.
+void DumpSuperblock(const Superblock& info, FILE* out) {
+    if (out == nullptr) {
+        return;
+    }
+
+    fprintf(out,
+            "info.magic0: %" PRIu64 "\n"
+            "info.magic1: %" PRIu64 "\n"
+            "info.version: %" PRIu32 "\n"
+            "info.flags: %" PRIu32 "\n"
+            "info.block_size: %" PRIu32 "\n"
+            "info.data_block_count: %" PRIu64 "\n"
+            "info.journal_block_count: %" PRIu64 "\n"
+            "info.inode_count: %" PRIu64 "\n"
+            "info.alloc_block_count: %" PRIu64 "\n"
+            "info.alloc_inode_count: %" PRIu64 "\n"
+            "info.blob_header_next: %" PRIu64 "\n"
+            "info.slice_size: %" PRIu64 "\n"
+            "info.vslice_count: %" PRIu64 "\n"
+            "info.abm_slices: %" PRIu32 "\n"
+            "info.ino_slices: %" PRIu32 "\n"
+            "info.dat_slices: %" PRIu32 "\n"
+            "info.journal_slices: %" PRIu32 "\n",
+            info.magic0, info.magic1, info.version, info.flags, info.block_size,
+            info.data_block_count, info.journal_block_count, info.inode_count,
+            info.alloc_block_count, info.alloc_inode_count, info.blob_header_next, info.slice_size,
+            info.vslice_count, info.abm_slices, info.ino_slices, info.dat_slices,
+            info.journal_slices);
+}
+
+} // namespace
 
 // Number of blocks reserved for the Merkle Tree
 uint32_t MerkleTreeBlocks(const Inode& blobNode) {
@@ -46,15 +85,18 @@ zx_status_t CheckSuperblock(const Superblock* info, uint64_t max) {
     if (info->version != kBlobfsVersion) {
         FS_TRACE_ERROR("blobfs: FS Version: %08x. Driver version: %08x\n", info->version,
                        kBlobfsVersion);
+        DumpSuperblock(*info, stderr);
         return ZX_ERR_INVALID_ARGS;
     }
     if (info->block_size != kBlobfsBlockSize) {
         FS_TRACE_ERROR("blobfs: bsz %u unsupported\n", info->block_size);
+        DumpSuperblock(*info, stderr);
         return ZX_ERR_INVALID_ARGS;
     }
     if ((info->flags & kBlobFlagFVM) == 0) {
         if (TotalBlocks(*info) > max) {
             FS_TRACE_ERROR("blobfs: too large for device\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         }
     } else {
@@ -64,9 +106,11 @@ zx_status_t CheckSuperblock(const Superblock* info, uint64_t max) {
         size_t abm_blocks_allocated = info->abm_slices * blocks_per_slice;
         if (abm_blocks_needed > abm_blocks_allocated) {
             FS_TRACE_ERROR("blobfs: Not enough slices for block bitmap\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         } else if (abm_blocks_allocated + BlockMapStartBlock(*info) >= NodeMapStartBlock(*info)) {
             FS_TRACE_ERROR("blobfs: Block bitmap collides into node map\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         }
 
@@ -74,9 +118,11 @@ zx_status_t CheckSuperblock(const Superblock* info, uint64_t max) {
         size_t ino_blocks_allocated = info->ino_slices * blocks_per_slice;
         if (ino_blocks_needed > ino_blocks_allocated) {
             FS_TRACE_ERROR("blobfs: Not enough slices for node map\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         } else if (ino_blocks_allocated + NodeMapStartBlock(*info) >= DataStartBlock(*info)) {
             FS_TRACE_ERROR("blobfs: Node bitmap collides into data blocks\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         }
 
@@ -84,18 +130,22 @@ zx_status_t CheckSuperblock(const Superblock* info, uint64_t max) {
         size_t dat_blocks_allocated = info->dat_slices * blocks_per_slice;
         if (dat_blocks_needed < kStartBlockMinimum) {
             FS_TRACE_ERROR("blobfs: Partition too small; no space left for data blocks\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         } else if (dat_blocks_needed > dat_blocks_allocated) {
             FS_TRACE_ERROR("blobfs: Not enough slices for data blocks\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         } else if (dat_blocks_allocated + DataStartBlock(*info) >
                    std::numeric_limits<uint32_t>::max()) {
             FS_TRACE_ERROR("blobfs: Data blocks overflow uint32\n");
+            DumpSuperblock(*info, stderr);
             return ZX_ERR_INVALID_ARGS;
         }
     }
     if (info->blob_header_next != 0) {
         FS_TRACE_ERROR("blobfs: linked blob headers not yet supported\n");
+        DumpSuperblock(*info, stderr);
         return ZX_ERR_INVALID_ARGS;
     }
     return ZX_OK;
@@ -103,11 +153,18 @@ zx_status_t CheckSuperblock(const Superblock* info, uint64_t max) {
 
 zx_status_t GetBlockCount(int fd, uint64_t* out) {
 #ifdef __Fuchsia__
-    block_info_t info;
-    ssize_t r;
-    if ((r = ioctl_block_get_info(fd, &info)) < 0) {
-        return static_cast<zx_status_t>(r);
+    fzl::UnownedFdioCaller caller(fd);
+    fuchsia_hardware_block_BlockInfo info;
+    zx_status_t status;
+    zx_status_t io_status = fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(), &status,
+                                                                &info);
+    if (io_status != ZX_OK) {
+        return io_status;
     }
+    if (status != ZX_OK) {
+        return status;
+    }
+
     *out = (info.block_size * info.block_count) / kBlobfsBlockSize;
 #else
     struct stat s;
@@ -143,6 +200,20 @@ zx_status_t writeblk(int fd, uint64_t bno, const void* data) {
         return ZX_ERR_IO;
     }
     return ZX_OK;
+}
+
+uint32_t BlocksRequiredForInode(uint64_t inode_count) {
+    return safemath::checked_cast<uint32_t>(fbl::round_up(inode_count, kBlobfsInodesPerBlock) /
+                                            kBlobfsInodesPerBlock);
+}
+
+uint32_t BlocksRequiredForBits(uint64_t bit_count) {
+    return safemath::checked_cast<uint32_t>(fbl::round_up(bit_count, kBlobfsBlockBits) /
+                                            kBlobfsBlockBits);
+}
+
+uint32_t SuggestJournalBlocks(uint32_t current, uint32_t available) {
+    return current + available;
 }
 
 int Mkfs(int fd, uint64_t block_count) {
@@ -195,10 +266,19 @@ int Mkfs(int fd, uint64_t block_count) {
         info.data_block_count = 0;
     }
 
+    zx_status_t status;
 #ifdef __Fuchsia__
-    fvm_info_t fvm_info;
+    fuchsia_hardware_block_volume_VolumeInfo fvm_info;
+    fzl::UnownedFdioCaller caller(fd);
 
-    if (ioctl_block_fvm_query(fd, &fvm_info) >= 0) {
+    // Querying may be used to confirm if the underlying connection is capable of
+    // communicating the FVM protocol. Clone the connection, since if the block
+    // device does NOT speak the Volume protocol, the connection is terminated.
+    zx::channel connection(fdio_service_clone(caller.borrow_channel()));
+
+    zx_status_t io_status;
+    io_status = fuchsia_hardware_block_volume_VolumeQuery(connection.get(), &status, &fvm_info);
+    if (io_status == ZX_OK && status == ZX_OK) {
         info.slice_size = fvm_info.slice_size;
         info.flags |= kBlobFlagFVM;
 
@@ -207,41 +287,48 @@ int Mkfs(int fd, uint64_t block_count) {
             return -1;
         }
 
-        if (fs::fvm_reset_volume_slices(fd) != ZX_OK) {
+        if (fvm::ResetAllSlices(fd) != ZX_OK) {
             FS_TRACE_ERROR("blobfs mkfs: Failed to reset slices\n");
             return -1;
         }
 
         const size_t kBlocksPerSlice = info.slice_size / kBlobfsBlockSize;
 
-        extend_request_t request;
-        request.length = 1;
-        request.offset = kFVMBlockMapStart / kBlocksPerSlice;
-        if (ioctl_block_fvm_extend(fd, &request) < 0) {
+        uint64_t offset = kFVMBlockMapStart / kBlocksPerSlice;
+        uint64_t length = 1;
+        io_status = fuchsia_hardware_block_volume_VolumeExtend(caller.borrow_channel(), offset,
+                                                               length, &status);
+        if (io_status != ZX_OK || status != ZX_OK) {
             FS_TRACE_ERROR("blobfs mkfs: Failed to allocate block map\n");
             return -1;
         }
 
-        request.offset = kFVMNodeMapStart / kBlocksPerSlice;
-        if (ioctl_block_fvm_extend(fd, &request) < 0) {
+        offset = kFVMNodeMapStart / kBlocksPerSlice;
+        io_status = fuchsia_hardware_block_volume_VolumeExtend(caller.borrow_channel(), offset,
+                                                               length, &status);
+        if (io_status != ZX_OK || status != ZX_OK) {
             FS_TRACE_ERROR("blobfs mkfs: Failed to allocate node map\n");
             return -1;
         }
 
         // Allocate the minimum number of journal blocks in FVM.
-        request.offset = kFVMJournalStart / kBlocksPerSlice;
-        request.length = fbl::round_up(kDefaultJournalBlocks, kBlocksPerSlice) / kBlocksPerSlice;
-        info.journal_slices = static_cast<uint32_t>(request.length);
-        if (ioctl_block_fvm_extend(fd, &request) < 0) {
+        offset = kFVMJournalStart / kBlocksPerSlice;
+        length = fbl::round_up(kDefaultJournalBlocks, kBlocksPerSlice) / kBlocksPerSlice;
+        info.journal_slices = static_cast<uint32_t>(length);
+        io_status = fuchsia_hardware_block_volume_VolumeExtend(caller.borrow_channel(), offset,
+                                                               length, &status);
+        if (io_status != ZX_OK || status != ZX_OK) {
             FS_TRACE_ERROR("blobfs mkfs: Failed to allocate journal blocks\n");
             return -1;
         }
 
         // Allocate the minimum number of data blocks in the FVM.
-        request.offset = kFVMDataStart / kBlocksPerSlice;
-        request.length = fbl::round_up(kMinimumDataBlocks, kBlocksPerSlice) / kBlocksPerSlice;
-        info.dat_slices = static_cast<uint32_t>(request.length);
-        if (ioctl_block_fvm_extend(fd, &request) < 0) {
+        offset = kFVMDataStart / kBlocksPerSlice;
+        length = fbl::round_up(kMinimumDataBlocks, kBlocksPerSlice) / kBlocksPerSlice;
+        info.dat_slices = static_cast<uint32_t>(length);
+        io_status = fuchsia_hardware_block_volume_VolumeExtend(caller.borrow_channel(), offset,
+                                                               length, &status);
+        if (io_status != ZX_OK || status != ZX_OK) {
             FS_TRACE_ERROR("blobfs mkfs: Failed to allocate data blocks\n");
             return -1;
         }
@@ -302,7 +389,6 @@ int Mkfs(int fd, uint64_t block_count) {
     }
 
     // All in-memory structures have been created successfully. Dump everything to disk.
-    zx_status_t status;
     char block[kBlobfsBlockSize];
     memset(block, 0, sizeof(block));
 

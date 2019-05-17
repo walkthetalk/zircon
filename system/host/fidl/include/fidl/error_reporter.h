@@ -6,16 +6,19 @@
 #define ZIRCON_SYSTEM_HOST_FIDL_INCLUDE_FIDL_ERROR_REPORTER_H_
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "source_location.h"
-#include "string_view.h"
 #include "token.h"
 
 namespace fidl {
 
 class ErrorReporter {
 public:
+    ErrorReporter(bool warnings_as_errors = false)
+        : warnings_as_errors_(warnings_as_errors) {}
+
     class Counts {
     public:
         Counts(const ErrorReporter* reporter)
@@ -24,22 +27,38 @@ public:
               num_warnings_(reporter->warnings().size()) {}
         bool NoNewErrors() { return num_errors_ == reporter_->errors().size(); }
         bool NoNewWarning() { return num_warnings_ == reporter_->warnings().size(); }
+
     private:
         const ErrorReporter* reporter_;
         const size_t num_errors_;
         const size_t num_warnings_;
     };
 
-    void ReportError(const SourceLocation& location, StringView message);
-    void ReportError(const Token& token, StringView message);
-    void ReportError(StringView message);
-    void ReportWarning(const SourceLocation& location, StringView message);
+    void ReportErrorWithSquiggle(const SourceLocation& location,
+                                 std::string_view message);
+    void ReportError(const SourceLocation& location, std::string_view message) {
+        ReportError(&location, message);
+    }
+    void ReportError(const SourceLocation* maybe_location, std::string_view message);
+    void ReportError(const Token& token, std::string_view message);
+    void ReportError(std::string_view message);
+    void ReportWarningWithSquiggle(const SourceLocation& location,
+                                   std::string_view message);
+    void ReportWarning(const SourceLocation& location, std::string_view message) {
+        ReportWarning(&location, message);
+    }
+    void ReportWarning(const SourceLocation* maybe_location, std::string_view message);
     void PrintReports();
-    Counts Checkpoint() const { return Counts(this); };
-    const std::vector<std::string>& errors() const { return errors_; };
-    const std::vector<std::string>& warnings() const { return warnings_; };
+    Counts Checkpoint() const { return Counts(this); }
+    const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& warnings() const { return warnings_; }
+    void set_warnings_as_errors(bool value) { warnings_as_errors_ = value; }
 
 private:
+    void AddError(std::string formatted_message);
+    void AddWarning(std::string formatted_message);
+
+    bool warnings_as_errors_;
     std::vector<std::string> errors_;
     std::vector<std::string> warnings_;
 };

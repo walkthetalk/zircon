@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef DDK_PLATFORM_DEFS_H_
+#define DDK_PLATFORM_DEFS_H_
 
 #include <zircon/compiler.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // Vendor, Product and Device IDs for generic platform drivers
 #define PDEV_VID_GENERIC            0
@@ -23,7 +24,7 @@ __BEGIN_CDECLS;
 #define PDEV_DID_DW_PCIE            10  // Designware PCIe
 #define PDEV_DID_LED2472G           11  // RPi Sense Hat LED2472G
 #define PDEV_DID_GPU_VSL_GC         12  // Verisilicon GC series GPU
-#define PDEV_DID_ARM_MALI_INIT      13  // ARM MALI GPU (Zircon)
+// 13 unused
 #define PDEV_DID_OPTEE              14  // OP-TEE OS Driver
 #define PDEV_DID_RTC_FALLBACK       15  // Synthetic RTC device
 #define PDEV_DID_ETH_MAC            16  // Ethernet MAC
@@ -38,6 +39,9 @@ __BEGIN_CDECLS;
 #define PDEV_DID_BOSCH_BMA253       25  // Bosch BMA253 acceleration sensor
 #define PDEV_DID_SG_MICRO_SGM37603A 26  // SG Micro SGM37603A backlight driver
 #define PDEV_DID_SYSMEM             27  // Sysmem driver
+#define PDEV_DID_GPIO_LIGHT         28  // Driver for controlling lights via GPIOs
+#define PDEV_DID_CPU_TRACE          29  // CPU tracing driver
+#define PDEV_DID_DW_DSI             30  // Designware DSI
 
 // QEMU emulator
 #define PDEV_VID_QEMU               1
@@ -52,13 +56,14 @@ __BEGIN_CDECLS;
 #define PDEV_DID_HIKEY960_USB       3
 #define PDEV_DID_HI_DISPLAY         4
 #define PDEV_DID_HISILICON_UFS      5
+#define PDEV_DID_HI3660_GPIO        6
 
 // Google
 #define PDEV_VID_GOOGLE             3
 #define PDEV_PID_GAUSS              1
 #define PDEV_PID_MACHINA            2
 #define PDEV_PID_ASTRO              3
-#define PDEV_PID_MADRONE            4
+// 4 unused
 #define PDEV_PID_SHERLOCK           5
 #define PDEV_PID_CLEO               6
 #define PDEV_PID_EAGLE              7
@@ -79,38 +84,40 @@ __BEGIN_CDECLS;
 // Amlogic
 #define PDEV_VID_AMLOGIC            5
 #define PDEV_PID_AMLOGIC_A113       1
-#define PDEV_PID_AMLOGIC_S905X      2
-#define PDEV_PID_AMLOGIC_S912       3
-#define PDEV_PID_AMLOGIC_S905       4
-#define PDEV_PID_AMLOGIC_S905D2     5
-#define PDEV_PID_AMLOGIC_T931       6
+#define PDEV_PID_AMLOGIC_S912       2
+#define PDEV_PID_AMLOGIC_S905D2     3
+#define PDEV_PID_AMLOGIC_T931       4
 
 #define PDEV_DID_AMLOGIC_GPIO       1
 #define PDEV_DID_AMLOGIC_I2C        2
 #define PDEV_DID_AMLOGIC_UART       3
 #define PDEV_DID_AMLOGIC_AXG_CLK    4
 #define PDEV_DID_AMLOGIC_GXL_CLK    5
-#define PDEV_DID_AMLOGIC_SD_EMMC    6
-#define PDEV_DID_AMLOGIC_ETH        7
-#define PDEV_DID_AMLOGIC_THERMAL    8
-#define PDEV_DID_AMLOGIC_MAILBOX    9
-#define PDEV_DID_AMLOGIC_SCPI       10
-#define PDEV_DID_AMLOGIC_DISPLAY    11
-#define PDEV_DID_AMLOGIC_VIDEO      12
-#define PDEV_DID_AMLOGIC_RAW_NAND   13
-#define PDEV_DID_AMLOGIC_CANVAS     14
-#define PDEV_DID_AMLOGIC_G12A_CLK   15
-#define PDEV_DID_AMLOGIC_TDM        16
-#define PDEV_DID_ASTRO_PDM          17
-#define PDEV_DID_AMLOGIC_G12B_CLK   18
-#define PDEV_DID_AMLOGIC_MIPI       19
-#define PDEV_DID_SHERLOCK_PDM       20
-
+#define PDEV_DID_AMLOGIC_SD_EMMC_A  6
+#define PDEV_DID_AMLOGIC_SD_EMMC_B  7
+#define PDEV_DID_AMLOGIC_SD_EMMC_C  8
+#define PDEV_DID_AMLOGIC_ETH        9
+#define PDEV_DID_AMLOGIC_THERMAL    10
+#define PDEV_DID_AMLOGIC_MAILBOX    11
+#define PDEV_DID_AMLOGIC_SCPI       12
+#define PDEV_DID_AMLOGIC_DISPLAY    13
+#define PDEV_DID_AMLOGIC_VIDEO      14
+#define PDEV_DID_AMLOGIC_RAW_NAND   15
+#define PDEV_DID_AMLOGIC_CANVAS     16
+#define PDEV_DID_AMLOGIC_G12A_CLK   17
+#define PDEV_DID_AMLOGIC_TDM        18
+#define PDEV_DID_ASTRO_PDM          19
+#define PDEV_DID_AMLOGIC_G12B_CLK   20
+#define PDEV_DID_AMLOGIC_MIPI_CSI   21
+#define PDEV_DID_SHERLOCK_PDM       22
+#define PDEV_DID_AMLOGIC_MALI_INIT  23
 
 // Broadcom
 #define PDEV_VID_BROADCOM           6
 #define PDEV_PID_BCM4356            1
 #define PDEV_PID_BCM43458           2
+
+#define PDEV_DID_BCM_WIFI           1
 
 //Hardkernel
 #define PDEV_VID_HARDKERNEL         7
@@ -118,12 +125,11 @@ __BEGIN_CDECLS;
 
 // Intel
 #define PDEV_VID_INTEL              8
-#define PDEV_DID_INTEL_CPU_TRACE    1 // Intel CPU tracing driver
+#define PDEV_PID_X86                1
 
 // NXP
 #define PDEV_VID_NXP                9
-#define PDEV_PID_IMX8MEVK           1
-#define PDEV_PID_IMX8MMEVK          2
+#define PDEV_PID_IMX8MMEVK          1
 
 #define PDEV_DID_IMX_GPIO           1
 #define PDEV_DID_IMX_DISPLAY        2
@@ -147,15 +153,18 @@ __BEGIN_CDECLS;
 #define PDEV_VID_MEDIATEK           13
 #define PDEV_PID_MEDIATEK_8167S_REF 1
 #define PDEV_DID_MEDIATEK_GPIO      1
-#define PDEV_DID_MEDIATEK_EMMC      2
-#define PDEV_DID_MEDIATEK_DISPLAY   3
-#define PDEV_DID_MEDIATEK_I2C       4
-#define PDEV_DID_MEDIATEK_SDIO      5
-#define PDEV_DID_MEDIATEK_GPU       6
-#define PDEV_DID_MEDIATEK_CLK       7
-#define PDEV_DID_MEDIATEK_THERMAL   8
-#define PDEV_DID_MEDIATEK_AUDIO_OUT 9
-#define PDEV_DID_MEDIATEK_AUDIO_IN  10
+#define PDEV_DID_MEDIATEK_MSDC0     2
+#define PDEV_DID_MEDIATEK_MSDC1     3
+#define PDEV_DID_MEDIATEK_MSDC2     4
+#define PDEV_DID_MEDIATEK_DISPLAY   5
+#define PDEV_DID_MEDIATEK_I2C       6
+#define PDEV_DID_MEDIATEK_GPU       7
+#define PDEV_DID_MEDIATEK_CLK       8
+#define PDEV_DID_MEDIATEK_THERMAL   9
+#define PDEV_DID_MEDIATEK_AUDIO_OUT 10
+#define PDEV_DID_MEDIATEK_AUDIO_IN  11
+#define PDEV_DID_MEDIATEK_DSI       12
+#define PDEV_DID_MEDIATEK_POWER     13
 
 // Sony
 #define PDEV_VID_SONY               14
@@ -173,12 +182,23 @@ __BEGIN_CDECLS;
 // Test
 #define PDEV_VID_TEST               17
 #define PDEV_PID_PBUS_TEST          1
+#define PDEV_PID_INTEGRATION_TEST   2
+#define PDEV_PID_USB_VBUS_TEST      3
+#define PDEV_PID_HIDCTL_TEST        4
+#define PDEV_PID_VCAMERA_TEST       5
+#define PDEV_PID_LIBDRIVER_TEST     6
 
 #define PDEV_DID_TEST_PARENT        1
 #define PDEV_DID_TEST_CHILD_1       2
 #define PDEV_DID_TEST_CHILD_2       3
 #define PDEV_DID_TEST_CHILD_3       4
 #define PDEV_DID_TEST_GPIO          5
+#define PDEV_DID_TEST_COMPOSITE     6
+#define PDEV_DID_TEST_CLOCK         7
+#define PDEV_DID_TEST_I2C           8
+#define PDEV_DID_TEST_POWER         9
+#define PDEV_DID_TEST_CHILD_4       10
+#define PDEV_DID_TEST_VCAMERA       11
 
 // ARM
 #define PDEV_VID_ARM                18
@@ -188,5 +208,17 @@ __BEGIN_CDECLS;
 // Qualcomm
 #define PDEV_VID_QUALCOMM           19
 #define PDEV_PID_QUALCOMM_MSM8X53    1
+#define PDEV_DID_QUALCOMM_GPIO       1
+#define PDEV_DID_QUALCOMM_PIL        2
+#define PDEV_DID_QUALCOMM_SDC1       3
+#define PDEV_DID_QUALCOMM_CLOCK      4
+#define PDEV_DID_QUALCOMM_POWER      5
 
-__END_CDECLS;
+// Synaptics
+#define PDEV_VID_SYNAPTICS          20
+#define PDEV_PID_SYNAPTICS_AS370     1
+#define PDEV_DID_SYNAPTICS_GPIO      2
+
+__END_CDECLS
+
+#endif  // DDK_PLATFORM_DEFS_H_

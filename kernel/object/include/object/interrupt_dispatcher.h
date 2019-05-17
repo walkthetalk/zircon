@@ -31,7 +31,7 @@ class InterruptDispatcher
 public:
     InterruptDispatcher& operator=(const InterruptDispatcher&) = delete;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_INTERRUPT; }
-    uint32_t get_flags() const { return flags_; };
+    uint32_t get_flags() const { return flags_; }
 
     zx_status_t WaitForInterrupt(zx_time_t* out_timestamp);
     zx_status_t Trigger(zx_time_t timestamp);
@@ -43,6 +43,8 @@ public:
         return ZX_ERR_NOT_SUPPORTED;
     }
 
+    void on_zero_handles() final;
+
 protected:
     virtual void MaskInterrupt() = 0;
     virtual void UnmaskInterrupt() = 0;
@@ -50,7 +52,6 @@ protected:
     virtual bool HasVcpu() const TA_REQ(spinlock_) { return false; }
 
     InterruptDispatcher();
-    void on_zero_handles() final;
     void Signal() {
         event_signal_etc(&event_, true, ZX_OK);
     }

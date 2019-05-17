@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FS_PSEUDO_DIR_H_
+#define FS_PSEUDO_DIR_H_
 
 #include <fbl/intrusive_wavl_tree.h>
 #include <fbl/macros.h>
@@ -47,6 +48,14 @@ public:
     // Returns |ZX_ERR_NOT_FOUND| if there is no node with the given name.
     zx_status_t RemoveEntry(fbl::StringPiece name);
 
+    // An extension of |RemoveEntry| which additionally verifies
+    // that the target vnode is |vn|.
+    //
+    // Returns |ZX_OK| on success.
+    // Returns |ZX_ERR_NOT_FOUND| if there is no node with the given name/vn
+    // pair.
+    zx_status_t RemoveEntry(fbl::StringPiece name, fs::Vnode* vn);
+
     // Removes all directory entries.
     void RemoveAllEntries();
 
@@ -62,6 +71,8 @@ public:
     void Notify(fbl::StringPiece name, unsigned event) final;
     zx_status_t WatchDir(fs::Vfs* vfs, uint32_t mask, uint32_t options, zx::channel watcher) final;
     zx_status_t Readdir(vdircookie_t* cookie, void* dirents, size_t len, size_t* out_actual) final;
+    bool IsDirectory() const final { return true; }
+    zx_status_t GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) final;
 
 private:
     static constexpr uint64_t kDotId = 1u;
@@ -102,10 +113,10 @@ private:
             return entry.name();
         }
         static bool LessThan(const fbl::String& key1, const fbl::String& key2) {
-          return key1 < key2;
+            return key1 < key2;
         }
         static bool EqualTo(const fbl::String& key1, const fbl::String& key2) {
-          return key1 == key2;
+            return key1 == key2;
         }
     };
 
@@ -141,3 +152,5 @@ private:
 };
 
 } // namespace fs
+
+#endif // FS_PSEUDO_DIR_H_

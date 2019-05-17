@@ -2,11 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_HW_USB_HUB_H_
+#define SYSROOT_ZIRCON_HW_USB_HUB_H_
 
 // clang-format off
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 // Hub request types
 #define USB_RECIP_HUB   (USB_TYPE_CLASS | USB_RECIP_DEVICE)
@@ -111,4 +112,6 @@ typedef struct {
 #define USB_C_PORT_TEST_MODE        (1 << 11)   // USB 2.0 only
 #define USB_C_PORT_INDICATOR_CONTROL (1 << 12)   // USB 2.0 only
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_HW_USB_HUB_H_

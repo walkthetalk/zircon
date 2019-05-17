@@ -41,6 +41,7 @@ struct {
 };
 
 // Commands struct.
+// clang-format off
 struct {
     const char* name;
     Command command;
@@ -48,25 +49,32 @@ struct {
     ArgType arg_type;
     const char* help;
 } CMDS[] = {
-    {"create",   Command::kMkfs,     O_RDWR | O_CREAT, ArgType::kOptional,
+    {"create",         Command::kMkfs,               O_RDWR | O_CREAT, ArgType::kOptional,
         "Initialize filesystem."},
-    {"mkfs",     Command::kMkfs,     O_RDWR | O_CREAT, ArgType::kOptional,
+    {"mkfs",           Command::kMkfs,               O_RDWR | O_CREAT, ArgType::kOptional,
         "Initialize filesystem."},
-    {"check",    Command::kFsck,     O_RDONLY,         ArgType::kNone,
+    {"check",          Command::kFsck,               O_RDONLY,         ArgType::kNone,
         "Check filesystem integrity."},
-    {"fsck",     Command::kFsck,     O_RDONLY,         ArgType::kNone,
+    {"fsck",           Command::kFsck,               O_RDONLY,         ArgType::kNone,
         "Check filesystem integrity."},
-    {"add",      Command::kAdd,      O_RDWR,           ArgType::kMany,
+    {"used-data-size", Command::kUsedDataSize,       O_RDONLY,         ArgType::kNone,
+        "Prints total bytes consumed by data."},
+    {"used-inodes",    Command::kUsedInodes,         O_RDONLY,         ArgType::kNone,
+        "Prints number of allocated inodes."},
+    {"used-size",      Command::kUsedSize,           O_RDONLY,         ArgType::kNone,
+        "Prints total bytes used by data and reserved for fs internal data structures."},
+    {"add",            Command::kAdd,                O_RDWR,           ArgType::kMany,
         "Add files to an fs image (additional arguments required)."},
-    {"cp",       Command::kCp,       O_RDWR,           ArgType::kTwo,
+    {"cp",             Command::kCp,                 O_RDWR,           ArgType::kTwo,
         "Copy to/from fs."},
-    {"mkdir",    Command::kMkdir,    O_RDWR,           ArgType::kOne,
+    {"mkdir",          Command::kMkdir,              O_RDWR,           ArgType::kOne,
         "Create directory."},
-    {"ls",       Command::kLs,       O_RDONLY,         ArgType::kOne,
+    {"ls",             Command::kLs,                 O_RDONLY,         ArgType::kOne,
         "List contents of directory."},
-    {"manifest", Command::kManifest, O_RDWR,           ArgType::kOne,
+    {"manifest",       Command::kManifest,           O_RDWR,           ArgType::kOne,
         "Add files to fs as specified in manifest (deprecated)."},
 };
+// clang-format on
 
 // Arguments struct.
 struct {
@@ -245,9 +253,17 @@ zx_status_t FsCreator::ProcessArgs(int argc, char** argv) {
             break;
         case 'o':
             offset_ = atoll(optarg);
+            if (offset_ < 0) {
+                fprintf(stderr, "error: offset < 0\n");
+                return ZX_ERR_INVALID_ARGS;
+            }
             break;
         case 'l':
             length_ = atoll(optarg);
+            if (length_ < 0) {
+                fprintf(stderr, "error: length < 0\n");
+                return ZX_ERR_INVALID_ARGS;
+            }
             break;
         case 'c':
             compress_ = true;
@@ -433,7 +449,8 @@ zx_status_t FsCreator::AppendDepfile(const char* str) {
 
     // this code makes assumptions about the size of atomic writes on target
     // platforms which currently hold true, but are not part of e.g. POSIX.
-    if (write(depfile_.get(), buf, len) != len) {
+    ssize_t result = write(depfile_.get(), buf, len);
+    if (result < 0 || static_cast<size_t>(result) != len) {
         fprintf(stderr, "error: depfile append error\n");
         return ZX_ERR_IO;
     }
@@ -451,6 +468,12 @@ zx_status_t FsCreator::RunCommand() {
         return Mkfs();
     case Command::kFsck:
         return Fsck();
+    case Command::kUsedDataSize:
+        return UsedDataSize();
+    case Command::kUsedInodes:
+        return UsedInodes();
+    case Command::kUsedSize:
+        return UsedSize();
     case Command::kAdd:
     case Command::kCp:
     case Command::kManifest:
@@ -496,7 +519,7 @@ zx_status_t FsCreator::ParseSize(char* device, size_t* out) {
             return ZX_ERR_INVALID_ARGS;
         }
 
-        if (length_ && offset_ + length_ > size) {
+        if (length_ && static_cast<size_t>(offset_ + length_) > size) {
             fprintf(stderr, "Must specify size > offset + length\n");
             return ZX_ERR_INVALID_ARGS;
         }
@@ -507,11 +530,6 @@ zx_status_t FsCreator::ParseSize(char* device, size_t* out) {
 }
 
 zx_status_t FsCreator::ResizeFile(off_t requested_size, struct stat stats) {
-    if (command_ != Command::kMkfs) {
-        // This method is only valid on creation of the fs image.
-        return ZX_OK;
-    }
-
     // Calculate the total required size for the fs image, given all files that have been processed
     // up to this point.
     off_t required_size;

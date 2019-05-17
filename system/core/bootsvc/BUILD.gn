@@ -1,0 +1,95 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+executable("bootsvc") {
+  sources = [
+    "bootfs-loader-service.cpp",
+    "bootfs-loader-service.h",
+    "bootfs-service.cpp",
+    "bootfs-service.h",
+    "main.cpp",
+    "svcfs-service.cpp",
+    "svcfs-service.h",
+  ]
+  deps = [
+    ":util",
+    "$zx/system/fidl/fuchsia-boot:c",
+    "$zx/system/fidl/fuchsia-io:c",
+    "$zx/system/ulib/async:async-cpp",
+    "$zx/system/ulib/async:async-default",
+    "$zx/system/ulib/async-loop",
+    "$zx/system/ulib/async-loop:async-loop-cpp",
+    "$zx/system/ulib/bootfs",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fdio",
+    "$zx/system/ulib/fidl",
+    "$zx/system/ulib/fidl-async",
+    "$zx/system/ulib/fs",
+    "$zx/system/ulib/launchpad",
+    "$zx/system/ulib/loader-service",
+    "$zx/system/ulib/memfs:memfs-cpp.static",
+    "$zx/system/ulib/memfs:static",
+    "$zx/system/ulib/trace",
+    "$zx/system/ulib/trace-engine",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zx",
+    "$zx/third_party/ulib/lz4",
+  ]
+
+  data_deps = [
+    "$zx/system/core/devmgr/devcoordinator",
+  ]
+}
+
+source_set("util") {
+  sources = [
+    "util.cpp",
+    "util.h",
+  ]
+  deps = [
+    "$zx/third_party/ulib/safemath",
+  ]
+  public_deps = [
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fs",
+    "$zx/system/ulib/zx",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  data_deps = [
+    ":bootsvc-unit-test",
+    ":bootsvc-integration-test",
+  ]
+}
+
+test("bootsvc-unit-test") {
+  output_name = "bootsvc-unit-test"
+  sources = [
+    "unit-test.cpp",
+  ]
+  deps = [
+    ":util",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/unittest",
+  ]
+}
+
+executable("bootsvc-integration-test") {
+  testonly = true
+  sources = [
+    "integration-test.cpp",
+  ]
+  deps = [
+    ":util",
+    "$zx/system/fidl/fuchsia-boot:c",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/fdio",
+    "$zx/system/ulib/unittest",
+    "$zx/system/ulib/zircon",
+    "$zx/system/ulib/zx",
+    "$zx/third_party/ulib/safemath",
+  ]
+}

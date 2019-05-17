@@ -8,10 +8,12 @@
 
 #include <vm/vm_aspace.h>
 #include <vm/vm_object.h>
+#include <vm/vm_object_paged.h>
 
 #include <zircon/rights.h>
 
 #include <fbl/alloc_checker.h>
+#include <lib/counters.h>
 
 #include <assert.h>
 #include <err.h>
@@ -19,6 +21,27 @@
 #include <trace.h>
 
 #define LOCAL_TRACE 0
+
+KCOUNTER(dispatcher_vmo_create_count, "dispatcher.vmo.create")
+KCOUNTER(dispatcher_vmo_destroy_count, "dispatcher.vmo.destroy")
+
+zx_status_t VmObjectDispatcher::parse_create_syscall_flags(uint32_t flags, uint32_t* out_flags) {
+    uint32_t res = 0;
+    if (flags & ZX_VMO_NON_RESIZABLE) {
+        flags &= ~ZX_VMO_NON_RESIZABLE;
+    } else {
+        flags &= ~ZX_VMO_RESIZABLE;
+        res |= VmObjectPaged::kResizable;
+    }
+
+    if (flags) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    *out_flags = res;
+
+    return ZX_OK;
+}
 
 zx_status_t VmObjectDispatcher::Create(fbl::RefPtr<VmObject> vmo,
                                        zx_koid_t pager_koid,
@@ -37,14 +60,15 @@ zx_status_t VmObjectDispatcher::Create(fbl::RefPtr<VmObject> vmo,
 
 VmObjectDispatcher::VmObjectDispatcher(fbl::RefPtr<VmObject> vmo, zx_koid_t pager_koid)
     : SoloDispatcher(ZX_VMO_ZERO_CHILDREN), vmo_(vmo), pager_koid_(pager_koid) {
-        vmo_->SetChildObserver(this);
-    }
+    kcounter_add(dispatcher_vmo_create_count, 1);
+    vmo_->SetChildObserver(this);
+}
 
 VmObjectDispatcher::~VmObjectDispatcher() {
+    kcounter_add(dispatcher_vmo_destroy_count, 1);
     // Intentionally leave vmo_->user_id() set to our koid even though we're
     // dying and the koid will no longer map to a Dispatcher. koids are never
     // recycled, and it could be a useful breadcrumb.
-    vmo_->SetChildObserver(nullptr);
 }
 
 
@@ -64,6 +88,12 @@ void VmObjectDispatcher::get_name(char out_name[ZX_MAX_NAME_LEN]) const {
 zx_status_t VmObjectDispatcher::set_name(const char* name, size_t len) {
     canary_.Assert();
     return vmo_->set_name(name, len);
+}
+
+void VmObjectDispatcher::on_zero_handles() {
+    // Clear when handle count reaches zero rather in the destructor because we're retaining a
+    // VmObject that might call back into |this| via VmObjectChildObserver when it's destroyed.
+    vmo_->SetChildObserver(nullptr);
 }
 
 zx_status_t VmObjectDispatcher::Read(user_out_ptr<void> user_data,
@@ -102,14 +132,15 @@ zx_info_vmo_t VmoToInfoEntry(const VmObject* vmo,
     entry.koid = vmo->user_id();
     vmo->get_name(entry.name, sizeof(entry.name));
     entry.size_bytes = vmo->size();
-    entry.create_options = vmo->create_options();
     entry.parent_koid = vmo->parent_user_id();
-    entry.num_children = vmo->num_children();
+    entry.num_children = vmo->num_user_children();
     entry.num_mappings = vmo->num_mappings();
     entry.share_count = vmo->share_count();
     entry.flags =
         (vmo->is_paged() ? ZX_INFO_VMO_TYPE_PAGED : ZX_INFO_VMO_TYPE_PHYSICAL) |
-        (vmo->is_cow_clone() ? ZX_INFO_VMO_IS_COW_CLONE : 0);
+        (vmo->is_resizable() ? ZX_INFO_VMO_RESIZABLE : 0) |
+        (vmo->is_pager_backed() ? ZX_INFO_VMO_PAGER_BACKED : 0) |
+        (vmo->is_contiguous() ? ZX_INFO_VMO_CONTIGUOUS : 0);
     entry.committed_bytes = vmo->AllocatedPages() * PAGE_SIZE;
     entry.cache_policy = vmo->GetMappingCachePolicy();
     if (is_handle) {
@@ -117,6 +148,13 @@ zx_info_vmo_t VmoToInfoEntry(const VmObject* vmo,
         entry.handle_rights = handle_rights;
     } else {
         entry.flags |= ZX_INFO_VMO_VIA_MAPPING;
+    }
+    switch (vmo->child_type()) {
+        case VmObject::ChildType::kCowClone:
+            entry.flags |= ZX_INFO_VMO_IS_COW_CLONE;
+            break;
+        case VmObject::ChildType::kNotChild:
+            break;
     }
     return entry;
 }
@@ -189,27 +227,35 @@ zx_status_t VmObjectDispatcher::SetMappingCachePolicy(uint32_t cache_policy) {
     return vmo_->SetMappingCachePolicy(cache_policy);
 }
 
-zx_status_t VmObjectDispatcher::Clone(uint32_t options, uint64_t offset, uint64_t size,
-        bool copy_name, fbl::RefPtr<VmObject>* clone_vmo) {
+zx_status_t VmObjectDispatcher::CreateChild(uint32_t options, uint64_t offset, uint64_t size,
+        bool copy_name, fbl::RefPtr<VmObject>* child_vmo) {
     canary_.Assert();
 
     LTRACEF("options 0x%x offset %#" PRIx64 " size %#" PRIx64 "\n",
             options, offset, size);
 
-    bool resizable = true;
-    if (options & ZX_VMO_CLONE_COPY_ON_WRITE) {
-        options &= ~ZX_VMO_CLONE_COPY_ON_WRITE;
+    // Check for mutually-exclusive child type flags.
+    CloneType type;
+    if (options & ZX_VMO_CHILD_COPY_ON_WRITE) {
+        options &= ~ZX_VMO_CHILD_COPY_ON_WRITE;
+        type = CloneType::Unidirectional;
+    } else if (options & ZX_VMO_CHILD_COPY_ON_WRITE2) {
+        options &= ~ZX_VMO_CHILD_COPY_ON_WRITE2;
+        type = CloneType::Bidirectional;
     } else {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    if (options & ZX_VMO_CLONE_NON_RESIZEABLE) {
-        resizable = false;
-        options &= ~ZX_VMO_CLONE_NON_RESIZEABLE;
+    Resizability resizable = Resizability::Resizable;
+    if (options & ZX_VMO_CHILD_NON_RESIZEABLE) {
+        resizable = Resizability::NonResizable;
+        options &= ~ZX_VMO_CHILD_NON_RESIZEABLE;
+    } else {
+        options &= ~ZX_VMO_CHILD_RESIZABLE;
     }
 
     if (options)
         return ZX_ERR_INVALID_ARGS;
 
-    return vmo_->CloneCOW(resizable, offset, size, copy_name, clone_vmo);
+    return vmo_->CreateCowClone(resizable, type, offset, size, copy_name, child_vmo);
 }

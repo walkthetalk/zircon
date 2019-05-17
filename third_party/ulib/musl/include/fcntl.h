@@ -1,4 +1,5 @@
-#pragma once
+#ifndef SYSROOT_FCNTL_H_
+#define SYSROOT_FCNTL_H_
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,7 +55,6 @@ int posix_fallocate(int, off_t, off_t);
 #ifdef _ALL_SOURCE
 #define O_NOREMOTE  0x00200000
 #define O_ADMIN     0x00000004
-#define O_PIPELINE  0x80000000
 #endif
 
 // Flags which do not align with ZXIO_FS_*
@@ -220,3 +220,5 @@ ssize_t tee(int, int, size_t, unsigned);
 #ifdef __cplusplus
 }
 #endif
+
+#endif // SYSROOT_FCNTL_H_

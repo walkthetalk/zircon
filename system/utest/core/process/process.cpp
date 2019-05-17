@@ -3,6 +3,8 @@
 // found in the LICENSE file.
 
 #include <assert.h>
+#include <atomic>
+#include <threads.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/exception.h>
@@ -43,6 +45,50 @@ bool mini_process_sanity() {
     zx_handle_close(thread);
     zx_handle_close(proc);
     zx_handle_close(vmar);
+    END_TEST;
+}
+
+bool process_start_no_handle() {
+    BEGIN_TEST;
+
+    zx_handle_t proc;
+    zx_handle_t thread;
+    zx_handle_t vmar;
+
+    constexpr const char kTestName[] = "test-no-handles";
+    ASSERT_EQ(zx_process_create(zx_job_default(),
+                                kTestName, sizeof(kTestName) - 1, 0,
+                                &proc, &vmar), ZX_OK);
+    ASSERT_EQ(zx_thread_create(proc, kTestName, sizeof(kTestName) - 1, 0u,
+                               &thread), ZX_OK);
+
+    // The process will get no handles, but it can still make syscalls.
+    // The vDSO's e_entry points to zx_process_exit.  So the process will
+    // enter at `zx_process_exit(ZX_HANDLE_INVALID);`.
+    uintptr_t entry;
+    EXPECT_EQ(mini_process_load_vdso(proc, vmar, nullptr, &entry), ZX_OK);
+
+    // The vDSO ABI needs a stack, though zx_process_exit actually might not.
+    uintptr_t stack_base, sp;
+    EXPECT_EQ(mini_process_load_stack(vmar, false, &stack_base, &sp), ZX_OK);
+    zx_handle_close(vmar);
+
+    EXPECT_EQ(zx_process_start(proc, thread, entry, sp, ZX_HANDLE_INVALID, 0),
+              ZX_OK);
+    zx_handle_close(thread);
+
+    zx_signals_t signals;
+    EXPECT_EQ(zx_object_wait_one(proc, ZX_TASK_TERMINATED,
+                                 zx_deadline_after(ZX_SEC(1)), &signals),
+              ZX_OK);
+    EXPECT_EQ(signals, ZX_TASK_TERMINATED);
+
+    zx_info_process_t info{};
+    EXPECT_EQ(zx_object_get_info(proc, ZX_INFO_PROCESS,
+                                 &info, sizeof(info), nullptr, nullptr), ZX_OK);
+    EXPECT_EQ(info.return_code, int64_t{ZX_HANDLE_INVALID});
+
+    zx_handle_close(proc);
     END_TEST;
 }
 
@@ -174,7 +220,7 @@ bool kill_process_via_vmar_destroy() {
     END_TEST;
 }
 
-static zx_status_t dup_send_handle(zx_handle_t channel, zx_handle_t handle) {
+zx_status_t dup_send_handle(zx_handle_t channel, zx_handle_t handle) {
     zx_handle_t dup;
     zx_status_t st = zx_handle_duplicate(handle, ZX_RIGHT_SAME_RIGHTS, &dup);
     if (st < 0)
@@ -277,6 +323,7 @@ bool info_reflects_process_state() {
             proc, ZX_INFO_PROCESS, &info, sizeof(info), NULL, NULL), ZX_OK);
     EXPECT_FALSE(info.started, "process should not appear as started");
     EXPECT_FALSE(info.exited, "process should not appear as exited");
+    EXPECT_EQ(info.return_code, 0, "return code is zero");
 
     zx_handle_t minip_chn;
     // Start the process and make (relatively) certain it's alive.
@@ -301,7 +348,7 @@ bool info_reflects_process_state() {
             proc, ZX_INFO_PROCESS, &info, sizeof(info), NULL, NULL), ZX_OK);
     EXPECT_TRUE(info.started, "process should appear as started");
     EXPECT_TRUE(info.exited, "process should appear as exited");
-    EXPECT_NE(info.return_code, 0, "killed process should have non-zero return code");
+    EXPECT_EQ(info.return_code, ZX_TASK_RETCODE_SYSCALL_KILL, "process retcode invalid");
 
     END_TEST;
 }
@@ -376,7 +423,6 @@ public:
         BEGIN_HELPER;
 
         EXPECT_EQ(zx_task_kill(process_), ZX_OK);
-
         EXPECT_EQ(zx_handle_close(process_), ZX_OK);
         EXPECT_EQ(zx_handle_close(vmar_), ZX_OK);
         EXPECT_EQ(zx_handle_close_many(threads_, num_threads_), ZX_OK);
@@ -659,11 +705,112 @@ bool suspend_with_dying_thread() {
     END_TEST;
 }
 
+// A stress test designed to create a race where one thread is creating a process while another
+// thread is killing its parent job.
+bool create_and_kill_job_race_stress() {
+    BEGIN_TEST;
+
+    constexpr zx_duration_t kTestDuration = ZX_SEC(1);
+    srand(4);
+
+    struct args_t {
+        std::atomic<bool>* keep_running;
+        std::atomic<zx_handle_t>* job;
+    };
+
+    // Repeatedly create and kill a job.
+    auto killer_thread = [](void* arg) -> int {
+        auto [job, keep_running] = *reinterpret_cast<args_t*>(arg);
+        while (keep_running->load()) {
+            zx_handle_t handle = ZX_HANDLE_INVALID;
+            zx_status_t status = zx_job_create(zx_job_default(), 0, &handle);
+            if (status != ZX_OK) {
+                return status;
+            }
+            job->store(handle);
+
+            // Give the creator threads an opportunity to get the handle before killing the job.
+            zx_nanosleep(ZX_MSEC(10));
+
+            status = zx_task_kill(handle);
+            if (status != ZX_OK) {
+                return status;
+            }
+            zx_handle_close(handle);
+            handle = ZX_HANDLE_INVALID;
+            job->store(handle);
+        }
+        return ZX_OK;
+    };
+
+    // Repeatedly create a process.
+    auto creator_thread = [](void* arg) -> int {
+        auto [job, keep_running] = *reinterpret_cast<args_t*>(arg);
+        constexpr const char kName[] = "create-and-kill";
+        while (keep_running->load()) {
+            zx_handle_t handle = job->load();
+            if (handle == ZX_HANDLE_INVALID) {
+                continue;
+            }
+
+            zx_handle_t proc = ZX_HANDLE_INVALID;
+            zx_handle_t vmar = ZX_HANDLE_INVALID;
+            zx_status_t status =
+                zx_process_create(handle, "create-and-kill", sizeof(kName) - 1, 0, &proc, &vmar);
+
+            // We're racing with the killer_thread so it's entirely possible for zx_process_create
+            // to fail with ZX_ERR_BAD_HANDLE or ZX_ERR_BAD_STATE. Just ignore those.
+            if (status != ZX_OK &&
+                status != ZX_ERR_BAD_HANDLE &&
+                status != ZX_ERR_BAD_STATE) {
+                return status;
+            }
+            zx_handle_close(proc);
+            proc = ZX_HANDLE_INVALID;
+            zx_handle_close(vmar);
+            vmar = ZX_HANDLE_INVALID;
+        }
+
+        return ZX_OK;
+    };
+
+    std::atomic<bool> keep_running(true);
+    std::atomic<zx_handle_t> job(ZX_HANDLE_INVALID);
+    args_t args{&keep_running, &job};
+
+    thrd_t killer;
+    ASSERT_EQ(thrd_create(&killer, killer_thread, &args), thrd_success);
+
+    constexpr unsigned kNumCreators = 4;
+    thrd_t creators[kNumCreators];
+    for (auto& t : creators) {
+        ASSERT_EQ(thrd_create(&t, creator_thread, &args), thrd_success);
+    }
+
+    zx_nanosleep(zx_deadline_after(kTestDuration));
+
+    keep_running.store(false);
+    for (auto& t : creators) {
+        int res;
+        ASSERT_EQ(thrd_join(t, &res), thrd_success);
+        ASSERT_EQ(res, ZX_OK);
+    }
+
+    int res;
+    ASSERT_EQ(thrd_join(killer, &res), thrd_success);
+    ASSERT_EQ(res, ZX_OK);
+
+    zx_handle_close(args.job->load());
+
+    END_TEST;
+}
+
 } // namespace
 
 BEGIN_TEST_CASE(process_tests)
 RUN_TEST(mini_process_sanity);
 RUN_TEST(process_start_fail);
+RUN_TEST(process_start_no_handle);
 RUN_TEST(process_not_killed_via_thread_close);
 RUN_TEST(process_not_killed_via_process_close);
 RUN_TEST(kill_process_via_thread_kill);
@@ -681,11 +828,5 @@ RUN_TEST(suspend_thread_and_process_before_starting_process);
 RUN_TEST(suspend_twice);
 RUN_TEST(suspend_twice_before_creating_threads);
 RUN_TEST(suspend_with_dying_thread);
+RUN_TEST_LARGE(create_and_kill_job_race_stress);
 END_TEST_CASE(process_tests)
-
-#ifndef BUILD_COMBINED_TESTS
-int main(int argc, char** argv) {
-    bool success = unittest_run_all_tests(argc, argv);
-    return success ? 0 : -1;
-}
-#endif

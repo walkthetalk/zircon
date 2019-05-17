@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_ASYNC_CPP_RECEIVER_H_
+#define LIB_ASYNC_CPP_RECEIVER_H_
 
-#include <fbl/function.h>
 #include <lib/async/receiver.h>
+#include <lib/fit/function.h>
 
 #include <utility>
 
@@ -65,7 +66,7 @@ public:
     //
     // The |status| is |ZX_OK| if the packet was successfully delivered and |data|
     // contains the information from the packet, otherwise |data| is null.
-    using Handler = fbl::Function<void(async_dispatcher_t* dispatcher,
+    using Handler = fit::function<void(async_dispatcher_t* dispatcher,
                                        async::Receiver* receiver,
                                        zx_status_t status,
                                        const zx_packet_user_t* data)>;
@@ -111,3 +112,5 @@ private:
 };
 
 } // namespace async
+
+#endif  // LIB_ASYNC_CPP_RECEIVER_H_

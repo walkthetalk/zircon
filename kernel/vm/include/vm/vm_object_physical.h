@@ -27,7 +27,9 @@ class VmObjectPhysical final : public VmObject {
 public:
     static zx_status_t Create(paddr_t base, uint64_t size, fbl::RefPtr<VmObject>* vmo);
 
+    ChildType child_type() const override { return ChildType::kNotChild; }
     bool is_contiguous() const override { return true; }
+    uint64_t parent_user_id() const override { return 0u; }
 
     uint64_t size() const override { return size_; }
 
@@ -45,7 +47,7 @@ public:
 
 private:
     // private constructor (use Create())
-    VmObjectPhysical(paddr_t base, uint64_t size);
+    VmObjectPhysical(fbl::RefPtr<vm_lock_t> lock, paddr_t base, uint64_t size);
 
     // private destructor, only called from refptr
     ~VmObjectPhysical() override;

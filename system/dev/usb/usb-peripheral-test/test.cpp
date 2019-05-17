@@ -26,10 +26,12 @@ constexpr size_t BUFFER_SIZE = 4096;
 // Data to send to the device
 uint8_t send_buf[BUFFER_SIZE] = {};
 // Buffer for receiving data from the device
-int receive_buf[BUFFER_SIZE] = {};
+uint8_t receive_buf[BUFFER_SIZE] = {};
 
 constexpr int TIMEOUT = 1000; // 1 seecond
 
+// Interface number for the test interface
+static uint8_t test_interface;
 
 // Fill send_buf with random values.
 void randomize() {
@@ -46,17 +48,18 @@ bool control_interrupt_test(size_t transfer_size) {
     randomize();
 
     // Send data to device via OUT control request.
-    int ret = usb_device_control_transfer(dev,
-                            USB_DIR_OUT | USB_TYPE_VENDOR | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-                            USB_PERIPHERAL_TEST_SET_DATA, 0, 0, send_buf, transfer_size, TIMEOUT);
-    EXPECT_EQ(ret, transfer_size);
+    int ret = usb_device_control_transfer(
+        dev, USB_DIR_OUT | USB_TYPE_VENDOR | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
+        USB_PERIPHERAL_TEST_SET_DATA, 0, test_interface, send_buf,
+        static_cast<int>(transfer_size), TIMEOUT);
+    EXPECT_EQ(ret, static_cast<int>(transfer_size));
 
     // Receive data back from device via IN control request.
-    ret = usb_device_control_transfer(dev,
-                            USB_DIR_IN | USB_TYPE_VENDOR | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-                            USB_PERIPHERAL_TEST_GET_DATA, 0, 0, receive_buf, transfer_size,
-                            TIMEOUT);
-    EXPECT_EQ(ret, transfer_size);
+    ret = usb_device_control_transfer(
+        dev, USB_DIR_IN | USB_TYPE_VENDOR | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
+        USB_PERIPHERAL_TEST_GET_DATA, 0, test_interface, receive_buf,
+        static_cast<int>(transfer_size), TIMEOUT);
+    EXPECT_EQ(ret, static_cast<int>(transfer_size));
 
     // Sent and received data should match.
     EXPECT_EQ(memcmp(send_buf, receive_buf, transfer_size), 0);
@@ -79,12 +82,14 @@ bool control_interrupt_test(size_t transfer_size) {
     // Ask the device to send us an interrupt request containing the data we sent earlier.
     ret = usb_device_control_transfer(dev,
                             USB_DIR_OUT | USB_TYPE_VENDOR | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-                            USB_PERIPHERAL_TEST_SEND_INTERUPT, 0, 0, nullptr, 0, TIMEOUT);
+                            USB_PERIPHERAL_TEST_SEND_INTERUPT, 0, test_interface, nullptr, 0,
+                            TIMEOUT);
     EXPECT_EQ(ret, 0);
 
     wait_thread.join();
 
     EXPECT_EQ(complete_req, req);
+    EXPECT_EQ(static_cast<size_t>(req->actual_length), transfer_size);
 
     // Sent data should match payload of interrupt request.
     EXPECT_EQ(memcmp(send_buf, receive_buf, transfer_size), 0);
@@ -182,7 +187,8 @@ int usb_device_added(const char *dev_name, void *client_data) {
     uint16_t vid = usb_device_get_vendor_id(dev);
     uint16_t pid = usb_device_get_product_id(dev);
 
-    if (vid != GOOGLE_USB_VID || pid != GOOGLE_USB_PERIPHERAL_TEST_PID) {
+    if (vid != GOOGLE_USB_VID ||
+        (pid != GOOGLE_USB_FUNCTION_TEST_PID && pid != GOOGLE_USB_CDC_AND_FUNCTION_TEST_PID)) {
         // Device doesn't match, so keep looking.
         usb_device_close(dev);
         dev = nullptr;
@@ -218,6 +224,7 @@ int usb_device_added(const char *dev_name, void *client_data) {
         fprintf(stderr, "usb_device_claim_interface failed\n");
         goto fail;
     }
+    test_interface = intf->bInterfaceNumber;
 
     // Device found, exit from usb_host_load().
     return 1;

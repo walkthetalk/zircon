@@ -7,7 +7,7 @@
 #include <ddk/protocol/platform-device-lib.h>
 #include <ddk/protocol/platform/device.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/mutex.h>
 #include <hwreg/mmio.h>
 
@@ -24,7 +24,7 @@ class AmlPwm {
 public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(AmlPwm);
     AmlPwm(uint32_t period, uint32_t hwpwm)
-        : period_(period), hwpwm_(hwpwm){};
+        : period_(period), hwpwm_(hwpwm){}
     zx_status_t Init(zx_device_t* parent);
     zx_status_t Configure(uint32_t duty_cycle);
     ~AmlPwm() = default;

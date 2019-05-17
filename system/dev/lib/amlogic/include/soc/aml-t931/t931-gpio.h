@@ -31,9 +31,17 @@
 
 #define T931_AO_PAD_DS_A                   S905D2_AO_PAD_DS_A
 #define T931_AO_PAD_DS_B                   S905D2_AO_PAD_DS_B
+#define T931_PAD_DS_REG0A                  S905D2_PAD_DS_REG0A
 #define T931_PAD_DS_REG1A                  S905D2_PAD_DS_REG1A
 #define T931_PAD_DS_REG2A                  S905D2_PAD_DS_REG2A
 #define T931_PAD_DS_REG2B                  S905D2_PAD_DS_REG2B
 #define T931_PAD_DS_REG3A                  S905D2_PAD_DS_REG3A
 #define T931_PAD_DS_REG4A                  S905D2_PAD_DS_REG4A
 #define T931_PAD_DS_REG5A                  S905D2_PAD_DS_REG5A
+
+// GPIO Pins used for board rev detection
+#define T931_GPIO_HW_ID0                   S905D2_GPIOA(11)
+#define T931_GPIO_HW_ID1                   S905D2_GPIOA(12)
+#define T931_GPIO_HW_ID2                   S905D2_GPIOC(6)
+#define T931_GPIO_HW_ID3                   S905D2_GPIOC(4)
+#define T931_GPIO_HW_ID4                   S905D2_GPIOC(5)

@@ -1,10 +1,11 @@
 {
     "$schema": "http://json-schema.org/draft-04/schema#",
-    "description": "See https://fuchsia.googlesource.com/docs/+/master/development/languages/fidl/reference/json-ir.md",
+    "description": "See https://fuchsia.googlesource.com/fuchsia/+/master/docs/development/languages/fidl/reference/json-ir.md",
     "type": "object",
     "required": [
         "version",
         "name",
+        "bits_declarations",
         "const_declarations",
         "enum_declarations",
         "interface_declarations",
@@ -24,6 +25,13 @@
         "name": {
             "description": "Name of the library",
             "$ref": "#/definitions/library-identifier"
+        },
+        "bits_declarations": {
+            "description": "List of bits declarations",
+            "type": "array",
+            "items": {
+                "$ref": "#/definitions/bits"
+            }
         },
         "const_declarations": {
             "description": "List of constants",
@@ -94,6 +102,63 @@
         }
     },
     "definitions": {
+        "bits": {
+            "description": "Definition of a bits declaration",
+            "type": "object",
+            "required": [
+                "name",
+                "type",
+                "mask",
+                "members"
+            ],
+            "properties": {
+                "maybe_attributes": {
+                    "description": "Optional list of attributes of the bits declaration",
+                    "$ref": "#/definitions/attributes-list"
+                },
+                "name": {
+                    "description": "Fully qualified name of the bits",
+                    "$ref": "#/definitions/compound-identifier"
+                },
+                "type": {
+                    "description": "Type of the bits",
+                    "$ref": "#/definitions/type"
+                },
+                "mask": {
+                    "description": "Mask of all members",
+                    "type": "string"
+                },
+                "members": {
+                    "description": "List of bits members",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/bits-member"
+                    }
+                }
+            }
+        },
+        "bits-member": {
+            "description": "Definition of an bits member",
+            "type": "object",
+            "required": [
+                "name",
+                "value"
+            ],
+            "properties": {
+                "name": {
+                    "description": "Name of the bits member",
+                    "$ref": "#/definitions/identifier"
+                },
+                "maybe_attributes": {
+                    "description": "Optional list of attributes of the bits member",
+                    "$ref": "#/definitions/attributes-list"
+                },
+                "value": {
+                    "description": "Value of the bits member",
+                    "$ref": "#/definitions/constant"
+                }
+            }
+        },
         "const": {
             "description": "Definition of a constant declaration",
             "type": "object",
@@ -110,6 +175,10 @@
                 "name": {
                     "description": "Fully qualified name of the constant",
                     "$ref": "#/definitions/compound-identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "type": {
                     "description": "Type of the constant",
@@ -138,6 +207,10 @@
                     "description": "Fully qualified name of the enum",
                     "$ref": "#/definitions/compound-identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "type": {
                     "description": "Type of the enum",
                     "$ref": "#/definitions/integer-type"
@@ -162,6 +235,10 @@
                 "name": {
                     "description": "Name of the enum member",
                     "$ref": "#/definitions/identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "maybe_attributes": {
                     "description": "Optional list of attributes of the enum member",
@@ -189,6 +266,10 @@
                     "description": "Name of the interface",
                     "$ref": "#/definitions/compound-identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "methods": {
                     "description": "List of methods and events",
                     "type": "array",
@@ -203,7 +284,7 @@
             "type": "object",
             "required": [
                 "ordinal",
-  	        "generated_ordinal",
+                "generated_ordinal",
                 "name",
                 "has_request",
                 "has_response"
@@ -224,6 +305,10 @@
                 "name": {
                     "description": "Name of the interface method",
                     "$ref": "#/definitions/identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "has_request": {
                     "description": "Flag indicating that interface method has a request component",
@@ -285,6 +370,10 @@
                     "description": "Name of the parameter or return",
                     "$ref": "#/definitions/identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "size": {
                     "description": "Size of the parameter or return",
                     "$ref": "#/definitions/count"
@@ -324,6 +413,10 @@
                 "name": {
                     "description": "Name of struct",
                     "$ref": "#/definitions/compound-identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "anonymous": {
                     "description": "Flag indicating that struct is anonymous",
@@ -365,6 +458,10 @@
                 "name": {
                     "description": "Name of struct member",
                     "$ref": "#/definitions/identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "size": {
                     "description": "Size of struct member",
@@ -414,6 +511,10 @@
                     "description": "Name of table",
                     "$ref": "#/definitions/compound-identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "members": {
                     "description": "List of table members",
                     "type": "array",
@@ -450,6 +551,10 @@
                 "name": {
                     "description": "Name of table member",
                     "$ref": "#/definitions/identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "ordinal": {
                     "description": "Ordinal value of table member",
@@ -500,6 +605,10 @@
                     "description": "Name of union",
                     "$ref": "#/definitions/compound-identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "members": {
                     "description": "List of union members",
                     "type": "array",
@@ -540,6 +649,10 @@
                 "name": {
                     "description": "Name of union member",
                     "$ref": "#/definitions/identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "size": {
                     "description": "Size of union member",
@@ -585,6 +698,10 @@
                 "name": {
                     "description": "Name of extensible union",
                     "$ref": "#/definitions/compound-identifier"
+                },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
                 },
                 "members": {
                     "description": "List of extensible union members",
@@ -632,6 +749,10 @@
                     "description": "Name of extensible union member",
                     "$ref": "#/definitions/identifier"
                 },
+                "location": {
+                    "description": "Source location of the declaration",
+                    "$ref": "#/definitions/location"
+                },
                 "size": {
                     "description": "Size of extensible union member",
                     "$ref": "#/definitions/count"
@@ -661,6 +782,7 @@
                 ".*": {
                     "type": "string",
                     "enum": [
+                        "bits",
                         "const",
                         "enum",
                         "interface",
@@ -980,105 +1102,36 @@
                 },
                 "literal": {
                     "description": "Literal used as constant value",
-                    "$ref": "#/definitions/literal"
+                    "$ref": "#/definitions/literal-value"
                 }
             }
         },
-        "literal": {
-            "description": "Definition of literal type",
-            "oneOf": [
-                {
-                    "description": "Selection of string literal type",
-                    "$ref": "#/definitions/string-literal"
-                },
-                {
-                    "description": "Selection of numeric literal type",
-                    "$ref": "#/definitions/numeric-literal"
-                },
-                {
-                    "description": "Selection of boolean true literal type",
-                    "$ref": "#/definitions/true-literal"
-                },
-                {
-                    "description": "Selection of boolean false literal type",
-                    "$ref": "#/definitions/false-literal"
-                },
-                {
-                    "description": "Selection of default literal type",
-                    "$ref": "#/definitions/default-literal"
-                }
-            ]
-        },
-        "string-literal": {
-            "description": "Definition of string literal",
+        "literal-value": {
+            "description": "Definition of a literal constant value",
             "type": "object",
             "required": [
                 "kind",
-                "value"
+                "value",
+                "expression"
             ],
             "properties": {
                 "kind": {
                     "description": "Selection of string literal type",
                     "type": "string",
                     "enum": [
-                        "string"
-                    ]
-                },
-                "value": {
-                    "description": "String literal value",
-                    "type": "string"
-                }
-            }
-        },
-        "numeric-literal": {
-            "description": "Definition of numeric literal",
-            "type": "object",
-            "required": [
-                "kind",
-                "value"
-            ],
-            "properties": {
-                "kind": {
-                    "description": "Selection of numeric literal",
-                    "type": "string",
-                    "enum": [
-                        "numeric"
-                    ]
-                },
-                "value": {
-                    "type": "string"
-                }
-            }
-        },
-        "true-literal": {
-            "description": "Definition of boolean true literal",
-            "type": "object",
-            "required": [
-                "kind"
-            ],
-            "properties": {
-                "kind": {
-                    "description": "Selection of boolean true literal type",
-                    "type": "string",
-                    "enum": [
-                        "true"
-                    ]
-                }
-            }
-        },
-        "false-literal": {
-            "description": "Definition of boolean false literal",
-            "type": "object",
-            "required": [
-                "kind"
-            ],
-            "properties": {
-                "kind": {
-                    "description": "Selection of boolean false literal type",
-                    "type": "string",
-                    "enum": [
+                        "string",
+                        "numeric",
+                        "true",
                         "false"
                     ]
+                },
+                "value": {
+                    "description": "Resolved constant value",
+                    "type": "string"
+                },
+                "expression": {
+                    "description": "Original in source constant value, may be a const expression.",
+                    "type": "string"
                 }
             }
         },
@@ -1095,6 +1148,29 @@
                     "enum": [
                         "default"
                     ]
+                }
+            }
+        },
+        "location": {
+            "type": "object",
+            "required": [
+                "filename",
+                "line",
+                "column"
+            ],
+            "properties": {
+                "filename": {
+                    "type": "string"
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295
+                },
+                "column": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295
                 }
             }
         },

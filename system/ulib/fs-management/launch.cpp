@@ -15,7 +15,9 @@
 #include <fs-management/mount.h>
 #include <lib/fdio/io.h>
 #include <lib/fdio/spawn.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/process.h>
 #include <zircon/compiler.h>
 #include <zircon/processargs.h>
@@ -24,15 +26,8 @@
 
 namespace {
 
-void InitArgvAndActions(int argc, const char** argv, zx_handle_t* handles,
-                        uint32_t* types, size_t len,
-                        const char** null_terminated_argv_out,
+void InitArgvAndActions(zx_handle_t* handles, uint32_t* types, size_t len,
                         fdio_spawn_action_t* actions_out) {
-    for (int i = 0; i < argc; ++i) {
-        null_terminated_argv_out[i] = argv[i];
-    }
-    null_terminated_argv_out[argc] = nullptr;
-
     for (size_t i = 0; i < len; ++i) {
         actions_out[i].action = FDIO_SPAWN_ACTION_ADD_HANDLE;
         actions_out[i].h.id = types[i];
@@ -63,7 +58,7 @@ void InitStdio(StdioType stdio, fdio_spawn_action_t* actions,
         zx_debuglog_create(ZX_HANDLE_INVALID, 0, &h);
         if (h != ZX_HANDLE_INVALID) {
             actions[*action_count].action = FDIO_SPAWN_ACTION_ADD_HANDLE;
-            actions[*action_count].h.id = PA_HND(PA_FDIO_LOGGER, FDIO_FLAG_USE_FOR_STDIO);
+            actions[*action_count].h.id = PA_HND(PA_FD, FDIO_FLAG_USE_FOR_STDIO);
             actions[*action_count].h.handle = h;
             *action_count += 1;
         }
@@ -123,15 +118,14 @@ zx_status_t Spawn(ProcessAction proc_action, uint32_t flags, const char** argv,
 
 zx_status_t Launch(StdioType stdio, ProcessAction proc_action, int argc,
                    const char** argv, zx_handle_t* handles, uint32_t* types, size_t len) {
-    const char* null_terminated_argv[argc + 1];
     fdio_spawn_action_t actions[len + kMaxStdioActions];
-    InitArgvAndActions(argc, argv, handles, types, len, null_terminated_argv, actions);
+    InitArgvAndActions(handles, types, len, actions);
 
     size_t action_count = len;
     uint32_t flags = FDIO_SPAWN_CLONE_ALL;
     InitStdio(stdio, actions, &action_count, &flags);
 
-    return Spawn(proc_action, flags, null_terminated_argv, action_count, actions);
+    return Spawn(proc_action, flags, argv, action_count, actions);
 }
 
 }  // namespace

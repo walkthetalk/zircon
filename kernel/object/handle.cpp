@@ -21,32 +21,42 @@ constexpr size_t kMaxHandleCount = 256 * 1024u;
 // there are this many outstanding handles.
 constexpr size_t kHighHandleCount = (kMaxHandleCount * 7) / 8;
 
-KCOUNTER(handle_count_made, "kernel.handles.made");
-KCOUNTER(handle_count_duped, "kernel.handles.duped");
-KCOUNTER(handle_count_live, "kernel.handles.live");
+KCOUNTER(handle_count_made, "handles.made")
+KCOUNTER(handle_count_duped, "handles.duped")
+KCOUNTER(handle_count_live, "handles.live")
 
 // Masks for building a Handle's base_value, which ProcessDispatcher
 // uses to create zx_handle_t values.
 //
 // base_value bit fields:
-//   [31..30]: Must be zero
-//   [29..kHandleGenerationShift]: Generation number
-//                                 Masked by kHandleGenerationMask
-//   [kHandleGenerationShift-1..0]: Index into handle_arena
-//                                  Masked by kHandleIndexMask
+//   [31..(32 - kHandleReservedBits)]                     : Must be zero
+//   [(31 - kHandleReservedBits)..kHandleGenerationShift] : Generation number
+//                                                          Masked by kHandleGenerationMask
+//   [kHandleGenerationShift-1..0]                        : Index into handle_arena
+//                                                          Masked by kHandleIndexMask
 constexpr uint32_t kHandleIndexMask = kMaxHandleCount - 1;
 static_assert((kHandleIndexMask & kMaxHandleCount) == 0,
               "kMaxHandleCount must be a power of 2");
-constexpr uint32_t kHandleGenerationMask = ~kHandleIndexMask & ~(3 << 30);
+
+// TODO(johngro): remove this and use the one in handle.h once we have updated
+// externals to no longer depend on the MSB of the handle being 0.  See WEB-33
+constexpr uint32_t kHandleReservedBits = 3;
+// END TODO
+constexpr uint32_t kHandleReservedBitsMask = ((1 << kHandleReservedBits) - 1)
+                                           << (32 - kHandleReservedBits);
+constexpr uint32_t kHandleGenerationMask = ~kHandleIndexMask & ~kHandleReservedBitsMask;
 constexpr uint32_t kHandleGenerationShift = log2_uint_floor(kMaxHandleCount);
 static_assert(((3 << (kHandleGenerationShift - 1)) & kHandleGenerationMask) ==
                   1 << kHandleGenerationShift,
               "Shift is wrong");
 static_assert((kHandleGenerationMask >> kHandleGenerationShift) >= 255,
               "Not enough room for a useful generation count");
-static_assert(((3 << 30) ^ kHandleGenerationMask ^ kHandleIndexMask) ==
-                  0xffffffffu,
-              "Masks do not agree");
+
+static_assert((kHandleReservedBitsMask & kHandleGenerationMask) == 0, "Handle Mask Overlap!");
+static_assert((kHandleReservedBitsMask & kHandleIndexMask) == 0, "Handle Mask Overlap!");
+static_assert((kHandleGenerationMask & kHandleIndexMask) == 0, "Handle Mask Overlap!");
+static_assert((kHandleReservedBitsMask | kHandleGenerationMask | kHandleIndexMask) == 0xffffffffu,
+              "Handle masks do not cover all bits!");
 
 }  // namespace
 
@@ -57,7 +67,7 @@ void Handle::Init() TA_NO_THREAD_SAFETY_ANALYSIS {
 }
 
 void Handle::set_process_id(zx_koid_t pid) {
-    process_id_.store(pid, fbl::memory_order_relaxed);
+    process_id_.store(pid, ktl::memory_order_relaxed);
     dispatcher_->set_owner(pid);
 }
 
@@ -89,14 +99,14 @@ void* Handle::Alloc(const fbl::RefPtr<Dispatcher>& dispatcher,
                     const char* what, uint32_t* base_value) {
     size_t outstanding_handles;
     {
-        Guard<fbl::Mutex> guard{ArenaLock::Get()};
+        Guard<BrwLockPi, BrwLockPi::Writer> guard{ArenaLock::Get()};
         void* addr = arena_.Alloc();
         outstanding_handles = arena_.DiagnosticCount();
         if (likely(addr)) {
             if (outstanding_handles > kHighHandleCount) {
                 // TODO: Avoid calling this for every handle after
                 // kHighHandleCount; printfs are slow and we're
-                // holding the mutex.
+                // holding the lock.
                 printf("WARNING: High handle count: %zu handles\n",
                        outstanding_handles);
             }
@@ -120,6 +130,18 @@ HandleOwner Handle::Make(fbl::RefPtr<Dispatcher> dispatcher,
     kcounter_add(handle_count_made, 1);
     kcounter_add(handle_count_live, 1);
     return HandleOwner(new (addr) Handle(ktl::move(dispatcher),
+                                         rights, base_value));
+}
+
+HandleOwner Handle::Make(KernelHandle<Dispatcher> kernel_handle,
+                         zx_rights_t rights) {
+    uint32_t base_value;
+    void* addr = Alloc(kernel_handle.dispatcher(), "new", &base_value);
+    if (unlikely(!addr))
+        return nullptr;
+    kcounter_add(handle_count_made, 1);
+    kcounter_add(handle_count_live, 1);
+    return HandleOwner(new (addr) Handle(kernel_handle.release(),
                                          rights, base_value));
 }
 
@@ -186,7 +208,7 @@ void Handle::Delete() {
 
     bool zero_handles = false;
     {
-        Guard<fbl::Mutex> guard{ArenaLock::Get()};
+        Guard<BrwLockPi, BrwLockPi::Writer> guard{ArenaLock::Get()};
         zero_handles = disp->decrement_handle_count();
         arena_.Free(this);
     }
@@ -202,7 +224,7 @@ void Handle::Delete() {
 Handle* Handle::FromU32(uint32_t value) TA_NO_THREAD_SAFETY_ANALYSIS {
     uintptr_t handle_addr = IndexToHandle(value & kHandleIndexMask);
     {
-        Guard<fbl::Mutex> guard{ArenaLock::Get()};
+        Guard<BrwLockPi, BrwLockPi::Reader> guard{ArenaLock::Get()};
         if (unlikely(!arena_.in_range(handle_addr)))
             return nullptr;
     }
@@ -212,16 +234,16 @@ Handle* Handle::FromU32(uint32_t value) TA_NO_THREAD_SAFETY_ANALYSIS {
 
 uint32_t Handle::Count(const fbl::RefPtr<const Dispatcher>& dispatcher) {
     // Handle::ArenaLock also guards Dispatcher::handle_count_.
-    Guard<fbl::Mutex> guard{ArenaLock::Get()};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{ArenaLock::Get()};
     return dispatcher->current_handle_count();
 }
 
 size_t Handle::diagnostics::OutstandingHandles() {
-    Guard<fbl::Mutex> guard{ArenaLock::Get()};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{ArenaLock::Get()};
     return arena_.DiagnosticCount();
 }
 
 void Handle::diagnostics::DumpTableInfo() {
-    Guard<fbl::Mutex> guard{ArenaLock::Get()};
+    Guard<BrwLockPi, BrwLockPi::Reader> guard{ArenaLock::Get()};
     arena_.Dump();
 }

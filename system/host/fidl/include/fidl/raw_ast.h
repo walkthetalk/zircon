@@ -6,6 +6,7 @@
 #define ZIRCON_SYSTEM_HOST_FIDL_INCLUDE_FIDL_RAW_AST_H_
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -63,38 +64,32 @@ public:
 
 class SourceElementMark {
 public:
-    SourceElementMark(TreeVisitor& tv,
+    SourceElementMark(TreeVisitor* tv,
                       const SourceElement& element);
 
     ~SourceElementMark();
 
 private:
-    TreeVisitor& tv_;
+    TreeVisitor* tv_;
     const SourceElement& element_;
 };
 
-class Identifier : public SourceElement {
+class Identifier final : public SourceElement {
 public:
     explicit Identifier(SourceElement const& element)
         : SourceElement(element) {}
 
-    virtual ~Identifier() {}
-
-    void Accept(TreeVisitor& visitor) {
-        SourceElementMark sem(visitor, *this);
-    }
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class CompoundIdentifier : public SourceElement {
+class CompoundIdentifier final : public SourceElement {
 public:
     CompoundIdentifier(SourceElement const& element, std::vector<std::unique_ptr<Identifier>> components)
         : SourceElement(element), components(std::move(components)) {}
 
-    virtual ~CompoundIdentifier() {}
+    void Accept(TreeVisitor* visitor) const;
 
     std::vector<std::unique_ptr<Identifier>> components;
-
-    void Accept(TreeVisitor& visitor);
 };
 
 class Literal : public SourceElement {
@@ -115,46 +110,46 @@ public:
     const Kind kind;
 };
 
-class StringLiteral : public Literal {
+class StringLiteral final : public Literal {
 public:
     explicit StringLiteral(SourceElement const& element)
         : Literal(element, Kind::kString) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class NumericLiteral : public Literal {
+class NumericLiteral final : public Literal {
 public:
     NumericLiteral(SourceElement const& element)
         : Literal(element, Kind::kNumeric) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class Ordinal : public SourceElement {
+class Ordinal final : public SourceElement {
 public:
     Ordinal(SourceElement const& element, uint32_t value)
         : SourceElement(element), value(value) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     const uint32_t value;
 };
 
-class TrueLiteral : public Literal {
+class TrueLiteral final : public Literal {
 public:
     TrueLiteral(SourceElement const& element)
         : Literal(element, Kind::kTrue) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class FalseLiteral : public Literal {
+class FalseLiteral final : public Literal {
 public:
     FalseLiteral(SourceElement const& element)
         : Literal(element, Kind::kFalse) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
 class Constant : public SourceElement {
@@ -172,220 +167,193 @@ public:
     const Kind kind;
 };
 
-class IdentifierConstant : public Constant {
+class IdentifierConstant final : public Constant {
 public:
     explicit IdentifierConstant(std::unique_ptr<CompoundIdentifier> identifier)
         : Constant(identifier->start_, Kind::kIdentifier), identifier(std::move(identifier)) {}
 
     std::unique_ptr<CompoundIdentifier> identifier;
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class LiteralConstant : public Constant {
+class LiteralConstant final : public Constant {
 public:
     explicit LiteralConstant(std::unique_ptr<Literal> literal)
         : Constant(literal->start_, Kind::kLiteral), literal(std::move(literal)) {}
 
     std::unique_ptr<Literal> literal;
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 };
 
-class Attribute : public SourceElement {
+class Attribute final : public SourceElement {
 public:
     Attribute(SourceElement const& element, std::string name, std::string value)
         : SourceElement(element), name(std::move(name)), value(std::move(value)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     const std::string name;
     const std::string value;
 };
 
-class AttributeList : public SourceElement {
+class AttributeList final : public SourceElement {
 public:
-    AttributeList(SourceElement const& element, std::vector<std::unique_ptr<Attribute>> attributes)
+    AttributeList(SourceElement const& element, std::vector<Attribute> attributes)
         : SourceElement(element), attributes(std::move(attributes)) {}
 
     bool HasAttribute(std::string name) const {
         for (const auto& attribute : attributes) {
-            if (attribute->name == name)
+            if (attribute.name == name)
                 return true;
         }
         return false;
     }
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
-    std::vector<std::unique_ptr<Attribute>> attributes;
+    std::vector<Attribute> attributes;
 };
 
-class Type : public SourceElement {
+class TypeConstructor final : public SourceElement {
 public:
-    virtual ~Type() {}
-
-    enum struct Kind {
-        kArray,
-        kVector,
-        kString,
-        kHandle,
-        kRequestHandle,
-        kIdentifier,
-    };
-
-    explicit Type(Token start, Token end, Kind kind)
-        : SourceElement(start, end), kind(kind) {}
-
-    const Kind kind;
-};
-
-class ArrayType : public Type {
-public:
-    ArrayType(SourceElement const& element, std::unique_ptr<Type> element_type, std::unique_ptr<Constant> element_count)
-        : Type(element.start_, element.end_, Kind::kArray), element_type(std::move(element_type)),
-          element_count(std::move(element_count)) {}
-
-    void Accept(TreeVisitor& visitor);
-    std::unique_ptr<Type> element_type;
-    std::unique_ptr<Constant> element_count;
-};
-
-class VectorType : public Type {
-public:
-    VectorType(SourceElement const& element, std::unique_ptr<Type> element_type, std::unique_ptr<Constant> maybe_element_count,
-               types::Nullability nullability)
-        : Type(element.start_, element.end_, Kind::kVector), element_type(std::move(element_type)),
-          maybe_element_count(std::move(maybe_element_count)), nullability(nullability) {}
-
-    void Accept(TreeVisitor& visitor);
-
-    std::unique_ptr<Type> element_type;
-    std::unique_ptr<Constant> maybe_element_count;
-    types::Nullability nullability;
-};
-
-class StringType : public Type {
-public:
-    StringType(SourceElement const& element, std::unique_ptr<Constant> maybe_element_count, types::Nullability nullability)
-        : Type(element.start_, element.end_, Kind::kString), maybe_element_count(std::move(maybe_element_count)),
+    TypeConstructor(SourceElement const& element,
+                    std::unique_ptr<CompoundIdentifier> identifier,
+                    std::unique_ptr<TypeConstructor> maybe_arg_type_ctor,
+                    std::optional<types::HandleSubtype> handle_subtype,
+                    std::unique_ptr<Constant> maybe_size,
+                    types::Nullability nullability)
+        : SourceElement(element.start_, element.end_),
+          identifier(std::move(identifier)),
+          maybe_arg_type_ctor(std::move(maybe_arg_type_ctor)),
+          handle_subtype(handle_subtype),
+          maybe_size(std::move(maybe_size)),
           nullability(nullability) {}
 
-    void Accept(TreeVisitor& visitor);
-
-    std::unique_ptr<Constant> maybe_element_count;
-    types::Nullability nullability;
-};
-
-class HandleType : public Type {
-public:
-    HandleType(SourceElement const& element, types::HandleSubtype subtype, types::Nullability nullability)
-        : Type(element.start_, element.end_, Kind::kHandle), subtype(subtype), nullability(nullability) {}
-
-    void Accept(TreeVisitor& visitor);
-
-    types::HandleSubtype subtype;
-    types::Nullability nullability;
-};
-
-class RequestHandleType : public Type {
-public:
-    RequestHandleType(SourceElement const& element, std::unique_ptr<CompoundIdentifier> identifier,
-                      types::Nullability nullability)
-        : Type(element.start_, element.end_, Kind::kRequestHandle), identifier(std::move(identifier)), nullability(nullability) {}
-
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<CompoundIdentifier> identifier;
+    std::unique_ptr<TypeConstructor> maybe_arg_type_ctor;
+    std::optional<types::HandleSubtype> handle_subtype;
+    std::unique_ptr<Constant> maybe_size;
     types::Nullability nullability;
 };
 
-class IdentifierType : public Type {
+class BitsMember final : public SourceElement {
 public:
-    IdentifierType(SourceElement const& element, std::unique_ptr<CompoundIdentifier> identifier, types::Nullability nullability)
-        : Type(element.start_, element.end_, Kind::kIdentifier), identifier(std::move(identifier)), nullability(nullability) {}
-
-    void Accept(TreeVisitor& visitor);
-
-    std::unique_ptr<CompoundIdentifier> identifier;
-    types::Nullability nullability;
-};
-
-class Using : public SourceElement {
-public:
-    Using(SourceElement const& element, std::unique_ptr<CompoundIdentifier> using_path, std::unique_ptr<Identifier> maybe_alias, std::unique_ptr<IdentifierType> maybe_type)
-        : SourceElement(element), using_path(std::move(using_path)), maybe_alias(std::move(maybe_alias)), maybe_type(std::move(maybe_type)) {}
-
-    void Accept(TreeVisitor& visitor);
-
-    std::unique_ptr<CompoundIdentifier> using_path;
-    std::unique_ptr<Identifier> maybe_alias;
-    // TODO(pascal): We should be more explicit for type aliases such as
-    // `using foo = int8;` and use a special purpose AST element.
-    std::unique_ptr<IdentifierType> maybe_type;
-};
-
-class ConstDeclaration : public SourceElement {
-public:
-    ConstDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes, std::unique_ptr<Type> type,
-                     std::unique_ptr<Identifier> identifier, std::unique_ptr<Constant> constant)
-        : SourceElement(element), attributes(std::move(attributes)), type(std::move(type)),
-          identifier(std::move(identifier)), constant(std::move(constant)) {}
-
-    void Accept(TreeVisitor& visitor);
-
-    std::unique_ptr<AttributeList> attributes;
-    std::unique_ptr<Type> type;
-    std::unique_ptr<Identifier> identifier;
-    std::unique_ptr<Constant> constant;
-};
-
-class EnumMember : public SourceElement {
-public:
-    EnumMember(SourceElement const& element, std::unique_ptr<Identifier> identifier, std::unique_ptr<Constant> value, std::unique_ptr<AttributeList> attributes)
+    BitsMember(SourceElement const& element, std::unique_ptr<Identifier> identifier, std::unique_ptr<Constant> value, std::unique_ptr<AttributeList> attributes)
         : SourceElement(element), identifier(std::move(identifier)), value(std::move(value)), attributes(std::move(attributes)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<Identifier> identifier;
     std::unique_ptr<Constant> value;
     std::unique_ptr<AttributeList> attributes;
 };
 
-class EnumDeclaration : public SourceElement {
+class BitsDeclaration final : public SourceElement {
 public:
-    EnumDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
+    BitsDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
                     std::unique_ptr<Identifier> identifier,
-                    std::unique_ptr<IdentifierType> maybe_subtype,
-                    std::vector<std::unique_ptr<EnumMember>> members)
-        : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
-          maybe_subtype(std::move(maybe_subtype)), members(std::move(members)) {}
+                    std::unique_ptr<TypeConstructor> maybe_type_ctor,
+                    std::vector<std::unique_ptr<BitsMember>> members)
+        : SourceElement(element), attributes(std::move(attributes)),
+          identifier(std::move(identifier)),
+          maybe_type_ctor(std::move(maybe_type_ctor)), members(std::move(members)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
-    std::unique_ptr<IdentifierType> maybe_subtype;
+    std::unique_ptr<TypeConstructor> maybe_type_ctor;
+    std::vector<std::unique_ptr<BitsMember>> members;
+};
+
+class Using final : public SourceElement {
+public:
+    Using(SourceElement const& element, std::unique_ptr<CompoundIdentifier> using_path,
+          std::unique_ptr<Identifier> maybe_alias,
+          std::unique_ptr<TypeConstructor> maybe_type_ctor)
+        : SourceElement(element), using_path(std::move(using_path)),
+          maybe_alias(std::move(maybe_alias)),
+          maybe_type_ctor(std::move(maybe_type_ctor)) {}
+
+    void Accept(TreeVisitor* visitor) const;
+
+    std::unique_ptr<CompoundIdentifier> using_path;
+    std::unique_ptr<Identifier> maybe_alias;
+    // TODO(pascal): We should be more explicit for type aliases such as
+    // `using foo = int8;` and use a special purpose AST element.
+    std::unique_ptr<TypeConstructor> maybe_type_ctor;
+};
+
+class ConstDeclaration final : public SourceElement {
+public:
+    ConstDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
+                     std::unique_ptr<TypeConstructor> type_ctor,
+                     std::unique_ptr<Identifier> identifier, std::unique_ptr<Constant> constant)
+        : SourceElement(element), attributes(std::move(attributes)),
+          type_ctor(std::move(type_ctor)),
+          identifier(std::move(identifier)), constant(std::move(constant)) {}
+
+    void Accept(TreeVisitor* visitor) const;
+
+    std::unique_ptr<AttributeList> attributes;
+    std::unique_ptr<TypeConstructor> type_ctor;
+    std::unique_ptr<Identifier> identifier;
+    std::unique_ptr<Constant> constant;
+};
+
+class EnumMember final : public SourceElement {
+public:
+    EnumMember(SourceElement const& element, std::unique_ptr<Identifier> identifier, std::unique_ptr<Constant> value, std::unique_ptr<AttributeList> attributes)
+        : SourceElement(element), identifier(std::move(identifier)), value(std::move(value)), attributes(std::move(attributes)) {}
+
+    void Accept(TreeVisitor* visitor) const;
+
+    std::unique_ptr<Identifier> identifier;
+    std::unique_ptr<Constant> value;
+    std::unique_ptr<AttributeList> attributes;
+};
+
+class EnumDeclaration final : public SourceElement {
+public:
+    EnumDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
+                    std::unique_ptr<Identifier> identifier,
+                    std::unique_ptr<TypeConstructor> maybe_type_ctor,
+                    std::vector<std::unique_ptr<EnumMember>> members)
+        : SourceElement(element), attributes(std::move(attributes)),
+          identifier(std::move(identifier)),
+          maybe_type_ctor(std::move(maybe_type_ctor)), members(std::move(members)) {}
+
+    void Accept(TreeVisitor* visitor) const;
+
+    std::unique_ptr<AttributeList> attributes;
+    std::unique_ptr<Identifier> identifier;
+    std::unique_ptr<TypeConstructor> maybe_type_ctor;
     std::vector<std::unique_ptr<EnumMember>> members;
 };
 
-class Parameter : public SourceElement {
+class Parameter final : public SourceElement {
 public:
-    Parameter(SourceElement const& element, std::unique_ptr<Type> type, std::unique_ptr<Identifier> identifier)
-        : SourceElement(element), type(std::move(type)), identifier(std::move(identifier)) {}
+    Parameter(SourceElement const& element, std::unique_ptr<TypeConstructor> type_ctor,
+              std::unique_ptr<Identifier> identifier)
+        : SourceElement(element), type_ctor(std::move(type_ctor)),
+          identifier(std::move(identifier)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
-    std::unique_ptr<Type> type;
+    std::unique_ptr<TypeConstructor> type_ctor;
     std::unique_ptr<Identifier> identifier;
 };
 
-class ParameterList : public SourceElement {
+class ParameterList final : public SourceElement {
 public:
     ParameterList(SourceElement const& element, std::vector<std::unique_ptr<Parameter>> parameter_list)
         : SourceElement(element), parameter_list(std::move(parameter_list)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::vector<std::unique_ptr<Parameter>> parameter_list;
 };
@@ -397,56 +365,69 @@ public:
                     std::unique_ptr<Identifier> identifier,
                     std::unique_ptr<ParameterList> maybe_request,
                     std::unique_ptr<ParameterList> maybe_response,
-                    std::unique_ptr<Type> maybe_error)
+                    std::unique_ptr<TypeConstructor> maybe_error_ctor)
         : SourceElement(element), attributes(std::move(attributes)),
           ordinal(std::move(ordinal)), identifier(std::move(identifier)),
           maybe_request(std::move(maybe_request)), maybe_response(std::move(maybe_response)),
-          maybe_error(std::move(maybe_error)) { }
+          maybe_error_ctor(std::move(maybe_error_ctor)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Ordinal> ordinal;
     std::unique_ptr<Identifier> identifier;
     std::unique_ptr<ParameterList> maybe_request;
     std::unique_ptr<ParameterList> maybe_response;
-    std::unique_ptr<Type> maybe_error;
+    std::unique_ptr<TypeConstructor> maybe_error_ctor;
 };
 
-class InterfaceDeclaration : public SourceElement {
+class ComposeProtocol final : public SourceElement {
+public:
+    ComposeProtocol(SourceElement const& element,
+                    std::unique_ptr<CompoundIdentifier> protocol_name)
+        : SourceElement(element), protocol_name(std::move(protocol_name)) {}
+
+    void Accept(TreeVisitor* visitor) const;
+
+    std::unique_ptr<CompoundIdentifier> protocol_name;
+};
+
+class InterfaceDeclaration final : public SourceElement {
 public:
     InterfaceDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
                          std::unique_ptr<Identifier> identifier,
-                         std::vector<std::unique_ptr<CompoundIdentifier>> superinterfaces,
+                         std::vector<std::unique_ptr<ComposeProtocol>> superinterfaces,
                          std::vector<std::unique_ptr<InterfaceMethod>> methods)
         : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
           superinterfaces(std::move(superinterfaces)), methods(std::move(methods)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
-    std::vector<std::unique_ptr<CompoundIdentifier>> superinterfaces;
+    std::vector<std::unique_ptr<ComposeProtocol>> superinterfaces;
     std::vector<std::unique_ptr<InterfaceMethod>> methods;
 };
 
-class StructMember : public SourceElement {
+class StructMember final : public SourceElement {
 public:
-    StructMember(SourceElement const& element, std::unique_ptr<Type> type, std::unique_ptr<Identifier> identifier,
+    StructMember(SourceElement const& element, std::unique_ptr<TypeConstructor> type_ctor,
+                 std::unique_ptr<Identifier> identifier,
                  std::unique_ptr<Constant> maybe_default_value,
                  std::unique_ptr<AttributeList> attributes)
-        : SourceElement(element), type(std::move(type)), identifier(std::move(identifier)),
-          maybe_default_value(std::move(maybe_default_value)), attributes(std::move(attributes)) {}
+        : SourceElement(element), type_ctor(std::move(type_ctor)),
+          identifier(std::move(identifier)), maybe_default_value(std::move(maybe_default_value)),
+          attributes(std::move(attributes)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
-    std::unique_ptr<Type> type;
+    std::unique_ptr<TypeConstructor> type_ctor;
     std::unique_ptr<Identifier> identifier;
     std::unique_ptr<Constant> maybe_default_value;
     std::unique_ptr<AttributeList> attributes;
 };
 
-class StructDeclaration : public SourceElement {
+class StructDeclaration final : public SourceElement {
 public:
     // Note: A nullptr passed to attributes means an empty attribute list.
     StructDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
@@ -455,38 +436,38 @@ public:
         : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
           members(std::move(members)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
     std::vector<std::unique_ptr<StructMember>> members;
 };
 
-struct TableMember : public SourceElement {
+struct TableMember final : public SourceElement {
     TableMember(SourceElement const& element, std::unique_ptr<Ordinal> ordinal,
-                std::unique_ptr<Type> type,
+                std::unique_ptr<TypeConstructor> type_ctor,
                 std::unique_ptr<Identifier> identifier,
                 std::unique_ptr<Constant> maybe_default_value,
                 std::unique_ptr<AttributeList> attributes)
         : SourceElement(element), ordinal(std::move(ordinal)),
-          maybe_used(std::make_unique<Used>(std::move(type), std::move(identifier),
+          maybe_used(std::make_unique<Used>(std::move(type_ctor), std::move(identifier),
                                             std::move(maybe_default_value), std::move(attributes))) {}
 
     TableMember(SourceElement const& element, std::unique_ptr<Ordinal> ordinal)
         : SourceElement(element), ordinal(std::move(ordinal)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<Ordinal> ordinal;
     // A used member is not 'reserved'
     struct Used {
-        Used(std::unique_ptr<Type> type,
+        Used(std::unique_ptr<TypeConstructor> type_ctor,
              std::unique_ptr<Identifier> identifier,
              std::unique_ptr<Constant> maybe_default_value,
              std::unique_ptr<AttributeList> attributes)
-            : type(std::move(type)), identifier(std::move(identifier)),
+            : type_ctor(std::move(type_ctor)), identifier(std::move(identifier)),
               maybe_default_value(std::move(maybe_default_value)), attributes(std::move(attributes)) {}
-        std::unique_ptr<Type> type;
+        std::unique_ptr<TypeConstructor> type_ctor;
         std::unique_ptr<Identifier> identifier;
         std::unique_ptr<Constant> maybe_default_value;
         std::unique_ptr<AttributeList> attributes;
@@ -494,34 +475,36 @@ struct TableMember : public SourceElement {
     std::unique_ptr<Used> maybe_used;
 };
 
-struct TableDeclaration : public SourceElement {
+struct TableDeclaration final : public SourceElement {
     TableDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
                      std::unique_ptr<Identifier> identifier,
                      std::vector<std::unique_ptr<TableMember>> members)
         : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
           members(std::move(members)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
     std::vector<std::unique_ptr<TableMember>> members;
 };
 
-class UnionMember : public SourceElement {
+class UnionMember final : public SourceElement {
 public:
-    UnionMember(SourceElement const& element, std::unique_ptr<Type> type, std::unique_ptr<Identifier> identifier,
+    UnionMember(SourceElement const& element, std::unique_ptr<TypeConstructor> type_ctor,
+                std::unique_ptr<Identifier> identifier,
                 std::unique_ptr<AttributeList> attributes)
-        : SourceElement(element), type(std::move(type)), identifier(std::move(identifier)), attributes(std::move(attributes)) {}
+        : SourceElement(element), type_ctor(std::move(type_ctor)),
+          identifier(std::move(identifier)), attributes(std::move(attributes)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
-    std::unique_ptr<Type> type;
+    std::unique_ptr<TypeConstructor> type_ctor;
     std::unique_ptr<Identifier> identifier;
     std::unique_ptr<AttributeList> attributes;
 };
 
-class UnionDeclaration : public SourceElement {
+class UnionDeclaration final : public SourceElement {
 public:
     UnionDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
                      std::unique_ptr<Identifier> identifier,
@@ -529,27 +512,28 @@ public:
         : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
           members(std::move(members)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
     std::vector<std::unique_ptr<UnionMember>> members;
 };
 
-class XUnionMember : public SourceElement {
+class XUnionMember final : public SourceElement {
 public:
-    XUnionMember(SourceElement const& element, std::unique_ptr<Type> type, std::unique_ptr<Identifier> identifier,
-                 std::unique_ptr<AttributeList> attributes)
-        : SourceElement(element), type(std::move(type)), identifier(std::move(identifier)), attributes(std::move(attributes)) {}
+    XUnionMember(SourceElement const& element, std::unique_ptr<TypeConstructor> type_ctor,
+                 std::unique_ptr<Identifier> identifier, std::unique_ptr<AttributeList> attributes)
+        : SourceElement(element), type_ctor(std::move(type_ctor)),
+          identifier(std::move(identifier)), attributes(std::move(attributes)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
-    std::unique_ptr<Type> type;
+    std::unique_ptr<TypeConstructor> type_ctor;
     std::unique_ptr<Identifier> identifier;
     std::unique_ptr<AttributeList> attributes;
 };
 
-class XUnionDeclaration : public SourceElement {
+class XUnionDeclaration final : public SourceElement {
 public:
     XUnionDeclaration(SourceElement const& element, std::unique_ptr<AttributeList> attributes,
                       std::unique_ptr<Identifier> identifier,
@@ -557,19 +541,20 @@ public:
         : SourceElement(element), attributes(std::move(attributes)), identifier(std::move(identifier)),
           members(std::move(members)) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<Identifier> identifier;
     std::vector<std::unique_ptr<XUnionMember>> members;
 };
 
-class File : public SourceElement {
+class File final : public SourceElement {
 public:
     File(SourceElement const& element, Token end,
          std::unique_ptr<AttributeList> attributes,
          std::unique_ptr<CompoundIdentifier> library_name,
          std::vector<std::unique_ptr<Using>> using_list,
+         std::vector<std::unique_ptr<BitsDeclaration>> bits_declaration_list,
          std::vector<std::unique_ptr<ConstDeclaration>> const_declaration_list,
          std::vector<std::unique_ptr<EnumDeclaration>> enum_declaration_list,
          std::vector<std::unique_ptr<InterfaceDeclaration>> interface_declaration_list,
@@ -581,6 +566,7 @@ public:
           attributes(std::move(attributes)),
           library_name(std::move(library_name)),
           using_list(std::move(using_list)),
+          bits_declaration_list(std::move(bits_declaration_list)),
           const_declaration_list(std::move(const_declaration_list)),
           enum_declaration_list(std::move(enum_declaration_list)),
           interface_declaration_list(std::move(interface_declaration_list)),
@@ -590,11 +576,12 @@ public:
           xunion_declaration_list(std::move(xunion_declaration_list)),
           end_(end) {}
 
-    void Accept(TreeVisitor& visitor);
+    void Accept(TreeVisitor* visitor) const;
 
     std::unique_ptr<AttributeList> attributes;
     std::unique_ptr<CompoundIdentifier> library_name;
     std::vector<std::unique_ptr<Using>> using_list;
+    std::vector<std::unique_ptr<BitsDeclaration>> bits_declaration_list;
     std::vector<std::unique_ptr<ConstDeclaration>> const_declaration_list;
     std::vector<std::unique_ptr<EnumDeclaration>> enum_declaration_list;
     std::vector<std::unique_ptr<InterfaceDeclaration>> interface_declaration_list;

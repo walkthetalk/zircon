@@ -36,10 +36,11 @@ zx_status_t LazyDir::Open(uint32_t flags, fbl::RefPtr<Vnode>* out_redirect) {
     return ZX_OK;
 }
 
-zx_status_t LazyDir::Getattr(vnattr_t* out_attr) {
-    memset(out_attr, 0, sizeof(vnattr_t));
-    out_attr->mode = V_TYPE_DIR | V_IRUSR;
-    out_attr->nlink = 1;
+zx_status_t LazyDir::Getattr(vnattr_t* attr) {
+    memset(attr, 0, sizeof(vnattr_t));
+    attr->mode = V_TYPE_DIR | V_IRUSR;
+    attr->inode = fuchsia_io_INO_UNKNOWN;
+    attr->nlink = 1;
     return ZX_OK;
 }
 
@@ -84,6 +85,11 @@ zx_status_t LazyDir::Readdir(vdircookie_t* cookie, void* dirents, size_t len, si
         cookie->n = it->id;
     }
     *out_actual = df.BytesFilled();
+    return ZX_OK;
+}
+
+zx_status_t LazyDir::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
+    info->tag = fuchsia_io_NodeInfoTag_directory;
     return ZX_OK;
 }
 

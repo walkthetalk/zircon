@@ -7,17 +7,22 @@
 #pragma once
 
 #include <fbl/arena.h>
-#include <fbl/atomic.h>
 #include <fbl/intrusive_double_list.h>
 #include <fbl/macros.h>
 #include <fbl/mutex.h>
 #include <fbl/ref_ptr.h>
+#include <kernel/brwlock.h>
 #include <kernel/lockdep.h>
+#include <ktl/atomic.h>
+#include <ktl/move.h>
 #include <stdint.h>
 #include <zircon/types.h>
 
 class Dispatcher;
 class Handle;
+
+template <typename T>
+class KernelHandle;
 
 // HandleOwner wraps a Handle in a unique_ptr-like object that has single
 // ownership of the Handle and deletes it whenever it falls out of scope.
@@ -79,9 +84,9 @@ private:
 // A Handle is how a specific process refers to a specific Dispatcher.
 class Handle final : public fbl::DoublyLinkedListable<Handle*> {
 public:
-    // The handle arena's mutex. This is public since it protects
+    // The handle arena's lock. This is public since it protects
     // other things like |Dispatcher::handle_count_|.
-    DECLARE_SINGLETON_MUTEX(ArenaLock);
+    DECLARE_SINGLETON_BRWLOCK_PI(ArenaLock);
 
     // Returns the Dispatcher to which this instance points.
     const fbl::RefPtr<Dispatcher>& dispatcher() const { return dispatcher_; }
@@ -89,7 +94,7 @@ public:
     // Returns the process that owns this instance. Used to guarantee
     // that one process may not access a handle owned by a different process.
     zx_koid_t process_id() const {
-        return process_id_.load(fbl::memory_order_relaxed);
+        return process_id_.load(ktl::memory_order_relaxed);
     }
 
     // Sets the value returned by process_id().
@@ -134,6 +139,8 @@ public:
     // Handle should never be created by anything other than Make or Dup.
     static HandleOwner Make(
         fbl::RefPtr<Dispatcher> dispatcher, zx_rights_t rights);
+    static HandleOwner Make(
+        KernelHandle<Dispatcher> kernel_handle, zx_rights_t rights);
     static HandleOwner Dup(Handle* source, zx_rights_t rights);
 
 private:
@@ -162,7 +169,7 @@ private:
     // process_id_ is atomic because threads from different processes can
     // access it concurrently, while holding different instances of
     // handle_table_lock_.
-    fbl::atomic<zx_koid_t> process_id_;
+    ktl::atomic<zx_koid_t> process_id_;
     fbl::RefPtr<Dispatcher> dispatcher_;
     const zx_rights_t rights_;
     const uint32_t base_value_;
@@ -188,3 +195,69 @@ inline void HandleOwner::Destroy() {
     if (h_)
         h_->Delete();
 }
+
+// A minimal wrapper around a Dispatcher which is owned by the kernel.
+//
+// Intended usage when creating new a Dispatcher object is:
+//   1. Create a KernelHandle on the stack (cannot fail)
+//   2. Move the RefPtr<Dispatcher> into the KernelHandle (cannot fail)
+//   3. When ready to give the handle to a process, upgrade the KernelHandle
+//      to a full HandleOwner via UpgradeToHandleOwner() or
+//      user_out_handle::make() (can fail)
+//
+// This sequence ensures that the Dispatcher's on_zero_handles() method is
+// called even if errors occur during or before HandleOwner creation, which
+// is necessary to break circular references for some Dispatcher types.
+//
+// This class is thread-unsafe and must be externally synchronized if used
+// across multiple threads.
+template <typename T>
+class KernelHandle {
+public:
+    KernelHandle() = default;
+
+    explicit KernelHandle(fbl::RefPtr<T> dispatcher)
+        : dispatcher_(ktl::move(dispatcher)) {}
+
+    ~KernelHandle() {
+        reset();
+    }
+
+    // Movable but not copyable since we own the underlying Dispatcher.
+    KernelHandle(const KernelHandle&) = delete;
+    KernelHandle& operator=(const KernelHandle&) = delete;
+
+    template <typename U>
+    KernelHandle(KernelHandle<U>&& other)
+        : dispatcher_(ktl::move(other.dispatcher_)) {}
+
+    template <typename U>
+    KernelHandle& operator=(KernelHandle<U>&& other) {
+        reset(ktl::move(other.dispatcher_));
+        return *this;
+    }
+
+    void reset() {
+        reset(fbl::RefPtr<T>());
+    }
+
+    template <typename U>
+    void reset(fbl::RefPtr<U> dispatcher) {
+        if (dispatcher_) {
+            dispatcher_->on_zero_handles();
+        }
+        dispatcher_ = ktl::move(dispatcher);
+    }
+
+    const fbl::RefPtr<T>& dispatcher() const { return dispatcher_; }
+
+    fbl::RefPtr<T> release() {
+        return ktl::move(dispatcher_);
+    }
+
+private:
+    template <typename U>
+    friend class KernelHandle;
+
+    fbl::RefPtr<T> dispatcher_;
+};

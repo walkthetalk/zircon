@@ -20,7 +20,7 @@ class SpaceShip {
 public:
     using SpaceShipBinder = fidl::Binder<SpaceShip>;
 
-    virtual ~SpaceShip() {};
+    virtual ~SpaceShip() {}
 
     virtual zx_status_t AdjustHeading(const uint32_t* stars_data,
                                       size_t stars_count, fidl_txn_t* txn) {
@@ -85,6 +85,10 @@ public:
         return fidl_test_spaceship_SpaceShipReportAstrologicalData_reply(txn, status);
     }
 
+    virtual zx_status_t ActivateShields(fidl_test_spaceship_Shields shields) {
+        return ZX_OK;
+    }
+
     virtual zx_status_t Bind(async_dispatcher_t* dispatcher, zx::channel channel) {
         static constexpr fidl_test_spaceship_SpaceShip_ops_t kOps = {
             .AdjustHeading = SpaceShipBinder::BindMember<&SpaceShip::AdjustHeading>,
@@ -98,6 +102,7 @@ public:
                     SpaceShipBinder::BindMember<&SpaceShip::ScanForTensorLifeforms>,
             .ReportAstrologicalData =
                 SpaceShipBinder::BindMember<&SpaceShip::ReportAstrologicalData>,
+            .ActivateShields = SpaceShipBinder::BindMember<&SpaceShip::ActivateShields>,
         };
 
         return SpaceShipBinder::BindOps<fidl_test_spaceship_SpaceShip_dispatch>(
@@ -230,7 +235,7 @@ class AsyncSpaceShip : public SpaceShip {
 public:
     using SpaceShipBinder = fidl::Binder<AsyncSpaceShip>;
 
-    virtual ~AsyncSpaceShip() {};
+    virtual ~AsyncSpaceShip() {}
 
     // Creates a |fidl_async_txn| using the C++ wrapper, and pushes the
     // computation to a background thread.
@@ -298,6 +303,7 @@ public:
                     SpaceShipBinder::BindMember<&SpaceShip::ScanForTensorLifeforms>,
             .ReportAstrologicalData =
                     SpaceShipBinder::BindMember<&SpaceShip::ReportAstrologicalData>,
+            .ActivateShields = SpaceShipBinder::BindMember<&SpaceShip::ActivateShields>,
         };
 
         return SpaceShipBinder::BindOps<fidl_test_spaceship_SpaceShip_dispatch>(
@@ -407,6 +413,7 @@ public:
             .AddFuelTank = DerivedBinder::BindMember<&SpaceShip::AddFuelTank>,
             .ScanForTensorLifeforms = DerivedBinder::BindMember<&Derived::ScanForTensorLifeforms>,
             .ReportAstrologicalData = DerivedBinder::BindMember<&Derived::ReportAstrologicalData>,
+            .ActivateShields = SpaceShipBinder::BindMember<&Derived::ActivateShields>,
         };
 
         return SpaceShipBinder::BindOps<fidl_test_spaceship_SpaceShip_dispatch>(
@@ -419,4 +426,4 @@ public:
 BEGIN_TEST_CASE(spaceship_tests_cpp)
 RUN_NAMED_TEST("fidl.test.spaceship.SpaceShip test", spaceship_test)
 RUN_NAMED_TEST("fidl.test.spaceship.SpaceShip async test", spaceship_async_test)
-END_TEST_CASE(spaceship_tests_cpp);
+END_TEST_CASE(spaceship_tests_cpp)

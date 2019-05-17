@@ -8,15 +8,19 @@
 
 #include <string.h>
 
-#include <zircon/rights.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
+#include <lib/counters.h>
 #include <object/handle.h>
+#include <zircon/rights.h>
+
+KCOUNTER(dispatcher_fifo_create_count, "dispatcher.fifo.create")
+KCOUNTER(dispatcher_fifo_destroy_count, "dispatcher.fifo.destroy")
 
 // static
 zx_status_t FifoDispatcher::Create(size_t count, size_t elemsize, uint32_t options,
-                                   fbl::RefPtr<Dispatcher>* dispatcher0,
-                                   fbl::RefPtr<Dispatcher>* dispatcher1,
+                                   KernelHandle<FifoDispatcher>* handle0,
+                                   KernelHandle<FifoDispatcher>* handle1,
                                    zx_rights_t* rights) {
     // count and elemsize must be nonzero
     // count must be a power of two
@@ -37,8 +41,10 @@ zx_status_t FifoDispatcher::Create(size_t count, size_t elemsize, uint32_t optio
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto fifo0 = fbl::AdoptRef(new (&ac) FifoDispatcher(ktl::move(holder0), options, static_cast<uint32_t>(count),
-                                                        static_cast<uint32_t>(elemsize), ktl::move(data0)));
+    KernelHandle fifo0(fbl::AdoptRef(new (&ac) FifoDispatcher(ktl::move(holder0), options,
+                                                              static_cast<uint32_t>(count),
+                                                              static_cast<uint32_t>(elemsize),
+                                                              ktl::move(data0))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
@@ -46,17 +52,19 @@ zx_status_t FifoDispatcher::Create(size_t count, size_t elemsize, uint32_t optio
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto fifo1 = fbl::AdoptRef(new (&ac) FifoDispatcher(ktl::move(holder1), options, static_cast<uint32_t>(count),
-                                                        static_cast<uint32_t>(elemsize), ktl::move(data1)));
+    KernelHandle fifo1(fbl::AdoptRef(new (&ac) FifoDispatcher(ktl::move(holder1), options,
+                                                              static_cast<uint32_t>(count),
+                                                              static_cast<uint32_t>(elemsize),
+                                                              ktl::move(data1))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    fifo0->Init(fifo1);
-    fifo1->Init(fifo0);
+    fifo0.dispatcher()->Init(fifo1.dispatcher());
+    fifo1.dispatcher()->Init(fifo0.dispatcher());
 
     *rights = default_rights();
-    *dispatcher0 = ktl::move(fifo0);
-    *dispatcher1 = ktl::move(fifo1);
+    *handle0 = ktl::move(fifo0);
+    *handle1 = ktl::move(fifo1);
     return ZX_OK;
 }
 
@@ -66,9 +74,11 @@ FifoDispatcher::FifoDispatcher(fbl::RefPtr<PeerHolder<FifoDispatcher>> holder,
     : PeeredDispatcher(ktl::move(holder), ZX_FIFO_WRITABLE),
       elem_count_(count), elem_size_(elem_size), mask_(count - 1),
       head_(0u), tail_(0u), data_(ktl::move(data)) {
+    kcounter_add(dispatcher_fifo_create_count, 1);
 }
 
 FifoDispatcher::~FifoDispatcher() {
+    kcounter_add(dispatcher_fifo_destroy_count, 1);
 }
 
 // Thread safety analysis disabled as this happens during creation only,

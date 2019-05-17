@@ -2,9 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <stdarg.h>
+#include <string.h>
+
 #include "ftlnp.h"
 
-#if INC_FTL_NDM
 // Local Function Definitions
 
 //  format_ftl: Erase all non-free blocks
@@ -76,7 +78,7 @@ static ui32 first_free_blk(CFTLN ftl) {
     for (b = 0;; ++b) {
         // Return error if no block is free.
         if (b == ftl->num_blks)
-            return (ui32)FsError(ENOSPC);
+            return (ui32)FsError2(FTL_NO_FREE_BLK, ENOSPC);
 
         // If block is free, return its block number.
         if (IS_FREE(ftl->bdata[b]))
@@ -101,7 +103,7 @@ int FtlnReport(void* vol, ui32 msg, ...) {
 
     // Set errno and return -1 if fatal I/O error occurred.
     if (ftl->flags & FTLN_FATAL_ERR)
-        return FsError(EIO);
+        return FsError2(NDM_EIO, EIO);
 
     // Handle event passed down from file system layer.
     switch (msg) {
@@ -110,7 +112,7 @@ int FtlnReport(void* vol, ui32 msg, ...) {
 
             // Return error if volume is mounted.
             if (ftl->flags & FTLN_MOUNTED)
-                return FsError(EEXIST);
+                return FsError2(FTL_MOUNTED, EEXIST);
 
             // Format volume. Return -1 if error.
             if (format_ftl(ftl))
@@ -130,21 +132,8 @@ int FtlnReport(void* vol, ui32 msg, ...) {
             return 1;
         }
 
-        case FS_PAGE_SZ:
-            return ftl->page_size;
-
-        case FS_FAT_SECTS:
-            return ftl->num_vsects;
-
         case FS_FORMAT:
         case FS_FORMAT_RESET_WC: {
-#if INC_FAT_MBR
-            // If there is an MBR present, save it. Return -1 if error.
-            if (ftl->vol_frst_sect)
-                if (FtlnRdSects(ftl->main_buf, 0, 1, ftl))
-                    return -1;
-#endif
-
             // Format volume. Return -1 if error.
             if (format_ftl(ftl))
                 return -1;
@@ -160,13 +149,6 @@ int FtlnReport(void* vol, ui32 msg, ...) {
                 for (b = 0; b < ftl->num_blks; ++b) ftl->blk_wc_lag[b] = 0;
             }
 
-#if INC_FAT_MBR
-            // If there was an MBR present, rewrite it. Return -1 if error.
-            if (ftl->vol_frst_sect)
-                if (FtlnWrSects(ftl->main_buf, 0, 1, ftl))
-                    return -1;
-#endif
-
             // Return success.
             return 0;
         }
@@ -177,26 +159,19 @@ int FtlnReport(void* vol, ui32 msg, ...) {
         case FS_UNMOUNT:
             // Return error if not mounted.
             if ((ftl->flags & FTLN_MOUNTED) == FALSE)
-                return FsError(ENOENT);
+                return FsError2(FTL_UNMOUNTED, ENOENT);
 
             // Clear the 'mounted' flag.
             ftl->flags &= ~FTLN_MOUNTED;
         // FALLTHROUGH
 
         case FS_SYNC: {
-#if INC_FTL_PAGE_CACHE
-            // If there is a volume page cache, save all dirty pages.
-            if (ftl->vol_cache)
-                if (FcFlush(ftl->vol_cache) == -1)
-                    return -1;
-#endif
-
             // Prepare to write all dirty map cache pages. Return -1 if err.
             if (FtlnRecCheck(ftl, 0))
                 return -1;
 
             // Save all dirty map pages to flash. Return -1 if error.
-            if (ftlmcFlushMaps(ftl->map_cache))
+            if (ftlmcFlushMap(ftl->map_cache))
                 return -1;
             PfAssert(ftl->num_free_blks >= FTLN_MIN_FREE_BLKS);
 
@@ -304,33 +279,19 @@ int FtlnReport(void* vol, ui32 msg, ...) {
             return 0;
         }
 
-        case FS_FLUSH_SECT: {
-            ui32 vsn, mpn;
+        case FS_FLUSH_PAGE: {
+            ui32 vpn, mpn;
 
-            // Use the va_arg mechanism to get virtual sector to be flushed.
+            // Use the va_arg mechanism to get virtual page to be flushed.
             va_start(ap, msg);
-            vsn = va_arg(ap, ui32);
+            vpn = va_arg(ap, ui32);
             va_end(ap);
 
             // Check argument for validity.
-            if (vsn > ftl->num_vsects)
-                return -1;
+            PfAssert(vpn < ftl->num_vpages);
 
-#if INC_FAT_MBR
-            // If cluster sector, ensure it is page aligned.
-            if (vsn >= ftl->frst_clust_sect)
-                vsn += ftl->clust_off;
-#endif
-
-#if INC_FTL_PAGE_CACHE
-            // If volume pages are cached, flush page if present and dirty.
-            if (ftl->vol_cache)
-                if (ftlvcFlushPage(ftl->vol_cache, vsn / ftl->sects_per_page))
-                    return -1;
-#endif
-
-            // Figure out MPN this sector belongs to.
-            mpn = (vsn / ftl->sects_per_page) / ftl->mappings_per_mpg;
+            // Figure out MPN this page belongs to.
+            mpn = vpn / ftl->mappings_per_mpg;
 
             // Flush MPN from cache. Return -1 if error.
             if (ftlmcFlushPage(ftl->map_cache, mpn))
@@ -347,55 +308,21 @@ int FtlnReport(void* vol, ui32 msg, ...) {
         }
 
         case FS_MARK_UNUSED: {
-            ui32 ppn, vsn, count, past_end, vpn;
+            ui32 ppn, count, past_end, vpn;
 
-            // Use va_arg mechanism to get the starting sector and number of
-            // sectors to be invalidated.
+            // Use va_arg mechanism to get the starting page and number of
+            // pages to be invalidated.
             va_start(ap, msg);
-            vsn = va_arg(ap, ui32);
+            vpn = va_arg(ap, ui32);
             count = va_arg(ap, ui32);
             va_end(ap);
 
             // Check arguments for validity.
-            if (vsn + count > ftl->num_vsects)
+            if (vpn + count > ftl->num_vpages)
                 return -1;
-
-#if INC_FAT_MBR
-            // Ensure cluster requests are page aligned.
-            if (vsn >= ftl->frst_clust_sect)
-                vsn += ftl->clust_off;
-#endif
-
-#if INC_SECT_FTL
-            // If starting sector is not page aligned, move to next whole
-            // page if any.
-            if (vsn % ftl->sects_per_page) {
-                ui32 round_off;
-
-                // Compute page round off based on starting sector.
-                round_off = ftl->sects_per_page - vsn % ftl->sects_per_page;
-
-                // If request is for less than one full page, return -1.
-                if (count < round_off)
-                    return -1;
-
-                // Adjust count and starting sector to account for round off.
-                count -= round_off;
-                vsn += round_off;
-            }
-
-            // Ensure whole number of pages are marked dirty.
-            count -= count % ftl->sects_per_page;
-            if (count == 0)
-                return -1;
-#endif
-
-            // Compute first and one past last page that will be dirty.
-            vpn = vsn / ftl->sects_per_page;
-            past_end = vpn + count / ftl->sects_per_page;
 
             // Mark page(s) unused in FTL.
-            for (; vpn < past_end; ++vpn) {
+            for (past_end = vpn + count; vpn < past_end; ++vpn) {
                 // Prepare to potentially write 1 map page. Return -1 if error.
                 if (FtlnRecCheck(ftl, -1))
                     return -1;
@@ -424,12 +351,6 @@ int FtlnReport(void* vol, ui32 msg, ...) {
                 // End check for no physical page number changes.
                 ftl->assert_no_recycle = FALSE;
 #endif
-
-#if INC_FTL_PAGE_CACHE
-                // If volume pages cache, remove page entry if cached.
-                if (ftl->vol_cache)
-                    FcRmvEntry(ftl->vol_cache, vpn);
-#endif
             }
 
             // Return success.
@@ -445,36 +366,19 @@ int FtlnReport(void* vol, ui32 msg, ...) {
             va_end(ap);
 
             // Get the garbage level.
-            buf->fat.garbage_level = FtlnGarbLvl(ftl);
+            buf->xfs.garbage_level = FtlnGarbLvl(ftl);
 
             // Get TargetFTL-NDM RAM usage.
             ftl->stats.ram_used = sizeof(struct ftln) + ftl->num_map_pgs * sizeof(ui32) +
-#if INC_SECT_FTL
-                                  2 * ftl->page_size + ftl->eb_size * ftl->pgs_per_blk +
-#else
-                                  1 * ftl->page_size + ftl->eb_size * ftl->pgs_per_blk +
-#endif
+                                  ftl->page_size + ftl->eb_size * ftl->pgs_per_blk +
                                   ftlmcRAM(ftl->map_cache) +
                                   ftl->num_blks * (sizeof(ui32) + sizeof(ui8));
-#if INC_FTL_PAGE_CACHE
-            if (ftl->vol_cache)
-                ftl->stats.ram_used += FcRAM(ftl->vol_cache);
-#endif
 #if FTLN_DEBUG > 1
             printf("TargetFTL-NDM RAM usage:\n");
             printf(" - sizeof(Ftln) : %u\n", (int)sizeof(FTLN));
-            printf(" - tmp buffers  : %u\n",
-#if INC_SECT_FTL
-                   2 * ftl->page_size + ftl->eb_size * ftl->pgs_per_blk);
-#else
-                   1 * ftl->page_size + ftl->eb_size * ftl->pgs_per_blk);
-#endif
+            printf(" - tmp buffers  : %u\n", ftl->page_size + ftl->eb_size * ftl->pgs_per_blk);
             printf(" - map pages    : %u\n", ftl->num_map_pgs * 4);
             printf(" - map cache    : %u\n", ftlmcRAM(ftl->map_cache));
-#if INC_FTL_PAGE_CACHE
-            if (ftl->vol_cache)
-                printf(" - vol pg cache : %u\n", FcRAM(ftl->vol_cache));
-#endif
             printf(" - bdata[]      : %u\n", ftl->num_blks * (int)(sizeof(ui32) + sizeof(ui8)));
 #endif
 
@@ -482,9 +386,8 @@ int FtlnReport(void* vol, ui32 msg, ...) {
             ftl->stats.wear_count = ftl->high_wc;
 
             // Set TargetFTL-NDM driver call counts and reset internal ones.
-            buf->fat.drvr_stats.ftl.ndm = ftl->stats;
-            buf->fat.ftl_type = FTL_NDM;
-            bzero(&ftl->stats, sizeof(ftl_ndm_stats));
+            buf->xfs.drvr_stats.ftl.ndm = ftl->stats;
+            memset(&ftl->stats, 0, sizeof(ftl_ndm_stats));
 
             // Return success.
             return 0;
@@ -493,14 +396,14 @@ int FtlnReport(void* vol, ui32 msg, ...) {
         case FS_MOUNT:
             // Return error if already mounted. Else set mounted flag.
             if (ftl->flags & FTLN_MOUNTED)
-                return FsError(EEXIST);
+                return FsError2(FTL_MOUNTED, EEXIST);
             ftl->flags |= FTLN_MOUNTED;
 
 #if FTLN_DEBUG > 1
             // Display FTL statistics.
             FtlnStats(ftl);
             FtlnBlkStats(ftl);
-#else
+#elif FTLN_DEBUG
             printf("FTL: total blocks: %u, free blocks: %u\n", ftl->num_blks, ftl->num_free_blks);
 #endif
 
@@ -521,7 +424,7 @@ int FtlnReport(void* vol, ui32 msg, ...) {
 //
 void FtlnMlcSafeFreeVpn(FTLN ftl) {
     // Only adjust MLC volumes for which volume free pointer is set.
-    if ((ftl->type == NDM_MLC) && (ftl->free_vpn != (ui32)-1)) {
+    if (ftl->free_vpn != (ui32)-1) {
         ui32 pn = ndmPastPrevPair(ftl->ndm, ftl->free_vpn);
 
 #if FTLN_DEBUG
@@ -531,96 +434,6 @@ void FtlnMlcSafeFreeVpn(FTLN ftl) {
     }
 }
 #endif // INC_FTL_NDM_MLC
-
-#if INC_FAT_MBR
-// FtlnSetClustSect1: Set frst_clust_sect from FAT boot sector
-//
-//      Inputs: vol = FTL handle
-//              bpb = buffer with contents of FAT boot sector
-//              format_req = TRUE when FAT format ongoing
-//
-//     Returns: 0 on success, -1 on failure
-//
-//        Note: Because a boot sector is optional, this routine does
-//              not fail if a boot sector is not found. It only fails
-//              if an allocation or I/O error occurs.
-//
-int FtlnSetClustSect1(FTLN ftl, const ui8* bpb, int format_req) {
-    ui16 rsrvd_sects, num_fats, root_ents, root_sects;
-    ui32 sects_per_fat, old_clust_off, ssize;
-    int rc = 0;
-
-    // Check the boot sector signature. Return 0 if not boot sector.
-    if (bpb[510] != 0x55 && bpb[511] != 0xAA)
-        return 0;
-
-    // Check the first byte of the jump instruction for the boot code.
-    if (bpb[0] != 0xEB && bpb[0] != 0xE9)
-        return 0;
-
-    // Check that the sector size is valid.
-    ssize = RD16_LE(&bpb[11]);
-    if (ssize != 512 && ssize != 1024 && ssize != 2048 && ssize != 4096)
-        return 0;
-
-    // Get the number of FAT reserved sectors.
-    rsrvd_sects = RD16_LE(&bpb[14]);
-
-    // Get the number of FAT tables.
-    num_fats = bpb[16];
-
-    // Get the size of a FAT table.
-    sects_per_fat = RD16_LE(&bpb[22]);
-    if (sects_per_fat == 0)
-        sects_per_fat = RD32_LE(&bpb[36]);
-
-    // Get the number of root entries and figure out root size.
-    root_ents = RD16_LE(&bpb[17]);
-    root_sects = (root_ents * 32 + FAT_SECT_SZ - 1) / FAT_SECT_SZ;
-
-    // Figure out where the first sector of first cluster is.
-    ftl->frst_clust_sect = ftl->vol_frst_sect + num_fats * sects_per_fat + rsrvd_sects + root_sects;
-
-    // Calculate offset needed to page-align the cluster sectors.
-    old_clust_off = ftl->clust_off;
-    ftl->clust_off = ftl->sects_per_page - (ftl->frst_clust_sect % ftl->sects_per_page);
-
-    // If this is a FAT32 volume and the offset is changed during a
-    // format request, need to clear the root directory cluster to
-    // account for the change in offset.
-    if (root_sects == 0 && old_clust_off != ftl->clust_off && format_req) {
-        ui32 root_1st_clust, root_1st_sect;
-        ui8 sects_per_clust, *clust_buf;
-
-        // Retrieve cluster size.
-        sects_per_clust = bpb[13];
-
-        // Retrieve root cluster.
-        root_1st_clust = RD32_LE(&bpb[44]);
-
-        // Compute first sector for root cluster.
-        root_1st_sect = (root_1st_clust - 2) * sects_per_clust + ftl->frst_clust_sect;
-
-        // Allocate buffer for cluster write. Return -1 if unable.
-        clust_buf = FsCalloc(FAT_SECT_SZ * sects_per_clust, 1);
-        if (clust_buf == NULL)
-            rc = -1;
-
-        // Else write 0's in the root cluster and then free buffer.
-        else {
-            rc = FtlnWrSects(clust_buf, root_1st_sect, sects_per_clust, ftl);
-            FsFree(clust_buf);
-        }
-    }
-
-#if FTLN_DEBUG
-    printf("FtlnSetClustSect1: set to %u, offset = %u\n", ftl->frst_clust_sect, ftl->clust_off);
-#endif
-
-    // Return status.
-    return rc;
-}
-#endif // INC_FAT_MBR
 
 // FtlnEraseBlk: Erase a block, increment its wear count, and mark it
 //               free and erased
@@ -650,7 +463,7 @@ int FtlnEraseBlk(FTLN ftl, ui32 b) {
 
     // Call driver to erase block. Return -1 if error.
     ++ftl->stats.erase_block;
-    if (ftl->erase_block(ftl->start_pn + b * ftl->pgs_per_blk, ftl->ndm))
+    if (ndmEraseBlock(ftl->start_pn + b * ftl->pgs_per_blk, ftl->ndm))
         return FtlnFatErr(ftl);
 
     // Increment block wear count and possibly adjust highest.
@@ -770,7 +583,7 @@ int FtlnFormat(FTLN ftl, ui32 meta_block) {
 //       Input: ftl = pointer to FTL control block
 //
 void FtlnStateRst(FTLN ftl) {
-    ui32 n;
+    ui32 n;  // TIMER: was 'int'
 
     ftl->high_bc = 0;
     ftl->high_bc_mblk = ftl->resume_vblk = (ui32)-1;
@@ -778,9 +591,6 @@ void FtlnStateRst(FTLN ftl) {
     ftl->copy_end_found = FALSE;
     ftl->max_rc_blk = (ui32)-1;
     ftl->free_vpn = ftl->free_mpn = (ui32)-1;
-#if INC_FAT_MBR
-    ftl->frst_clust_sect = (ui32)-1;
-#endif
 #if INC_ELIST
     ftl->elist_blk = (ui32)-1;
 #endif
@@ -794,10 +604,6 @@ void FtlnStateRst(FTLN ftl) {
     memset(ftl->spare_buf, 0xFF, ftl->pgs_per_blk * ftl->eb_size);
     for (n = 0; n < ftl->num_map_pgs; ++n) ftl->mpns[n] = (ui32)-1;
     ftlmcInit(ftl->map_cache);
-#if INC_FTL_PAGE_CACHE
-    if (ftl->vol_cache)
-        FcReinit(ftl->vol_cache, ftl->page_size);
-#endif
 }
 
 // FtlnDecUsed: Decrement block used count for page no longer in-use
@@ -815,10 +621,9 @@ void FtlnDecUsed(FTLN ftl, ui32 pn, ui32 vpn) {
     DEC_USED(ftl->bdata[b]);
 
 #if FTLN_DEBUG
-    // Read page spare area (exit if error) and assert VPNs match.
+    // Read page spare area and assert VPNs match.
     ++ftl->stats.read_spare;
-    if (ftl->read_spare(ftl->start_pn + pn, ftl->spare_buf, ftl->ndm) < 0)
-        exit(errno);
+    PfAssert(ndmReadSpare(ftl->start_pn + pn, ftl->spare_buf, ftl->ndm) >= 0);
     PfAssert(GET_SA_VPN(ftl->spare_buf) == vpn);
 #endif
 } //lint !e818
@@ -831,13 +636,10 @@ void FtlnDecUsed(FTLN ftl, ui32 pn, ui32 vpn) {
 //
 int FtlnFatErr(FTLN ftl) {
     ftl->flags |= FTLN_FATAL_ERR;
-    return FsError(EIO);
+    return FsError2(NDM_EIO, EIO);
 }
 
 #if FTLN_DEBUG
-void Spaces(int num) {
-    while (num-- > 0) putchar(' ');
-}
 // flush_bstat: Flush buffered statistics counts
 //
 //      Inputs: ftl = pointer to FTL control block
@@ -859,7 +661,7 @@ static void flush_bstat(CFTLN ftl, int* blk0, int* blke, int b, const char* type
             printf(" - %s BLOCK\n", type);
         } else {
             printf("-%-4u", *blke);
-            Spaces(37);
+            printf("%*s", 37, " ");
             printf("- %s BLOCKS\n", type);
         }
         *blk0 = *blke = b;
@@ -922,13 +724,7 @@ void FtlnStats(FTLN ftl) {
     ui32 b, n;
 
     printf("\nFTL STATS:\n");
-    printf("  - # vol sects    = %d\n", ftl->num_vsects);
     printf("  - # vol pages    = %d\n", ftl->num_vpages);
-#if INC_FAT_MBR
-    printf("  - 1st_clust_sect = %d\n", ftl->frst_clust_sect);
-    printf("  - clust_off      = %d\n", ftl->clust_off);
-    printf("  - vol_frst_sect  = %d\n", ftl->vol_frst_sect);
-#endif
     printf("  - # map pages    = %d\n", ftl->num_map_pgs);
     printf("  - # free blocks  = %d\n", ftl->num_free_blks);
     for (n = b = 0; b < ftl->num_blks; ++b)
@@ -936,10 +732,6 @@ void FtlnStats(FTLN ftl) {
             ++n;
     printf("  - # erased blks  = %d\n", n);
     printf("  - flags =");
-    if (ftl->flags & FTLN_FAT_VOL)
-        printf(" FTLN_FAT_VOL");
-    if (ftl->flags & FTLN_XFS_VOL)
-        printf(" FTLN_XFS_VOL");
     if (ftl->flags & FTLN_FATAL_ERR)
         printf(" FTLN_FATAL_ERR");
     if (ftl->flags & FTLN_MOUNTED)
@@ -961,10 +753,8 @@ void FtlnCheckBlank(FTLN ftl, ui32 b) {
 
     do {
         rc = ftl->page_check(pn, ftl->main_buf, ftl->spare_buf, ftl->ndm);
-        if (rc != NDM_PAGE_ERASED)
-            exit(EINVAL);
+        PfAssert(rc == NDM_PAGE_ERASED);
     } while (++pn < end);
 }
 #endif // DEBUG_ELIST
 
-#endif // INC_FTL_NDM

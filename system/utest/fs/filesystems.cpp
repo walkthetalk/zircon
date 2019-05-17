@@ -12,12 +12,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <fvm/fvm.h>
 #include <fs-management/fvm.h>
 #include <fs-management/mount.h>
-#include <fs-management/ramdisk.h>
+#include <fuchsia/device/c/fidl.h>
+#include <fvm/format.h>
+#include <lib/fdio/fdio.h>
+#include <lib/zx/channel.h>
+#include <ramdevice-client/ramdisk.h>
 #include <zircon/device/block.h>
-#include <zircon/device/device.h>
 
 #include "filesystems.h"
 
@@ -25,7 +27,7 @@ const char* kTmpfsPath = "/fs-test-tmp";
 const char* kMountPath = "/fs-test-tmp/mount";
 
 bool use_real_disk = false;
-block_info_t test_disk_info;
+fuchsia_hardware_block_BlockInfo test_disk_info;
 char test_disk_path[PATH_MAX];
 ramdisk_client_t* test_ramdisk = nullptr;
 fs_info_t* test_info;
@@ -34,17 +36,17 @@ static char fvm_disk_path[PATH_MAX];
 
 constexpr const char minfs_name[] = "minfs";
 constexpr const char memfs_name[] = "memfs";
-constexpr const char thinfs_name[] = "FAT";
 
 const fsck_options_t test_fsck_options = {
     .verbose = false,
     .never_modify = true,
     .always_modify = false,
     .force = true,
+    .apply_journal = false,
 };
 
 #define FVM_DRIVER_LIB "/boot/driver/fvm.so"
-#define STRLEN(s) sizeof(s) / sizeof((s)[0])
+#define STRLEN(s) (sizeof(s) / sizeof((s)[0]))
 
 const test_disk_t default_test_disk = {
     .block_count = TEST_BLOCK_COUNT_DEFAULT,
@@ -70,7 +72,7 @@ void setup_fs_test(test_disk_t disk, fs_test_type_t test_class) {
     }
 
     if (!use_real_disk) {
-        if (create_ramdisk(disk.block_size, disk.block_count, &test_ramdisk) != ZX_OK) {
+        if (ramdisk_create(disk.block_size, disk.block_count, &test_ramdisk) != ZX_OK) {
             fprintf(stderr, "[FAILED]: Could not create ramdisk for test\n");
             exit(-1);
         }
@@ -81,16 +83,28 @@ void setup_fs_test(test_disk_t disk, fs_test_type_t test_class) {
     }
 
     if (test_class == FS_TEST_FVM) {
-        int fd = open(test_disk_path, O_RDWR);
-        if (fd < 0) {
+        fbl::unique_fd fd(open(test_disk_path, O_RDWR));
+        if (!fd) {
             fprintf(stderr, "[FAILED]: Could not open test disk\n");
             exit(-1);
         }
-        if (fvm_init(fd, disk.slice_size) != ZX_OK) {
+        if (fvm_init(fd.get(), disk.slice_size) != ZX_OK) {
             fprintf(stderr, "[FAILED]: Could not format disk with FVM\n");
             exit(-1);
         }
-        if (ioctl_device_bind(fd, FVM_DRIVER_LIB, STRLEN(FVM_DRIVER_LIB)) < 0) {
+
+        zx::channel fvm_channel;
+        if (fdio_get_service_handle(fd.get(), fvm_channel.reset_and_get_address()) != ZX_OK) {
+            fprintf(stderr, "[FAILED]: Could not convert fd to channel\n");
+            exit(-1);
+        }
+        zx_status_t call_status;
+        zx_status_t status = fuchsia_device_ControllerBind(fvm_channel.get(), FVM_DRIVER_LIB,
+                                                           STRLEN(FVM_DRIVER_LIB), &call_status);
+        if (status == ZX_OK) {
+            status = call_status;
+        }
+        if (status != ZX_OK) {
             fprintf(stderr, "[FAILED]: Could not bind disk to FVM driver\n");
             exit(-1);
         }
@@ -101,9 +115,9 @@ void setup_fs_test(test_disk_t disk, fs_test_type_t test_class) {
         }
 
         // Open "fvm" driver
-        close(fd);
-        int fvm_fd;
-        if ((fvm_fd = open(fvm_disk_path, O_RDWR)) < 0) {
+        fvm_channel.reset();
+        fbl::unique_fd fvm_fd(open(fvm_disk_path, O_RDWR));
+        if (!fvm_fd) {
             fprintf(stderr, "[FAILED]: Could not open FVM driver\n");
             exit(-1);
         }
@@ -115,18 +129,18 @@ void setup_fs_test(test_disk_t disk, fs_test_type_t test_class) {
         memcpy(request.type, kTestPartGUID, sizeof(request.type));
         memcpy(request.guid, kTestUniqueGUID, sizeof(request.guid));
 
-        if ((fd = fvm_allocate_partition(fvm_fd, &request)) < 0) {
+        fd.reset(fvm_allocate_partition(fvm_fd.get(), &request));
+        if (!fd) {
             fprintf(stderr, "[FAILED]: Could not allocate FVM partition\n");
             exit(-1);
         }
-        close(fvm_fd);
-        close(fd);
+        close(fvm_fd.release());
 
-        if ((fd = open_partition(kTestUniqueGUID, kTestPartGUID, 0, test_disk_path)) < 0) {
+        fd.reset(open_partition(kTestUniqueGUID, kTestPartGUID, 0, test_disk_path));
+        if (!fd) {
             fprintf(stderr, "[FAILED]: Could not locate FVM partition\n");
             exit(-1);
         }
-        close(fd);
 
         // Restore the "fvm_disk_path" to the containing disk, so it can
         // be destroyed when the test completes
@@ -272,9 +286,9 @@ static int fsck_common(const char* disk_path, disk_format_t fs_type) {
 
 static int mount_common(const char* disk_path, const char* mount_path,
                         disk_format_t fs_type) {
-    int fd = open(disk_path, O_RDWR);
+    fbl::unique_fd fd(open(disk_path, O_RDWR));
 
-    if (fd < 0) {
+    if (!fd) {
         fprintf(stderr, "Could not open disk: %s\n", disk_path);
         return -1;
     }
@@ -282,7 +296,7 @@ static int mount_common(const char* disk_path, const char* mount_path,
     // fd consumed by mount. By default, mount waits until the filesystem is
     // ready to accept commands.
     zx_status_t status;
-    if ((status = mount(fd, mount_path, fs_type, &default_mount_options,
+    if ((status = mount(fd.release(), mount_path, fs_type, &default_mount_options,
                         launch_stdio_async)) != ZX_OK) {
         fprintf(stderr, "Could not mount %s filesystem\n",
                 disk_format_string(fs_type));
@@ -317,27 +331,6 @@ int unmount_minfs(const char* mount_path) {
     return unmount_common(mount_path);
 }
 
-bool should_test_thinfs(void) {
-    struct stat buf;
-    return (stat("/system/bin/thinfs", &buf) == 0) && should_test_filesystem<thinfs_name>();
-}
-
-int mkfs_thinfs(const char* disk_path) {
-    return mkfs_common(disk_path, DISK_FORMAT_FAT);
-}
-
-int fsck_thinfs(const char* disk_path) {
-    return fsck_common(disk_path, DISK_FORMAT_FAT);
-}
-
-int mount_thinfs(const char* disk_path, const char* mount_path) {
-    return mount_common(disk_path, mount_path, DISK_FORMAT_FAT);
-}
-
-int unmount_thinfs(const char* mount_path) {
-    return unmount_common(mount_path);
-}
-
 fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {
     {memfs_name,
         should_test_filesystem<memfs_name>, mkfs_memfs, mount_memfs, unmount_memfs, fsck_memfs,
@@ -360,16 +353,5 @@ fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {
         .supports_mmap = false,
         .supports_resize = true,
         .nsec_granularity = 1,
-    },
-    {thinfs_name,
-        should_test_thinfs, mkfs_thinfs, mount_thinfs, unmount_thinfs, fsck_thinfs,
-        .can_be_mounted = true,
-        .can_mount_sub_filesystems = false,
-        .supports_hardlinks = false,
-        .supports_watchers = false,
-        .supports_create_by_vmo = false,
-        .supports_mmap = false,
-        .supports_resize = false,
-        .nsec_granularity = ZX_SEC(2),
     },
 };

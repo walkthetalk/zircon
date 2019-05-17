@@ -61,7 +61,7 @@ public:
 
     virtual void OnInterfaceDeclaration(std::unique_ptr<InterfaceDeclaration> const& element) override {
         OnBlankLineRequiringNode();
-        TreeVisitor::OnInterfaceDeclaration(element);
+        DeclarationOrderTreeVisitor::OnInterfaceDeclaration(element);
     }
 
     virtual void OnSourceElementStart(const SourceElement& element) override {
@@ -105,6 +105,7 @@ public:
 
     virtual void OnEnumDeclaration(std::unique_ptr<EnumDeclaration> const& element) override {
         OnBlankLineRequiringNode();
+        ScopedBool mem(is_enum_decl_, true);
         TreeVisitor::OnEnumDeclaration(element);
     }
 
@@ -117,6 +118,11 @@ public:
         ScopedBool mem(is_member_decl_);
         ScopedBool has_ordinal(has_ordinal_, element->ordinal != nullptr);
         TreeVisitor::OnInterfaceMethod(element);
+    }
+
+    virtual void OnComposeProtocol(std::unique_ptr<ComposeProtocol> const& element) override {
+        OnBlankLineRespectingNode();
+        TreeVisitor::OnComposeProtocol(element);
     }
 
     virtual void OnStructDeclaration(std::unique_ptr<StructDeclaration> const& element) override {
@@ -167,11 +173,11 @@ public:
         TreeVisitor::OnXUnionMember(element);
     }
 
-    virtual void OnType(std::unique_ptr<Type> const& element) override {
+    virtual void OnTypeConstructor(std::unique_ptr<TypeConstructor> const& element) override {
         ScopedIncrement si(nested_type_depth_);
-        ScopedBool before_colon(blank_space_before_colon_, false);
-        ScopedBool after_colon(blank_space_after_colon_, false);
-        TreeVisitor::OnType(element);
+        ScopedBool before_colon(blank_space_before_colon_, is_enum_decl_);
+        ScopedBool after_colon(blank_space_after_colon_, is_enum_decl_);
+        TreeVisitor::OnTypeConstructor(element);
     }
 
     virtual void OnFile(std::unique_ptr<File> const& element) override;
@@ -242,7 +248,7 @@ private:
     }
 
     static bool IsStartOfBlankLine(const std::string& str, int offset) {
-        for (int i = offset; i < str.size() && str[i] != '\n'; i++) {
+        for (int i = offset; i < static_cast<int>(str.size()) && str[i] != '\n'; i++) {
             if (!IsNonNewlineWS(str[i])) {
                 return false;
             }
@@ -251,14 +257,25 @@ private:
     }
 
     static bool IsStartOfComment(std::string str, int i) {
-        return (i < str.size() - 1) && str[i] == '/' && str[i + 1] == '/';
+        if ((i < static_cast<int>(str.size()) - 1) && str[i] == '/' && str[i + 1] == '/') {
+            // doc comments, which start with three slashes, should not
+            // be treated as comments since they get internally converted
+            // to attributes
+            if (str.size() == 2) {
+                return true;
+            } else {
+                return str[i + 2] != '/';
+            }
+        } else {
+            return false;
+        }
     }
 
     // If the string str at offset pos is the beginning of a comment, pos is
     // modified to be the newline character at EOL.
     static void MaybeWindPastComment(std::string str, int& pos) {
         if (IsStartOfComment(str, pos)) {
-            while (pos < str.size() && str[pos] != '\n') {
+            while (pos < static_cast<int>(str.size()) && str[pos] != '\n') {
                 pos++;
             }
         }
@@ -306,12 +323,14 @@ private:
         }
 
     private:
+        // RequiresWSBeforeChar is called 1st.
         bool RequiresWSBeforeChar(char ch) {
             return (ch == '{') ||
                    (ch == '=') ||
                    (visitor_->blank_space_before_colon_ && ch == ':');
         }
 
+        // NoSpacesBeforeChar is called 2nd (after RequiresWSBeforeChar).
         bool NoSpacesBeforeChar(char ch) {
             return NoWSBeforeChar(ch) ||
                    (ch == ')') ||
@@ -320,15 +339,17 @@ private:
                    (visitor_->nested_type_depth_ > 0 && ch == '>');
         }
 
-        bool NoWSBeforeChar(char ch) {
-            return (ch == ';');
-        }
-
+        // RequiresWSAfterChar is called 3rd (after NoSpacesBeforeChar).
         bool RequiresWSAfterChar(char ch) {
             return (ch == '=') ||
                    (ch == ',') ||
+                   (ch == ')') ||
                    (ch == '>' && (visitor_->nested_type_depth_ <= 1)) ||
                    (ch == ':' && visitor_->blank_space_after_colon_);
+        }
+
+        bool NoWSBeforeChar(char ch) {
+            return (ch == ';');
         }
 
         bool NoWSAfterChar(char ch) {
@@ -384,6 +405,7 @@ private:
         blank_line_respecting_node_ = true;
     }
 
+    bool is_enum_decl_ = false;
     bool is_member_decl_ = false;
 
     // Does the current member have an explicit ordinal?
@@ -408,44 +430,6 @@ private:
             formatted_output_ += total_string;
             last_source_location_ = ws_location;
         }
-    }
-};
-
-class OrdinalRemovalVisitor : public fidl::raw::DeclarationOrderTreeVisitor {
-public:
-    OrdinalRemovalVisitor() {}
-    virtual void OnInterfaceMethod(
-        std::unique_ptr<fidl::raw::InterfaceMethod> const& element) override {
-        if (element->ordinal != nullptr) {
-            const char* start = element->ordinal->start_.data().data();
-            const char* end = element->ordinal->end_.data().data() +
-                              element->ordinal->end_.data().size();
-            for (char* ptr = const_cast<char*>(start); ptr < end; ptr++) {
-                // Don't erase comments in the middle of ordinals;
-                if (strncmp("//", ptr, 2) == 0) {
-                    while (*ptr != '\n' && ptr < end) {
-                        ptr++;
-                    }
-                    continue;
-                }
-                *ptr = ' ';
-            }
-
-            // Incorporate the whitespace that came before the ordinal into the
-            // whitespace before the identifier.
-            element->identifier->start_.set_previous_end(
-                element->ordinal->start_.previous_end());
-            element->identifier->end_.set_previous_end(
-                element->ordinal->start_.previous_end());
-
-            // If there are no attributes, the identifier is now the start of
-            // the method.
-            if (element->attributes == nullptr)
-                element->start_ = element->identifier->start_;
-
-            element->ordinal.reset(nullptr);
-        }
-        DeclarationOrderTreeVisitor::OnInterfaceMethod(element);
     }
 };
 

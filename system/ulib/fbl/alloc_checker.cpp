@@ -4,6 +4,7 @@
 
 #include <fbl/alloc_checker.h>
 
+#include <cstdlib>
 #include <new>
 #include <zircon/assert.h>
 #include <zircon/compiler.h>
@@ -31,7 +32,7 @@ void* checked(size_t size, AllocChecker* ac, void* mem) {
 } // namespace
 
 AllocChecker::AllocChecker()
-    : state_(0u) {
+    : state_(0U) {
 }
 
 AllocChecker::~AllocChecker() {
@@ -41,7 +42,7 @@ AllocChecker::~AllocChecker() {
 void AllocChecker::arm(size_t size, bool result) {
     panic_if_armed(state_);
     state_ = alloc_armed |
-             ((size == 0u) ? alloc_ok : (result ? alloc_ok : 0u));
+             ((size == 0U) ? alloc_ok : (result ? alloc_ok : 0U));
 }
 
 bool AllocChecker::check() {
@@ -57,8 +58,8 @@ bool AllocChecker::check() {
 // new are freed via delete, only allocations done via new[] are freed
 // via delete[], and only allocations done via the C malloc family
 // functions are freed via the C free function.  The non-throwing
-// operator new and operator new[] we call might be trivial ones like
-// zxcpp's that actually just call malloc, or they might be ones that
+// operator new and operator new[] we call might be trivial ones
+// that actually just call malloc, or they might be ones that
 // enforce this invariant (such as the ASan allocator).
 
 } // namespace fbl
@@ -79,21 +80,24 @@ void* operator new[](size_t size, std::align_val_t align, fbl::AllocChecker* ac)
 }
 #else  // _KERNEL
 
+static_assert(HEAP_DEFAULT_ALIGNMENT >= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+
 void* operator new(size_t size, fbl::AllocChecker* ac) noexcept {
-    void* operator new(size_t s, void* caller, const std::nothrow_t&) noexcept;
-    return fbl::checked(size, ac, operator new(size, __GET_CALLER(), std::nothrow_t()));
+    return fbl::checked(size, ac, malloc_debug_caller(size, __GET_CALLER()));
 }
+
 void* operator new(size_t size, std::align_val_t align, fbl::AllocChecker* ac) noexcept {
-    void* operator new(size_t s, std::align_val_t align, void* caller, const std::nothrow_t&) noexcept;
-    return fbl::checked(size, ac, operator new(size, align, __GET_CALLER(), std::nothrow_t()));
+    return fbl::checked(size, ac, memalign_debug_caller(
+                            size, static_cast<size_t>(align), __GET_CALLER()));
 }
 
 void* operator new[](size_t size, fbl::AllocChecker* ac) noexcept {
-    void* operator new[](size_t s, void* caller, const std::nothrow_t&) noexcept;
-    return fbl::checked(size, ac, operator new[](size, __GET_CALLER(), std::nothrow_t()));
+    return fbl::checked(size, ac, malloc_debug_caller(size, __GET_CALLER()));
 }
+
 void* operator new[](size_t size, std::align_val_t align, fbl::AllocChecker* ac) noexcept {
-    void* operator new[](size_t s, std::align_val_t align, void* caller, const std::nothrow_t&) noexcept;
-    return fbl::checked(size, ac, operator new[](size, align, __GET_CALLER(), std::nothrow_t()));
+    return fbl::checked(size, ac, memalign_debug_caller(
+                            size, static_cast<size_t>(align), __GET_CALLER()));
 }
+
 #endif // !_KERNEL

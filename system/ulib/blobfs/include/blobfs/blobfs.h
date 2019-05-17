@@ -31,17 +31,21 @@
 #include <fs/vfs.h>
 #include <fs/vnode.h>
 #include <fuchsia/blobfs/c/fidl.h>
+#include <fuchsia/hardware/block/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
+#include <lib/async-loop/cpp/loop.h>
 #include <lib/async/cpp/wait.h>
+#include <lib/fzl/fdio.h>
 #include <lib/fzl/owned-vmo-mapper.h>
 #include <lib/fzl/resizeable-vmo-mapper.h>
+#include <lib/zx/channel.h>
 #include <lib/zx/event.h>
 #include <lib/zx/vmo.h>
 #include <trace/event.h>
 
 #include <blobfs/allocator.h>
-#include <blobfs/blob.h>
 #include <blobfs/blob-cache.h>
+#include <blobfs/blob.h>
 #include <blobfs/common.h>
 #include <blobfs/directory.h>
 #include <blobfs/extent-reserver.h>
@@ -60,9 +64,19 @@ namespace blobfs {
 
 using digest::Digest;
 
+enum class Writability {
+    // Do not write to persistent storage under any circumstances whatsoever.
+    ReadOnlyDisk,
+    // Do not allow users of the filesystem to mutate filesystem state. This
+    // state allows the journal to replay while initializing writeback.
+    ReadOnlyFilesystem,
+    // Permit all operations.
+    Writable,
+};
+
 // Toggles that may be set on blobfs during initialization.
 struct MountOptions {
-    bool readonly = false;
+    Writability writability = Writability::Writable;
     bool metrics = false;
     bool journal = false;
     CachePolicy cache_policy = CachePolicy::EvictImmediately;
@@ -166,9 +180,13 @@ public:
 
     void SetUnmountCallback(fbl::Closure closure) { on_unmount_ = std::move(closure); }
 
-    // Initializes the WritebackQueue and Journal (if enabled in |options|),
-    // replaying any existing journal entries.
-    zx_status_t InitializeWriteback(const MountOptions& options);
+    // Initializes the WritebackQueue and Journal, replaying any existing journal entries
+    // if requested.
+    //
+    // If the underlying block device is read-only, the journal may not be
+    // replayed, and this function returns ZX_ERR_ACCESS_DENIED.
+    // If the filesystem is to be mounted read-only or read + write, the journal may be replayed.
+    zx_status_t InitializeWriteback(Writability writability, bool journal_enabled);
 
     virtual ~Blobfs();
 
@@ -176,14 +194,18 @@ public:
     // Acts as a special-case to bootstrap filesystem mounting.
     zx_status_t OpenRootNode(fbl::RefPtr<Directory>* out);
 
-
     BlobCache& Cache() {
         return blob_cache_;
     }
 
     zx_status_t Readdir(fs::vdircookie_t* cookie, void* dirents, size_t len, size_t* out_actual);
 
-    int Fd() const { return blockfd_.get(); }
+    const zx::unowned_channel BlockDevice() const {
+        return zx::unowned_channel(block_device_.borrow_channel());
+    }
+    const fbl::unique_fd& BlockDeviceFd() const {
+        return block_device_.fd();
+    }
 
     // Returns an unique identifier for this instance.
     uint64_t GetFsId() const { return fs_id_; }
@@ -244,6 +266,10 @@ private:
     // Enqueues an update for allocated inode/block counts.
     void WriteInfo(WritebackWork* wb);
 
+    // When will flush the metrics in the calling thread and will schedule itself
+    // to flush again in the future.
+    void ScheduleMetricFlush();
+
     // Creates an unique identifier for this instance. This is to be called only during
     // "construction".
     zx_status_t CreateFsId();
@@ -257,8 +283,8 @@ private:
 
     BlobCache blob_cache_;
 
-    fbl::unique_fd blockfd_;
-    block_info_t block_info_ = {};
+    fzl::FdioCaller block_device_;
+    fuchsia_hardware_block_BlockInfo block_info_ = {};
     std::atomic<groupid_t> next_group_ = {};
     block_client::Client fifo_client_;
 
@@ -276,6 +302,7 @@ private:
 
     // TODO(gevalentino): clean up old metrics and update this to inspect API.
     fs::Metrics cobalt_metrics_;
+    async::Loop flush_loop_ = async::Loop(&kAsyncLoopConfigNoAttachToThread);
 };
 
 zx_status_t Initialize(fbl::unique_fd blockfd, const MountOptions& options,

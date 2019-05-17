@@ -13,12 +13,21 @@
 
 namespace {
 
-static bool Compiles(const std::string& source_code) {
-    return TestLibrary("test.fidl", source_code).Compile();
+static bool Compiles(const std::string& source_code, std::vector<std::string>* out_errors = nullptr) {
+    auto library = TestLibrary("test.fidl", source_code);
+    const bool success = library.Compile();
+
+    if (out_errors) {
+        *out_errors = library.errors();
+    }
+
+    return success;
 }
 
 static bool compiling(void) {
     BEGIN_TEST;
+
+    std::vector<std::string> errors;
 
     // Populated fields.
     EXPECT_TRUE(Compiles(R"FIDL(
@@ -114,7 +123,10 @@ library fidl.test.tables;
 table Foo {
     int64 x;
 };
-)FIDL"));
+)FIDL", &errors));
+
+    EXPECT_EQ(errors.size(), 1u);
+    ASSERT_STR_STR(errors.at(0).c_str(), "Expected one of ordinal or '}'");
 
     // Attributes on fields.
     EXPECT_TRUE(Compiles(R"FIDL(
@@ -149,11 +161,106 @@ table Foo {
 };
 )FIDL"));
 
+    // Keywords as field names.
+    EXPECT_TRUE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+struct struct {
+    bool field;
+};
+
+table Foo {
+    1: int64 table;
+    2: bool library;
+    3: uint32 uint32;
+    4: struct member;
+};
+)FIDL"));
+
+    // Optional tables in structs are invalid.
+    EXPECT_FALSE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+table Foo {
+    1: int64 t;
+};
+
+struct OptionalTableContainer {
+    Foo? foo;
+};
+
+)FIDL", &errors));
+    EXPECT_EQ(errors.size(), 1u);
+    ASSERT_STR_STR(errors.at(0).c_str(), "cannot be nullable");
+
+    // Optional tables in (static) unions are invalid.
+    EXPECT_FALSE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+table Foo {
+    1: int64 t;
+};
+
+union OptionalTableContainer {
+    Foo? foo;
+};
+
+)FIDL", &errors));
+    EXPECT_EQ(errors.size(), 1u);
+    ASSERT_STR_STR(errors.at(0).c_str(), "cannot be nullable");
+
+    // Tables in tables are valid.
+    EXPECT_TRUE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+table Foo {
+    1: int64 t;
+};
+
+table Bar {
+    1: Foo foo;
+};
+
+)FIDL"));
+
+    // Tables in xunions are valid.
+    EXPECT_TRUE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+table Foo {
+    1: int64 t;
+};
+
+xunion OptionalTableContainer {
+    Foo foo;
+};
+
+)FIDL"));
+
+    END_TEST;
+}
+
+bool default_not_allowed() {
+    BEGIN_TEST;
+
+    std::vector<std::string> errors;
+    EXPECT_FALSE(Compiles(R"FIDL(
+library fidl.test.tables;
+
+table Foo {
+    1: int64 t = 1;
+};
+
+)FIDL", &errors));
+    ASSERT_EQ(errors.size(), 1u);
+    ASSERT_STR_STR(errors.at(0).c_str(), "Defaults on tables are not yet supported.");
+
     END_TEST;
 }
 
 } // namespace
 
-BEGIN_TEST_CASE(table_tests);
-RUN_TEST(compiling);
-END_TEST_CASE(table_tests);
+BEGIN_TEST_CASE(table_tests)
+RUN_TEST(compiling)
+RUN_TEST(default_not_allowed)
+END_TEST_CASE(table_tests)

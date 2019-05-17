@@ -8,9 +8,12 @@
 #include <utility>
 
 #include <fbl/algorithm.h>
+#include <lib/fdio/directory.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/io.h>
 #include <lib/fdio/namespace.h>
 #include <lib/fdio/spawn.h>
-#include <lib/fdio/util.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/process.h>
 #include <zircon/assert.h>
@@ -22,13 +25,14 @@
 
 namespace {
 
-constexpr const char* kDevmgrPath = "/boot/bin/devmgr";
+constexpr const char* kDevmgrPath = "/boot/bin/devcoordinator";
 
 } // namespace
 
 namespace devmgr_launcher {
 
-zx_status_t Launch(Args args, zx::job* devmgr_job, zx::channel* devfs_root) {
+zx_status_t Launch(Args args, zx::channel bootsvc_client, zx::job* devmgr_job,
+                   zx::channel* devfs_root) {
     // Create containing job (and copy to send to devmgr)
     zx::job job, job_copy;
     zx_status_t status = zx::job::create(*zx::job::default_job(), 0, &job);
@@ -60,6 +64,27 @@ zx_status_t Launch(Args args, zx::job* devmgr_job, zx::channel* devfs_root) {
         }
     }
 
+    // Create a new client to /svc to maybe give to devmgr
+    zx::channel svc_client;
+    {
+        zx::channel svc_server;
+        status = zx::channel::create(0, &svc_client, &svc_server);
+        if (status != ZX_OK) {
+            return status;
+        }
+
+        fdio_ns_t* ns;
+        status = fdio_ns_get_installed(&ns);
+        if (status != ZX_OK) {
+            return status;
+        }
+        status = fdio_ns_connect(ns, "/svc", ZX_FS_RIGHT_READABLE | ZX_FS_RIGHT_WRITABLE,
+                                 svc_server.release());
+        if (status != ZX_OK) {
+            return status;
+        }
+    }
+
     // Create channel to connect to devfs
     zx::channel devfs_client, devfs_server;
     status = zx::channel::create(0, &devfs_client, &devfs_server);
@@ -83,35 +108,48 @@ zx_status_t Launch(Args args, zx::job* devmgr_job, zx::channel* devfs_root) {
         argv.push_back("--sys-device-driver");
         argv.push_back(args.sys_device_driver);
     }
+    if (args.use_system_svchost) {
+        argv.push_back("--use-system-svchost");
+    }
+    if (args.disable_block_watcher) {
+        argv.push_back("--disable-block-watcher");
+    }
+    if (args.disable_netsvc) {
+        argv.push_back("--disable-netsvc");
+    }
     argv.push_back(nullptr);
 
     fbl::Vector<fdio_spawn_action_t> actions;
     actions.push_back(fdio_spawn_action_t{
         .action = FDIO_SPAWN_ACTION_SET_NAME,
-        .name = { .data = "test-devmgr" },
+        .name = {.data = "test-devmgr"},
     });
     actions.push_back(fdio_spawn_action_t{
         .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
-        .h = { .id = PA_HND(PA_JOB_DEFAULT, 0), .handle = job_copy.release() },
+        .h = {.id = PA_HND(PA_JOB_DEFAULT, 0), .handle = job_copy.release()},
     });
     actions.push_back(fdio_spawn_action_t{
         .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
-        .h = { .id = DEVMGR_LAUNCHER_DEVFS_ROOT_HND, .handle = devfs_server.release() },
+        .h = {.id = DEVMGR_LAUNCHER_DEVFS_ROOT_HND, .handle = devfs_server.release()},
     });
     actions.push_back(fdio_spawn_action_t{
         .action = FDIO_SPAWN_ACTION_ADD_NS_ENTRY,
-        .ns = { .prefix = "/boot", .handle = bootfs_client.release() },
+        .ns = {.prefix = "/boot", .handle = bootfs_client.release()},
     });
-    if (args.bootdata) {
+    actions.push_back(fdio_spawn_action_t{
+        .action = FDIO_SPAWN_ACTION_ADD_NS_ENTRY,
+        .ns = {.prefix = "/bootsvc", .handle = bootsvc_client.release()},
+    });
+    if (args.use_system_svchost) {
         actions.push_back(fdio_spawn_action_t{
-            .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
-            .h = { .id = PA_HND(PA_VMO_BOOTDATA, 0), .handle = args.bootdata.release() },
+            .action = FDIO_SPAWN_ACTION_ADD_NS_ENTRY,
+            .ns = {.prefix = "/svc", .handle = svc_client.release()},
         });
     }
     if (!clone_stdio) {
         actions.push_back(fdio_spawn_action_t{
             .action = FDIO_SPAWN_ACTION_TRANSFER_FD,
-            .fd = { .local_fd = args.stdio.release(), .target_fd = FDIO_FLAG_USE_FOR_STDIO },
+            .fd = {.local_fd = args.stdio.release(), .target_fd = FDIO_FLAG_USE_FOR_STDIO},
         });
     }
 
@@ -139,4 +177,4 @@ zx_status_t Launch(Args args, zx::job* devmgr_job, zx::channel* devfs_root) {
     return ZX_OK;
 }
 
-} // namespace devmgr_integration_test
+} // namespace devmgr_launcher

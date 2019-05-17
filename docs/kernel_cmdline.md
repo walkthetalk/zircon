@@ -24,8 +24,13 @@ If this option is set, the system will not use Address Space Layout
 Randomization.
 
 ## bootsvc.next=\<bootfs path\>
+
 Controls what program is executed by bootsvc to continue the boot process.
 If this is not specified, the default next program will be used.
+
+Arguments to the program can optionally be specified using a comma separator
+between the program and individual arguments. For example,
+'bootsvc.next=bin/mybin,arg1,arg2'.
 
 ## devmgr\.epoch=\<seconds\>
 
@@ -296,37 +301,12 @@ This option (disabled by default) turns on dynamic linker trace output.
 The output is in a form that is consumable by clients like Intel
 Processor Trace support.
 
-## thread.set.priority.disable=\<bool>
-
-This option (false by default) prevents the syscall that increases
-a thread priority (`zx_thread_set_priority`) from taking effect.
-
 ## zircon.autorun.boot=\<command>
 
 This option requests that *command* be run at boot, after devmgr starts up.
 
 Any `+` characters in *command* are treated as argument separators, allowing
 you to pass arguments to an executable.
-
-### Sidebar: Injecting a personal autorun script <a name="autorun"></a>
-
-It's often useful to inject a personal autorun script into the boot filesystem,
-especially for running tests or setup tasks. You can do this with the zircon
-build system's `EXTRA_USER_MANIFEST_LINES` make variable.
-
-1.  Create a local shell script with the commands you want to run; for this
-    example, call it `${HOME}/my_local_script.sh`. \
-    **NOTE**: The first line must be a `#!` line, typically `#!/boot/bin/sh`.
-2.  Add your script to the boot filesystem by invoking `make` (or one of the
-    `//zircon/scripts/build-*` scripts) with \
-    `EXTRA_USER_MANIFEST_LINES="my_installed_script=${HOME}/my_local_script.sh"`
-    \
-    This will copy your local script into the boot filesystem at the path
-    `/boot/my_installed_script`. (You can change the `my_installed_script` part
-    to change the basename of the installed script, though it will always appear
-    under `/boot`.)
-3.  Tell `devmgr` to invoke your script by passing a commandline like
-    `zircon.autorun.boot=/boot/my_installed_script`
 
 ## zircon.autorun.system=\<command>
 
@@ -336,24 +316,6 @@ will never be launched.
 
 Any `+` characters in *command* are treated as argument separators, allowing
 you to pass arguments to an executable.
-
-## zircon.system.blob-init=\<command>
-
-**DEPRECATED** See [`zircon.system.pkgfs.cmd`](#zircon.system.pkgfs.cmd).
-
-This option requests that *command* be run once the blob partition is
-mounted. The given command is expected to mount /system, and then signal its
-process handle with `ZX_USER_SIGNAL_0`.
-
-*command* may not assume that any other filesystem has been mounted. If
-`zircon.system.blob-init-arg` is set, it will be provided as the first
-argument.
-
-A ramdisk containing `/system` takes precedence over
-`zircon.system.blob-init` and *command* will not be run if a system
-ramdisk is present. blob init will take precedence over a minfs
-partition with the system GUID, and the minfs partition will not be mounted
-if `zircon.system.blob-init` is set.
 
 ## zircon.system.disable-automount=\<bool>
 
@@ -384,11 +346,6 @@ with `ZX_USER_SIGNAL_0`.  Then `/pkgfs/system` will be mounted as `/system`.
 ## zircon.system.pkgfs.file.*path*=\<blobid>
 
 Used with [`zircon.system.pkgfs.cmd`](#zircon.system.pkgfs.cmd), above.
-
-## zircon.system.writable=\<bool>
-
-This option requests that if a minfs partition with the system type GUID is
-found, it is to be mounted read-write rather than read-only.
 
 ## zircon.system.volume=\<arg>
 

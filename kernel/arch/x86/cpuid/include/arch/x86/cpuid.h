@@ -5,11 +5,10 @@
 #ifndef KERNEL_ARCH_X86_CPUID_H_
 #define KERNEL_ARCH_X86_CPUID_H_
 
+#include <assert.h>
 #include <cstdint>
 #include <cstring>
 #include <optional>
-
-#include <assert.h>
 
 namespace cpu_id {
 
@@ -37,6 +36,12 @@ struct Registers {
     uint32_t reg[4];
 };
 
+template <size_t count>
+struct SubLeaves {
+    Registers subleaf[count];
+    static constexpr size_t size = count;
+};
+
 // Extracts the manufacturer id string from call with EAX=0.
 class ManufacturerInfo {
 public:
@@ -49,7 +54,7 @@ public:
     // How many chars are in a manufacturer id.
     static constexpr size_t kManufacturerIdLength = 12;
 
-    ManufacturerInfo(Registers leaf0);
+    ManufacturerInfo(Registers leaf0, Registers leaf8_0);
 
     Manufacturer manufacturer() const;
 
@@ -61,8 +66,13 @@ public:
     // Highest leaf (EAX parameter to cpuid) that this processor supports.
     size_t highest_cpuid_leaf() const;
 
+    // Highest leaf (EAX parameter to cpuid) that this processor supports in the
+    // extended range (> 0x80000000);
+    size_t highest_extended_cpuid_leaf() const;
+
 private:
-    const Registers registers_;
+    const Registers leaf0_;
+    const Registers leaf8_0_;
 };
 
 // Extracts the processor signature/id from call with EAX=1.
@@ -79,6 +89,9 @@ public:
     // Family of processors to which this chip belongs.
     uint16_t family() const;
 
+    // Return the full 32-bit identifier of this chip.
+    uint32_t signature() const;
+
     // APIC ID of the processor on which this object was generated. Note this
     // class uses a cached copy of registers so if this object was generated on
     // a differnet processor this value could be misleading.
@@ -94,8 +107,8 @@ private:
 class Features {
 public:
     enum LeafIndex {
-        LEAF1,
-        LEAF7,
+        LEAF1,  // Feature Information
+        LEAF7,  // Structured Extended Feature Flags
         LEAF8_01,
         INVALID_SET = 254,
     };
@@ -166,6 +179,7 @@ public:
     static constexpr Feature AVX = {.leaf = LEAF1, .reg = Registers::ECX, .bit = 28};
     static constexpr Feature F16C = {.leaf = LEAF1, .reg = Registers::ECX, .bit = 29};
     static constexpr Feature RDRAND = {.leaf = LEAF1, .reg = Registers::ECX, .bit = 30};
+    static constexpr Feature HYPERVISOR = {.leaf = LEAF1, .reg = Registers::ECX, .bit = 31};
 
     static constexpr Feature FSGSBASE = {.leaf = LEAF7, .reg = Registers::EBX, .bit = 0};
     static constexpr Feature SGX = {.leaf = LEAF7, .reg = Registers::EBX, .bit = 2};
@@ -247,13 +261,15 @@ private:
 // Parses topology data from the CPUID instruction.
 class Topology {
 public:
+    static constexpr size_t kEaxBSubleaves = 3;
     static constexpr size_t kMaxLevels = 3;
     static constexpr uint8_t kInvalidCount = 255;
+
     enum class LevelType {
         INVALID,
         SMT,
         CORE,
-        PACKAGE
+        DIE,
     };
     struct Level {
         LevelType type = LevelType::INVALID;
@@ -261,38 +277,67 @@ public:
         // node_count is set best-effort, only some systems provide it.
         uint8_t node_count = kInvalidCount;
 
-        uint8_t shift_width = 0;
+        // This many bits of the apic id are used to distinguish different nodes in this level.
+        // In other words, the width by which you would need to shift an apic id to "skip"
+        // this level.
+        uint8_t id_bits = 0;
     };
     struct Levels {
         Level levels[kMaxLevels];
         uint8_t level_count = 0;
     };
 
+    struct Cache {
+        uint8_t level = 0;
+
+        // This is how many bits you need to shift the apic id right by in order
+        // to determine which cache is serving it.
+        uint8_t shift_width = 0;
+
+        uint64_t size_bytes = 0;
+    };
+
+    // Leaf4 and 8_1D being provided should represent the highest level of cache.
+    // Intel labels leaf 4 as "Deterministic Cache Parameters" and leaf 0xB as
+    // "Processor Topology".
     Topology(ManufacturerInfo info, Features features,
-             Registers leaf4, Registers* leafB);
+             Registers leaf4, SubLeaves<kEaxBSubleaves> leafB,
+             Registers leaf8_1, Registers leaf8_1D, Registers leaf8_1E);
 
     // Provides details for each level of this system's topology.
     // Returns nullopt if unable to parse topology from cpuid data.
     std::optional<Levels> levels() const;
 
+    // Returns info about the numerically highest level (i.e. L3 > L2 > L1) of processor cache.
+    Cache highest_level_cache() const;
+
+protected:
+    // Used for testing.
+    Topology()
+        : info_({}, {}), features_({}, {}, {}) {}
+
 private:
     std::optional<Levels> IntelLevels() const;
-
-    static constexpr size_t kEaxBLevels = 3;
+    std::optional<Levels> AmdLevels() const;
 
     ManufacturerInfo info_;
     Features features_;
 
     Registers leaf4_;
-    Registers leafB_[kEaxBLevels];
+    SubLeaves<kEaxBSubleaves> leafB_;
+    Registers leaf8_8_;
+    Registers leaf8_1D_;
+    Registers leaf8_1E_;
 };
 
 // Wraps the CPUID instruction on x86, provides helpers to parse the output and
 // allows unit testing of libraries reading it.
+// CpuId is uncached; every call results in one (or more) invocations of CPUID.
 class CpuId {
 public:
     virtual ~CpuId() = default;
     virtual ManufacturerInfo ReadManufacturerInfo() const;
+    // Return ProcessorId; provides (Extended) Family/Model/Stepping.
     virtual ProcessorId ReadProcessorId() const;
     virtual Features ReadFeatures() const;
     virtual Topology ReadTopology() const;

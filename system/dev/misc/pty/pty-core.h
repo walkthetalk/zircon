@@ -9,9 +9,11 @@
 #include <threads.h>
 
 #include <ddk/device.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 
 #include <zircon/compiler.h>
 #include <zircon/listnode.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 
 typedef struct pty_server pty_server_t;
 typedef struct pty_client pty_client_t;
@@ -42,10 +44,10 @@ struct pty_server {
     // (it is not legal to call back into any pty_server_*() functions)
     zx_status_t (*recv)(pty_server_t* ps, const void* data, size_t len, size_t* actual);
 
-    // if non-null, called for unhandled client ioctl ops
+    // if non-null, called for unhandled client message ops
     // no lock is held across this call
-    zx_status_t (*ioctl)(pty_server_t* ps, uint32_t op, const void* cmd, size_t cmdlen, void* out,
-                         size_t outlen, size_t* out_actual);
+    zx_status_t (*set_window_size)(void* ctx, const fuchsia_hardware_pty_WindowSize* size,
+                                   fidl_txn_t* txn);
 
     // called when pty_server_t should be deleted
     // if NULL, free(ps) is called instead
@@ -72,9 +74,8 @@ void pty_server_resume_locked(pty_server_t* ps);
 
 void pty_server_set_window_size(pty_server_t* ps, uint32_t w, uint32_t h);
 
-// device ops for pty_server
-// the zx_device_t here must be the one embedded in pty_server_t
-zx_status_t pty_server_openat(void* ctx, zx_device_t** out, const char* path, uint32_t flags);
+// Device ops for pty_server. The |ctx| here must be the zx_device_t embedded in pty_server_t.
+zx_status_t pty_server_fidl_OpenClient(void* ctx, uint32_t id, zx_handle_t handle, fidl_txn_t* txn);
 void pty_server_release(void* ctx);
 
 #endif // ZIRCON_SYSTEM_DEV_MISC_PTY_PTY_CORE_H_

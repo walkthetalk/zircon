@@ -11,13 +11,16 @@
 #include <arch/exception.h>
 #include <kernel/dpc.h>
 #include <kernel/event.h>
+#include <kernel/owned_wait_queue.h>
 #include <kernel/thread.h>
-#include <vm/vm_address_region.h>
 #include <object/channel_dispatcher.h>
 #include <object/dispatcher.h>
+#include <object/exception_dispatcher.h>
+#include <object/exceptionate.h>
 #include <object/excp_port.h>
-#include <object/futex_node.h>
+#include <object/handle.h>
 #include <object/thread_state.h>
+#include <vm/vm_address_region.h>
 
 #include <zircon/compiler.h>
 #include <zircon/syscalls/debug.h>
@@ -69,9 +72,16 @@ public:
         PAGER,
     };
 
+    // Entry state for a thread
+    struct EntryState {
+        uintptr_t pc = 0;
+        uintptr_t sp = 0;
+        uintptr_t arg1 = 0;
+        uintptr_t arg2 = 0;
+    };
+
     static zx_status_t Create(fbl::RefPtr<ProcessDispatcher> process, uint32_t flags,
-                              fbl::StringPiece name,
-                              fbl::RefPtr<Dispatcher>* out_dispatcher,
+                              fbl::StringPiece name, KernelHandle<ThreadDispatcher>* out_handle,
                               zx_rights_t* out_rights);
     ~ThreadDispatcher();
 
@@ -86,8 +96,7 @@ public:
     // Performs initialization on a newly constructed ThreadDispatcher
     // If this fails, then the object is invalid and should be deleted
     zx_status_t Initialize(const char* name, size_t len);
-    zx_status_t Start(uintptr_t pc, uintptr_t sp, uintptr_t arg1, uintptr_t arg2,
-                      bool initial_thread);
+    zx_status_t Start(const EntryState& entry, bool initial_thread);
     void Exit() __NO_RETURN;
     void Kill();
 
@@ -130,7 +139,6 @@ public:
     void EnterException(fbl::RefPtr<ExceptionPort> eport,
                         const zx_exception_report_t* report,
                         const arch_exception_context_t* arch_context);
-    void ExitException();
     void ExitExceptionLocked() TA_REQ(get_lock());
 
     // Called when an exception handler is finished processing the exception.
@@ -148,6 +156,39 @@ public:
     // fill in |*report| with the exception report.
     // Returns ZX_ERR_BAD_STATE if not in an exception.
     zx_status_t GetExceptionReport(zx_exception_report_t* report);
+
+    // TODO(ZX-3072): remove the port-based exception code once everyone is
+    // switched over to channels.
+    Exceptionate* exceptionate();
+
+    // Sends an exception over the exception channel and blocks for a response.
+    //
+    // |sent| will indicate whether the exception was successfully sent over
+    // the given |exceptionate| channel. This can be used in the ZX_ERR_NEXT
+    // case to determine whether the exception channel didn't exist or it did
+    // exist but the receiver opted not to handle the exception.
+    //
+    // Returns:
+    //   ZX_OK if the exception was processed and the thread should resume.
+    //   ZX_ERR_NEXT if there is no channel or the receiver opted to skip.
+    //   ZX_ERR_NO_MEMORY on allocation failure.
+    //   ZX_ERR_INTERNAL_INTR_KILLED if the thread was killed before
+    //       receiving a response.
+    zx_status_t HandleException(Exceptionate* exceptionate,
+                                fbl::RefPtr<ExceptionDispatcher> exception,
+                                bool* sent);
+
+    // Similar to HandleException(), but for single-shot exceptions which are
+    // sent to at most one handler, e.g. ZX_EXCP_THREAD_STARTING.
+    //
+    // The main difference is that this takes |exception_type| and |context|
+    // rather than a full exception object, and internally sets up the required
+    // state and creates the exception object.
+    //
+    // Returns true if the exception was sent.
+    bool HandleSingleShotException(Exceptionate* exceptionate,
+                                   zx_excp_type_t exception_type,
+                                   const arch_exception_context_t& context);
 
     // Fetch the state of the thread for userspace tools.
     zx_status_t GetInfoForUserspace(zx_info_thread_t* info);
@@ -188,6 +229,11 @@ private:
     ThreadDispatcher(const ThreadDispatcher&) = delete;
     ThreadDispatcher& operator=(const ThreadDispatcher&) = delete;
 
+    // friend FutexContext so that it can manipulate the blocking_futex_id_ member of
+    // ThreadDispatcher, and so that it can access the "thread_" member of the class so that
+    // wait_queue opertations can be performed on ThreadDispatchers
+    friend class FutexContext;
+
     // kernel level entry point
     static int StartRoutine(void* arg);
 
@@ -200,7 +246,11 @@ private:
     void Resuming();
 
     // Return true if waiting for an exception response.
-    bool InExceptionLocked() TA_REQ(get_lock());
+    bool InPortExceptionLocked() TA_REQ(get_lock());
+    bool InChannelExceptionLocked() TA_REQ(get_lock());
+
+    // Returns true if the thread is suspended or processing an exception.
+    bool SuspendedOrInExceptionLocked() TA_REQ(get_lock());
 
     // Helper routine to minimize code duplication.
     zx_status_t MarkExceptionHandledWorker(PortDispatcher* eport,
@@ -212,19 +262,15 @@ private:
     // change states of the object, do what is appropriate for the state transition
     void SetStateLocked(ThreadState::Lifecycle lifecycle) TA_REQ(get_lock());
 
-    fbl::Canary<fbl::magic("THRD")> canary_;
+    bool IsDyingOrDeadLocked() const TA_REQ(get_lock());
 
     // The containing process holds a list of all its threads.
     fbl::DoublyLinkedListNodeState<ThreadDispatcher*> dll_thread_;
-
     // a ref pointer back to the parent process
     fbl::RefPtr<ProcessDispatcher> process_;
 
     // User thread starting register values.
-    uintptr_t user_entry_ = 0;
-    uintptr_t user_sp_ = 0;
-    uintptr_t user_arg1_ = 0;
-    uintptr_t user_arg2_ = 0;
+    EntryState user_entry_;
 
     ThreadState state_ TA_GUARDED(get_lock());
 
@@ -237,7 +283,9 @@ private:
     // get put on a wait queue, the thread was never really blocked.
     volatile Blocked blocked_reason_ = Blocked::NONE;
 
-    // A thread-level exception port for this thread.
+    // Thread-level exception handler.
+    // Exceptionates have internal locking so we don't need to guard it here.
+    Exceptionate exceptionate_;
     fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(get_lock());
 
     // Support for sending an exception to an exception handler and then waiting for a response.
@@ -247,6 +295,14 @@ private:
     const zx_exception_report_t* exception_report_ TA_GUARDED(get_lock());
     event_t exception_event_ =
         EVENT_INITIAL_VALUE(exception_event_, false, EVENT_FLAG_AUTOUNSIGNAL);
+
+    // Non-null if the thread is currently processing a channel exception.
+    fbl::RefPtr<ExceptionDispatcher> exception_ TA_GUARDED(get_lock());
+
+    // Some glue to temporarily bridge state between channel-based and
+    // port-based exception handling until we remove ports.
+    ExceptionPort::Type channel_exception_wait_type_ TA_GUARDED(get_lock()) =
+        ExceptionPort::Type::NONE;
 
     // cleanup dpc structure
     dpc_t cleanup_dpc_ = {LIST_INITIAL_CLEARED_VALUE, nullptr, nullptr};
@@ -273,4 +329,14 @@ private:
     // If true and ancestor job has a debugger attached, thread will block on
     // start and will send a process start exception.
     bool is_initial_thread_ = false;
+
+    // The ID of the futex we are currently waiting on, or 0 if we are not
+    // waiting on any futex at the moment.
+    //
+    // TODO(johngro): figure out some way to apply clang static thread analysis
+    // to this.  Right now, there is no good (cost free) way for the compiler to
+    // figure out that this thread belongs to a specific process/futex-context,
+    // and therefor the thread's futex-context lock can be used to guard this
+    // futex ID.
+    uintptr_t blocking_futex_id_ = 0;
 };

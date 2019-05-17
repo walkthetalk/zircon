@@ -10,7 +10,6 @@
 #include <lib/fdio/vfs.h>
 #include <lib/zxio/ops.h>
 #include <stdarg.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -37,8 +36,8 @@ typedef struct fdio_ops {
     zx_status_t (*close)(fdio_t* io);
     zx_status_t (*open)(fdio_t* io, const char* path, uint32_t flags,
                         uint32_t mode, fdio_t** out);
-    zx_status_t (*clone)(fdio_t* io, zx_handle_t* out_handles, uint32_t* out_types);
-    zx_status_t (*unwrap)(fdio_t* io, zx_handle_t* out_handles, uint32_t* out_types);
+    zx_status_t (*clone)(fdio_t* io, zx_handle_t* out_handle);
+    zx_status_t (*unwrap)(fdio_t* io, zx_handle_t* out_handle);
     void (*wait_begin)(fdio_t* io, uint32_t events, zx_handle_t* handle,
                        zx_signals_t* signals);
     void (*wait_end)(fdio_t* io, zx_signals_t signals, uint32_t* events);
@@ -49,7 +48,6 @@ typedef struct fdio_ops {
     zx_status_t (*get_token)(fdio_t* io, zx_handle_t* out);
     zx_status_t (*get_attr)(fdio_t* io, fuchsia_io_NodeAttributes* out);
     zx_status_t (*set_attr)(fdio_t* io, uint32_t flags, const fuchsia_io_NodeAttributes* attr);
-    zx_status_t (*sync)(fdio_t* io);
     zx_status_t (*readdir)(fdio_t* io, void* ptr, size_t max, size_t* actual);
     zx_status_t (*rewind)(fdio_t* io);
     zx_status_t (*unlink)(fdio_t* io, const char* path, size_t len);
@@ -61,7 +59,7 @@ typedef struct fdio_ops {
     zx_status_t (*get_flags)(fdio_t* io, uint32_t* out_flags);
     zx_status_t (*set_flags)(fdio_t* io, uint32_t flags);
     ssize_t (*recvfrom)(fdio_t* io, void* data, size_t len, int flags,
-                        struct sockaddr* restrict addr, socklen_t* restrict addrlen);
+                        struct sockaddr* __restrict addr, socklen_t* __restrict addrlen);
     ssize_t (*sendto)(fdio_t* io, const void* data, size_t len, int flags,
                       const struct sockaddr* addr, socklen_t addrlen);
     ssize_t (*recvmsg)(fdio_t* io, struct msghdr* msg, int flags);
@@ -82,18 +80,44 @@ typedef struct fdio_ops {
 // Static assertions in unistd.c ensure we aren't colliding.
 #define IOFLAG_FD_FLAGS IOFLAG_CLOEXEC
 
-typedef struct fdio {
-    fdio_ops_t* ops;
-    uint32_t magic;
-    atomic_int_fast32_t refcount;
-    int32_t dupcount;
-    uint32_t ioflag;
-    zxio_storage_t storage;
-} fdio_t;
+typedef struct fdio fdio_t;
 
-static inline zxio_t* fdio_get_zxio(fdio_t* io) {
-    return &io->storage.io;
-}
+__BEGIN_CDECLS
+
+// Acquire a reference to a globally shared "fdio_t" object
+// acts as a sentinel value for reservation.
+//
+// It is unsafe to call any ops within this object.
+// It is unsafe to change the reference count of this object.
+fdio_t* fdio_get_reserved_io(void);
+
+// Access the |zxio_t| field within an |fdio_t|.
+zxio_t* fdio_get_zxio(fdio_t* io);
+
+// Initialize an |fdio_t| object with the provided ops table.
+//
+// Initializes the refcount to one. The refcount may be altered with the |fdio_acquire| and
+// |fdio_release| functions. When the refcount reaches zero, the object is destroyed.
+fdio_t* fdio_alloc(const fdio_ops_t* ops);
+
+// Increases the refcount of |io| by one.
+void fdio_acquire(fdio_t* io);
+
+// Decreases the refcount of |io| by one. If the reference count
+// reaches zero, the object is destroyed.
+void fdio_release(fdio_t* io);
+
+// Returns true if |io| is the only acquired reference to an object.
+bool fdio_is_last_reference(fdio_t* io);
+
+// Accessors for the internal fields of fdio_t:
+
+const fdio_ops_t* fdio_get_ops(const fdio_t* io);
+int32_t fdio_get_dupcount(const fdio_t* io);
+void fdio_dupcount_acquire(fdio_t* io);
+void fdio_dupcount_release(fdio_t* io);
+uint32_t* fdio_get_ioflag(fdio_t* io);
+zxio_storage_t* fdio_get_zxio_storage(fdio_t* io);
 
 // Lifecycle notes:
 //
@@ -110,7 +134,7 @@ static inline zxio_t* fdio_get_zxio(fdio_t* io) {
 // that the fdtab itself is holding is released, at which
 // point they will be free()'d unless somebody is holding
 // a ref due to an ongoing io transaction, which will
-// certainly fail doe to underlying handles being closed
+// certainly fail due to underlying handles being closed
 // at which point a downref will happen and destruction
 // will follow.
 //
@@ -118,24 +142,43 @@ static inline zxio_t* fdio_get_zxio(fdio_t* io) {
 // is in.  close() reduces the dupcount, and only actually
 // closes the underlying object when it reaches zero.
 
-#define FDIO_MAGIC 0x4f49584d // FDIO
-
 zx_status_t fdio_close(fdio_t* io);
 zx_status_t fdio_wait(fdio_t* io, uint32_t events, zx_time_t deadline,
                       uint32_t* out_pending);
+
+// Wraps a channel with an fdio_t using remote io.
+// Takes ownership of h and e.
+fdio_t* fdio_remote_create(zx_handle_t h, zx_handle_t event);
+
+// creates a fdio that wraps a log object
+// this will allocate a buffer (on demand) to assemble
+// entire log-lines and flush them on newline or buffer full.
+fdio_t* fdio_logger_create(zx_handle_t);
 
 // Creates an |fdio_t| from a remote directory connection.
 //
 // Takes ownership of |control|.
 fdio_t* fdio_dir_create(zx_handle_t control);
 
+// Creates an |fdio_t| from a remote file connection.
+//
+// Takes ownership of |control| and |event|.
+fdio_t* fdio_file_create(zx_handle_t control, zx_handle_t event);
+
 // Creates a pipe backed by a socket.
 //
 // Takes ownership of |socket|.
 fdio_t* fdio_pipe_create(zx_handle_t socket);
 
-// Wraps a socket with an fdio_t using socketpair io.
-fdio_t* fdio_socketpair_create(zx_handle_t h);
+// Creates a socketpair backed by a socket.
+//
+// Takes ownership of |socket|.
+fdio_t* fdio_socketpair_create(zx_handle_t socket);
+
+// Creates an |fdio_t| from a VMO.
+//
+// Takes ownership of |vmo|.
+fdio_t* fdio_vmo_create(zx_handle_t vmo, zx_off_t seek);
 
 // Creates an |fdio_t| for a VMO file.
 //
@@ -150,23 +193,6 @@ fdio_t* fdio_socketpair_create(zx_handle_t h);
 fdio_t* fdio_vmofile_create(zx_handle_t control, zx_handle_t vmo,
                             zx_off_t offset, zx_off_t length, zx_off_t seek);
 
-// Creates an |fdio_t| from a Zircon socket object.
-//
-// Examines |socket| and determines whether to create a pipe, stream socket, or
-// datagram socket.
-//
-// Always consumes |socket|.
-zx_status_t fdio_from_socket(zx_handle_t socket, fdio_t** out_io);
-
-// Creates an |fdio_t| from a Zircon channel object.
-//
-// The |channel| must implement the |fuchsia.io.Node| protocol. Uses the
-// |Describe| method from the |fuchsia.io.Node| protocol to determine whether to
-// create a remoteio or a vmofile.
-//
-// Always consumes |channel|.
-zx_status_t fdio_from_channel(zx_handle_t channel, fdio_t** out_io);
-
 // Wraps a socket with an fdio_t using socket io.
 fdio_t* fdio_socket_create_stream(zx_handle_t s, int flags);
 fdio_t* fdio_socket_create_datagram(zx_handle_t s, int flags);
@@ -174,9 +200,22 @@ fdio_t* fdio_socket_create_datagram(zx_handle_t s, int flags);
 // creates a message port and pair of simple io fdio_t's
 int fdio_pipe_pair(fdio_t** a, fdio_t** b);
 
-void fdio_free(fdio_t* io);
-
 fdio_t* fdio_ns_open_root(fdio_ns_t* ns);
+
+// Open |path| relative to |dir| as an |fdio_t|.
+//
+// |dir| must be a channel that implements the |fuchsia.io.Directory| protocol.
+// The |flags| and |mode| are passed to |fuchsia.io.Directory/Open| as |flags|
+// and |mode|, respectively.
+//
+// If |flags| includes |ZX_FS_FLAG_DESCRIBE|, this function reads the resulting
+// |fuchsia.io.Node/OnOpen| event from the newly created channel and creates an
+// appropriate |fdio_t| object to interact with the remote object.
+//
+// Otherwise, this function creates a generic "remote" |fdio_t| object.
+zx_status_t fdio_remote_open_at(zx_handle_t dir, const char* path,
+                                uint32_t flags, uint32_t mode,
+                                fdio_t** out_io);
 
 // io will be consumed by this and must not be shared
 void fdio_chdir(fdio_t* io, const char* path);
@@ -202,8 +241,8 @@ zx_status_t fdio_default_set_flags(fdio_t* io, uint32_t flags);
 ssize_t fdio_default_write(fdio_t* io, const void* _data, size_t len);
 ssize_t fdio_default_write_at(fdio_t* io, const void* _data, size_t len, off_t offset);
 ssize_t fdio_default_recvfrom(fdio_t* io, void* _data, size_t len, int flags,
-                              struct sockaddr* restrict addr,
-                              socklen_t* restrict addrlen);
+                              struct sockaddr* __restrict addr,
+                              socklen_t* __restrict addrlen);
 ssize_t fdio_default_sendto(fdio_t* io, const void* _data, size_t len,
                             int flags, const struct sockaddr* addr,
                             socklen_t addrlen);
@@ -213,13 +252,13 @@ zx_status_t fdio_default_get_attr(fdio_t* io, fuchsia_io_NodeAttributes* out);
 zx_status_t fdio_default_close(fdio_t* io);
 zx_status_t fdio_default_open(fdio_t* io, const char* path, uint32_t flags,
                               uint32_t mode, fdio_t** out);
-zx_status_t fdio_default_clone(fdio_t* io, zx_handle_t* handles, uint32_t* types);
+zx_status_t fdio_default_clone(fdio_t* io, zx_handle_t* out_handle);
 ssize_t fdio_default_ioctl(fdio_t* io, uint32_t op, const void* in_buf,
                            size_t in_len, void* out_buf, size_t out_len);
 void fdio_default_wait_begin(fdio_t* io, uint32_t events, zx_handle_t* handle,
                              zx_signals_t* _signals);
 void fdio_default_wait_end(fdio_t* io, zx_signals_t signals, uint32_t* _events);
-zx_status_t fdio_default_unwrap(fdio_t* io, zx_handle_t* handles, uint32_t* types);
+zx_status_t fdio_default_unwrap(fdio_t* io, zx_handle_t* out_handle);
 zx_status_t fdio_default_shutdown(fdio_t* io, int how);
 ssize_t fdio_default_posix_ioctl(fdio_t* io, int req, va_list va);
 zx_status_t fdio_default_get_vmo(fdio_t* io, int flags, zx_handle_t* out);
@@ -250,51 +289,6 @@ extern fdio_state_t __fdio_global_state;
 #define fdio_root_init (__fdio_global_state.init)
 #define fdio_root_ns (__fdio_global_state.ns)
 
-// Enable low level debug chatter, which requires a kernel that
-// doesn't check the resource argument to zx_debuglog_create()
-//
-// The value is the default debug level (0 = none)
-// The environment variable FDIODEBUG will override this on fdio init
-//
-// #define FDIO_LLDEBUG 1
-
-#ifdef FDIO_LLDEBUG
-void fdio_lldebug_printf(unsigned level, const char* fmt, ...);
-#define LOG(level, fmt...) fdio_lldebug_printf(level, fmt)
-#else
-#define LOG(level, fmt...) \
-    do {                   \
-    } while (0)
-#endif
-
-void fdio_set_debug_level(unsigned level);
-
-// Enable intrusive allocation debugging
-//
-//#define FDIO_ALLOCDEBUG
-
-static inline void fdio_acquire(fdio_t* io) {
-    LOG(6, "fdio: acquire: %p\n", io);
-    atomic_fetch_add(&io->refcount, 1);
-}
-
-static inline void fdio_release(fdio_t* io) {
-    LOG(6, "fdio: release: %p\n", io);
-    if (atomic_fetch_sub(&io->refcount, 1) == 1) {
-        fdio_free(io);
-    }
-}
-
-#ifdef FDIO_ALLOCDEBUG
-void* fdio_alloc(size_t sz);
-#else
-static inline void* fdio_alloc(size_t sz) {
-    void* ptr = calloc(1, sz);
-    LOG(5, "fdio: io: alloc: %p\n", ptr);
-    return ptr;
-}
-#endif
-
 // Returns an fd number greater than or equal to |starting_fd|, following the
 // same rules as fdio_bind_fd. If there are no free file descriptors, -1 is
 // returned and |errno| is set to EMFILE. The returned |fd| is bound to
@@ -309,3 +303,5 @@ int fdio_assign_reserved(int fd, fdio_t* io);
 // Unassign the reservation at |fd|. If |fd| does not resolve to a reservation
 // then -1 is returned and errno is set to EINVAL, otherwise |fd| is returned.
 int fdio_release_reserved(int fd);
+
+__END_CDECLS

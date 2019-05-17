@@ -63,7 +63,8 @@ int UsbDevice::CallbackThread() {
         // Call completion callbacks outside of the lock.
         for (auto req = temp_queue.pop(); req; req = temp_queue.pop()) {
             const auto& response = req->request()->response;
-            req->Complete(response.status, response.actual);
+            req->Complete(response.status, response.actual,
+                          req->private_storage()->silent_completions_count);
         }
     }
 
@@ -89,21 +90,104 @@ void UsbDevice::StopCallbackThread() {
     thrd_join(callback_thread_, nullptr);
 }
 
+UsbDevice::Endpoint* UsbDevice::GetEndpoint(uint8_t ep_address) {
+    uint8_t index = 0;
+    if (ep_address > 0) {
+        index = static_cast<uint8_t>(2 * (ep_address & ~USB_ENDPOINT_DIR_MASK));
+        if ((ep_address & USB_ENDPOINT_DIR_MASK) == USB_ENDPOINT_OUT) {
+            index--;
+        }
+    }
+    return index < USB_MAX_EPS ? &eps_[index] : nullptr;
+}
+
+bool UsbDevice::UpdateEndpoint(Endpoint* ep, usb_request_t* completed_req) {
+    fbl::AutoLock lock(&ep->lock);
+
+    auto unowned = UnownedRequest(completed_req, parent_req_size_, /* allow_destruct */ false);
+
+    std::optional<size_t> completed_req_idx = ep->pending_reqs.find(&unowned);
+    if (!completed_req_idx.has_value()) {
+        zxlogf(ERROR, "could not find completed req %p in pending list of endpoint: 0x%x\n",
+               unowned.request(), completed_req->header.ep_address);
+        // This should never happen, but we should probably still do a callback.
+        return true;
+    }
+
+    auto* storage = unowned.private_storage();
+    storage->ready_for_client = true;
+
+    auto opt_prev = ep->pending_reqs.prev(&unowned);
+    // If all requests in the pending list prior to this one are ready for a callback,
+    // then this request has completed in order. Since we do an immediate callback
+    // for out of order requests, we just have to check the request before this one.
+    bool completed_in_order = !opt_prev.has_value() ||
+                              opt_prev->private_storage()->ready_for_client;
+
+    if (!storage->require_callback && completed_in_order &&
+        completed_req->response.status == ZX_OK) {
+        // Skipping unwanted callback since the request completed successfully and in order.
+        // Don't remove the request from the list until we do the next callback.
+        return false;
+    }
+
+    if (completed_in_order) {
+        // Remove all requests up to the current request from the pending list.
+        auto opt_req = ep->pending_reqs.begin();
+        while (opt_req) {
+            auto req = *std::move(opt_req);
+            auto opt_next = ep->pending_reqs.next(&req);
+
+            ZX_DEBUG_ASSERT(req.private_storage()->ready_for_client);
+
+            ep->pending_reqs.erase(&req);
+            if (req.request() == completed_req) {
+                break;
+            }
+            opt_req = std::move(opt_next);
+        }
+    } else {
+        // The request completed out of order. Only remove the single request.
+        ep->pending_reqs.erase(&unowned);
+        // If this request was supposed to do a callback, make sure the previous request
+        // will do a callback.
+        ZX_DEBUG_ASSERT(opt_prev.has_value()); // Must be populated if we completed out of order.
+        if (unowned.private_storage()->require_callback) {
+            opt_prev->private_storage()->require_callback = true;
+        }
+    }
+    unowned.private_storage()->silent_completions_count = completed_in_order ?
+                                                          completed_req_idx.value() : 0;
+    return true;
+}
+
 // usb request completion for the requests passed down to the HCI driver
 void UsbDevice::RequestComplete(usb_request_t* req) {
-    fbl::AutoLock lock(&callback_lock_);
-
-    if (req->cb_on_error_only && req->response.status == ZX_OK) {
+    auto* ep = GetEndpoint(req->header.ep_address);
+    if (!ep) {
+        zxlogf(ERROR, "could not find endpoint with address 0x%x\n", req->header.ep_address);
+        // This should never happen, but we should probably still do a callback.
+        QueueCallback(req);
         return;
     }
 
-    // move original request to completed_reqs list so it can be completed on the callback_thread
-    completed_reqs_.push(UnownedRequest(req, parent_req_size_));
+    bool do_callback = UpdateEndpoint(ep, req);
+    if (do_callback) {
+        QueueCallback(req);
+    }
+}
+
+void UsbDevice::QueueCallback(usb_request_t* req) {
+    {
+        fbl::AutoLock lock(&callback_lock_);
+
+        // move original request to completed_reqs list so it can be completed on the callback_thread
+        completed_reqs_.push(UnownedRequest(req, parent_req_size_));
+    }
     sync_completion_signal(&callback_thread_completion_);
 }
 
-
-void UsbDevice::SetHubInterface(const usb_hub_interface_t* hub_intf) {
+void UsbDevice::SetHubInterface(const usb_hub_interface_protocol_t* hub_intf) {
     if (hub_intf) {
         hub_intf_ = hub_intf;
     } else {
@@ -280,6 +364,22 @@ void UsbDevice::UsbRequestQueue(usb_request_t* req, const usb_request_complete_t
 
     // Save client's callback in private storage.
     UnownedRequest request(req, *complete_cb, parent_req_size_);
+    *request.private_storage() = {
+        .ready_for_client = false,
+        .require_callback = !req->cb_on_error_only,
+        .silent_completions_count = 0
+    };
+
+    auto* ep = GetEndpoint(req->header.ep_address);
+    if (!ep) {
+        zxlogf(ERROR, "could not find endpoint with address 0x%x\n", req->header.ep_address);
+    }
+
+    {
+        // RequestQueue may callback before it returns, so make sure to release the endpoint lock.
+        fbl::AutoLock lock(&ep->lock);
+        ep->pending_reqs.push_back(&request);
+    }
 
     // Queue with our callback instead.
     hci_.RequestQueue(request.take(), &complete);
@@ -520,6 +620,9 @@ zx_status_t UsbDevice::UsbGetStringDescriptor(uint8_t desc_id, uint16_t lang_id,
 
 zx_status_t UsbDevice::UsbCancelAll(uint8_t ep_address) {
     return hci_.CancelAll(device_id_, ep_address);
+    // TODO(jocelyndang): after cancelling, we should check if the ep pending_reqs has any items.
+    // We may have to do callbacks now if the requests already completed before the cancel
+    // occurred, but the client did not request any callbacks.
 }
 
 uint64_t UsbDevice::UsbGetCurrentFrame() {
@@ -564,12 +667,12 @@ zx_status_t UsbDevice::MsgGetConfigurationDescriptor(uint8_t config, fidl_txn_t*
 }
 
 zx_status_t UsbDevice::MsgGetStringDescriptor(uint8_t desc_id, uint16_t lang_id, fidl_txn_t* txn) {
-    uint8_t buffer[fuchsia_hardware_usb_device_MAX_STRING_DESC_SIZE];
+    char buffer[fuchsia_hardware_usb_device_MAX_STRING_DESC_SIZE];
     size_t actual;
     auto status = UsbGetStringDescriptor(desc_id, lang_id, &lang_id, buffer, sizeof(buffer),
                                          &actual);
-    return fuchsia_hardware_usb_device_DeviceGetStringDescriptor_reply(txn, status, buffer, actual,
-                                                                       lang_id);
+    return fuchsia_hardware_usb_device_DeviceGetStringDescriptor_reply(txn, status, buffer,
+                                                                       actual, lang_id);
 }
 
 zx_status_t UsbDevice::MsgSetInterface(uint8_t interface_number, uint8_t alt_setting,

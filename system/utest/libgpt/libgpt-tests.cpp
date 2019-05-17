@@ -3,10 +3,11 @@
 // found in the LICENSE file.
 
 #include <fbl/auto_call.h>
-#include <fs-management/ramdisk.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <lib/fzl/fdio.h>
+#include <ramdevice-client/ramdisk.h>
 #include <unittest/unittest.h>
 #include <zircon/assert.h>
-#include <zircon/device/device.h>
 
 #include "libgpt-tests.h"
 
@@ -314,9 +315,12 @@ bool LibGptTest::InitDisk(const char* disk_path) {
     snprintf(disk_path_, PATH_MAX, "%s", disk_path);
     fbl::unique_fd fd(open(disk_path_, O_RDWR));
     ASSERT_TRUE(fd.is_valid(), "Could not open block device to fetch info");
-    block_info_t block_info;
-    ssize_t rc = ioctl_block_get_info(fd.get(), &block_info);
-    ASSERT_EQ(rc, sizeof(block_info), "Could not query block device info");
+    fuchsia_hardware_block_BlockInfo block_info;
+    fzl::UnownedFdioCaller caller(fd.get());
+    zx_status_t status;
+    ASSERT_EQ(fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(), &status, &block_info),
+              ZX_OK);
+    ASSERT_EQ(status, ZX_OK);
 
     blk_size_ = block_info.block_size;
     blk_count_ = block_info.block_count;
@@ -330,7 +334,7 @@ bool LibGptTest::InitDisk(const char* disk_path) {
 
 bool LibGptTest::InitRamDisk() {
     BEGIN_HELPER;
-    ASSERT_EQ(create_ramdisk(GetBlockSize(), GetBlockCount(), &ramdisk_),
+    ASSERT_EQ(ramdisk_create(GetBlockSize(), GetBlockCount(), &ramdisk_),
               ZX_OK, "Could not create ramdisk");
     strlcpy(disk_path_, ramdisk_get_path(ramdisk_), sizeof(disk_path_));
     fd_.reset(open(disk_path_, O_RDWR));

@@ -24,20 +24,43 @@ $VerifiedPlatform mac-amd64
 
 # Clang
 @Subdir clang
-fuchsia/clang/${platform} git_revision:f81edba34ddf2e70300baa227b136dcdb8aecb6e
+fuchsia/clang/${platform} git_revision:1558731607cb2aef361d02be9973d4e374475254
 
 # GCC
 @Subdir gcc
-fuchsia/gcc/${os}-${arch=amd64} git_revision:fb02152947d8ef666961e3b8b6527ed39de18334,653a4ab26cb08800c45b8c3446c3753d6f2102df
+fuchsia/gcc/${os}-${arch=amd64} git_revision:9fb89fa845c1b2e0a18d85ada0b077c84508ab78,9163eacc1840f8db0523e21d4e7bc4239608c564,1
 
-# sysroot
-@Subdir sysroot
-fuchsia/sysroot/${os=linux}-${arch} git_revision:a96053c799a0f1ad0b7e8ab8199edbfa18adcbb6
+# sysroot/linux-arm64
+@Subdir sysroot/linux-arm64
+fuchsia/sysroot/linux-arm64 git_revision:a4aaacde9d37ccf91a0f8dc8267cb7ad5d9be283
+
+# sysroot/linux-x64
+@Subdir sysroot/linux-x64
+fuchsia/sysroot/linux-amd64 git_revision:a4aaacde9d37ccf91a0f8dc8267cb7ad5d9be283
 
 # Symbolizer tool.  This is a standalone executable, not a subdirectory.
 @Subdir
-fuchsia/tools/symbolize/${platform} git_revision:5e5a9e55af0926d9ce08c9da9cf46dc3f9eabc1b
+fuchsia/tools/symbolize/${platform} git_revision:0f30b84316f88db873708d291138ef5638b19270
 
 # QEMU
 @Subdir qemu
-fuchsia/third_party/qemu/${platform} git_revision:533bf2563d0213a7e002d9fcde75519d30ffa70f
+fuchsia/third_party/qemu/${platform} git_revision:533bf2563d0213a7e002d9fcde75519d30ffa70f,1
+
+# GN
+# TODO(BLD-341): replace ${os}-${arch=amd64} with ${platform}
+@Subdir
+gn/gn/${os}-${arch=amd64} git_revision:d409ab897d648b80e8b97fe04ced3fb013b6f39d
+
+# Ninja
+# TODO(BLD-341): replace ${os}-${arch=amd64} with ${platform}
+@Subdir
+infra/ninja/${os}-${arch=amd64} version:1.8.2
+
+# Banjo compiler
+@Subdir banjo
+# TODO(BLD-341): replace ${os}-${arch=amd64} with ${platform}
+fuchsia/tools/banjo_bin/${os}-${arch=amd64} git_revision:74d433b8ae7709785b80159b39cfcef831edf19f
+
+# AEMU
+@Subdir aemu
+fuchsia/third_party/aemu/${os}-${arch=amd64} git_revision:2da1707469c501168757c820cf5459c64a2ca128

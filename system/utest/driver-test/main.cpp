@@ -14,14 +14,16 @@
 
 #include <fbl/unique_fd.h>
 #include <fbl/unique_ptr.h>
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/device/test/c/fidl.h>
 #include <lib/devmgr-integration-test/fixture.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/socket.h>
 #include <lib/zx/time.h>
 #include <unittest/unittest.h>
-#include <zircon/device/device.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
 
@@ -31,7 +33,7 @@ using devmgr_integration_test::IsolatedDevmgr;
 
 namespace {
 
-void do_one_test(const fbl::unique_ptr<IsolatedDevmgr>& devmgr, const zx::channel& test_root,
+void do_one_test(const IsolatedDevmgr& devmgr, const zx::channel& test_root,
                  const char* drv_libname, const zx::socket& output,
                  fuchsia_device_test_TestReport* report) {
     // Initialize the report with a failure state to handle early returns
@@ -71,7 +73,7 @@ void do_one_test(const fbl::unique_ptr<IsolatedDevmgr>& devmgr, const zx::channe
     fbl::unique_fd fd;
     int retry = 0;
     do {
-        fd.reset(openat(devmgr->devfs_root().get(), relative_devpath, O_RDWR));
+        fd.reset(openat(devmgr.devfs_root().get(), relative_devpath, O_RDWR));
         if (fd.is_valid()) {
             break;
         }
@@ -83,20 +85,23 @@ void do_one_test(const fbl::unique_ptr<IsolatedDevmgr>& devmgr, const zx::channe
         return;
     }
 
-    char libpath[PATH_MAX];
-    int n = snprintf(libpath, sizeof(libpath), "%s/%s", DRIVER_TEST_DIR, drv_libname);
-    ssize_t rc = ioctl_device_bind(fd.get(), libpath, n);
-    if (rc < 0) {
-        printf("driver-tests: error %zd binding to %s\n", rc, libpath);
-        // TODO(teisenbe): I think fuchsia_device_test_DeviceDestroy() should be called
-        // here?
-        return;
-    }
-
     zx::channel test_channel;
     status = fdio_get_service_handle(fd.release(), test_channel.reset_and_get_address());
     if (status != ZX_OK) {
         printf("driver-tests: failed to get channel %s\n", zx_status_get_string(status));
+        return;
+    }
+
+    char libpath[PATH_MAX];
+    int n = snprintf(libpath, sizeof(libpath), "%s/%s", DRIVER_TEST_DIR, drv_libname);
+    status = fuchsia_device_ControllerBind(test_channel.get(), libpath, n, &call_status);
+    if (status == ZX_OK) {
+        status = call_status;
+    }
+    if (status != ZX_OK) {
+        printf("driver-tests: error %d binding to %s\n", status, libpath);
+        // TODO(teisenbe): I think fuchsia_device_test_DeviceDestroy() should be called
+        // here?
         return;
     }
 
@@ -158,7 +163,7 @@ int output_thread(void* arg) {
 int main(int argc, char** argv) {
     auto args = IsolatedDevmgr::DefaultArgs();
 
-    fbl::unique_ptr<IsolatedDevmgr> devmgr;
+    IsolatedDevmgr devmgr;
     zx_status_t status = IsolatedDevmgr::Create(std::move(args), &devmgr);
     if (status != ZX_OK) {
         printf("driver-tests: failed to create isolated devmgr\n");
@@ -174,7 +179,7 @@ int main(int argc, char** argv) {
 
     // Wait for /dev/test/test to appear
     fbl::unique_fd fd;
-    status = devmgr_integration_test::RecursiveWaitForFile(devmgr->devfs_root(), "test/test",
+    status = devmgr_integration_test::RecursiveWaitForFile(devmgr.devfs_root(), "test/test",
                                                            zx::deadline_after(zx::sec(5)), &fd);
     if (status != ZX_OK) {
         printf("driver-tests: failed to find /dev/test/test\n");

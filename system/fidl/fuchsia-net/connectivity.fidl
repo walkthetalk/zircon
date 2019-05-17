@@ -5,6 +5,9 @@
 library fuchsia.net;
 
 [Discoverable]
-interface Connectivity {
-    1: -> OnNetworkReachable(bool reachable);
+protocol Connectivity {
+    /// This is triggered on a state change in network reachability. Clients
+    /// should expect that network requests will succeed when |reachable| is
+    /// true.
+    -> OnNetworkReachable(bool reachable);
 };

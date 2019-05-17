@@ -10,7 +10,7 @@
 #include <ddk/protocol/platform-device-lib.h>
 #include <zircon/assert.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/unique_ptr.h>
 #include <optional>
 #include "common.h"
@@ -60,7 +60,7 @@ public:
     // Configure Display RDMA engine based on display dimensions
     zx_status_t Config();
 
-    // Dumps all the relevant Display Registers
+    // Dumps all the relevant Display RDMA Registers
     void Dump();
 
 private:

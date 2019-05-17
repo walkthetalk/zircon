@@ -30,18 +30,18 @@ zx_status_t sys_socket_create(uint32_t options,
                               user_out_handle* out0,
                               user_out_handle* out1) {
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryBasicPolicy(ZX_POL_NEW_SOCKET);
+    zx_status_t res = up->EnforceBasicPolicy(ZX_POL_NEW_SOCKET);
     if (res != ZX_OK)
         return res;
 
-    fbl::RefPtr<Dispatcher> socket0, socket1;
+    KernelHandle<SocketDispatcher> handle0, handle1;
     zx_rights_t rights;
-    zx_status_t result = SocketDispatcher::Create(options, &socket0, &socket1, &rights);
+    zx_status_t result = SocketDispatcher::Create(options, &handle0, &handle1, &rights);
 
     if (result == ZX_OK)
-        result = out0->make(ktl::move(socket0), rights);
+        result = out0->make(ktl::move(handle0), rights);
     if (result == ZX_OK)
-        result = out1->make(ktl::move(socket1), rights);
+        result = out1->make(ktl::move(handle1), rights);
     return result;
 }
 

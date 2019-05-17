@@ -11,12 +11,11 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 #include <zircon/status.h>
 
 #include "pty-core.h"
 #include "pty-fifo.h"
-
-#include <zircon/device/pty.h>
 
 typedef struct pty_server_dev {
     pty_server_t srv;
@@ -29,7 +28,8 @@ static zx_device_t* pty_root;
 
 static zx_status_t psd_recv(pty_server_t* ps, const void* data, size_t len, size_t* actual) {
     if (len == 0) {
-        return 0;
+        *actual = 0;
+        return ZX_OK;
     }
 
     pty_server_dev_t* psd = static_cast<pty_server_dev_t*>(containerof(ps, pty_server_dev_t, srv));
@@ -95,23 +95,46 @@ static zx_status_t psd_write(void* ctx, const void* buf, size_t count, zx_off_t 
     }
 }
 
-static zx_status_t psd_ioctl(void* ctx, uint32_t op, const void* in_buf, size_t in_len,
-                             void* out_buf, size_t out_len, size_t* out_actual) {
-    auto psd = static_cast<pty_server_dev_t*>(ctx);
+zx_status_t psd_ClrSetFeature(void* ctx, uint32_t clr, uint32_t set, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceClrSetFeature_reply(txn, ZX_ERR_NOT_SUPPORTED, 0);
+}
 
-    switch (op) {
-    case IOCTL_PTY_SET_WINDOW_SIZE: {
-        auto wsz = static_cast<const pty_window_size_t*>(in_buf);
-        zxlogf(TRACE, "PTY Server Device %p ioctl: set window size\n", psd);
-        if (in_len != sizeof(pty_window_size_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        pty_server_set_window_size(&psd->srv, wsz->width, wsz->height);
-        return ZX_OK;
-    }
-    default:
-        return ZX_ERR_NOT_SUPPORTED;
-    }
+zx_status_t psd_GetWindowSize(void* ctx, fidl_txn_t* txn) {
+    fuchsia_hardware_pty_WindowSize wsz = {
+        .width = 0,
+        .height = 0
+    };
+    return fuchsia_hardware_pty_DeviceGetWindowSize_reply(txn, ZX_ERR_NOT_SUPPORTED, &wsz);
+}
+
+zx_status_t psd_MakeActive(void* ctx, uint32_t client_pty_id, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceMakeActive_reply(txn, ZX_ERR_NOT_SUPPORTED);
+}
+
+zx_status_t psd_ReadEvents(void* ctx, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_DeviceReadEvents_reply(txn, ZX_ERR_NOT_SUPPORTED, 0);
+}
+
+zx_status_t psd_SetWindowSize(void* ctx, const fuchsia_hardware_pty_WindowSize* size,
+                              fidl_txn_t* txn) {
+    auto psd = static_cast<pty_server_dev_t*>(ctx);
+    zxlogf(TRACE, "PTY Server Device %p message: set window size\n", psd);
+    pty_server_set_window_size(&psd->srv, size->width, size->height);
+    return fuchsia_hardware_pty_DeviceSetWindowSize_reply(txn, ZX_OK);
+}
+
+
+static fuchsia_hardware_pty_Device_ops_t psd_fidl_ops = {
+    .OpenClient = pty_server_fidl_OpenClient,
+    .ClrSetFeature = psd_ClrSetFeature,
+    .GetWindowSize = psd_GetWindowSize,
+    .MakeActive = psd_MakeActive,
+    .ReadEvents = psd_ReadEvents,
+    .SetWindowSize = psd_SetWindowSize
+};
+
+zx_status_t psd_message(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn) {
+    return fuchsia_hardware_pty_Device_dispatch(ctx, txn, msg, &psd_fidl_ops);
 }
 
 // Since we have no special functionality,
@@ -121,11 +144,10 @@ static zx_protocol_device_t psd_ops = []() {
     zx_protocol_device_t ops = {};
     ops.version = DEVICE_OPS_VERSION;
     // ops.open = default, allow cloning;
-    ops.open_at = pty_server_openat;
     ops.release = pty_server_release;
     ops.read = psd_read;
     ops.write = psd_write;
-    ops.ioctl = psd_ioctl;
+    ops.message = psd_message;
     return ops;
 }();
 
@@ -141,6 +163,7 @@ static zx_status_t ptmx_open(void* ctx, zx_device_t** out, uint32_t flags) {
 
     pty_server_init(&psd->srv);
     psd->srv.recv = psd_recv;
+    psd->srv.set_window_size = psd_SetWindowSize;
     mtx_init(&psd->lock, mtx_plain);
     psd->fifo.head = 0;
     psd->fifo.tail = 0;

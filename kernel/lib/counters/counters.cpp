@@ -23,16 +23,13 @@ __USED __SECTION(".kcounter.desc.header") static const uint64_t vmo_header[] = {
 static_assert(sizeof(vmo_header) ==
               offsetof(counters::DescriptorVmo, descriptor_table_size));
 
-// This counter gets a constant value just as a sanity check.
-KCOUNTER(magic, "kernel.counters.magic");
+// This counter tracks how long it takes for Zircon to reach the last init level
+// It also can show if the target does not reset the internal clock upon reboot
+// which is true also for mexec (netboot) scenario.
+KCOUNTER(init_time, "init.target.time.msec")
 
 static void counters_init(unsigned level) {
-    // Wire the memory defined in the .bss section to the counters.
-    for (size_t ix = 0; ix != SMP_MAX_CPUS; ++ix) {
-        percpu[ix].counters = CounterArena().CpuData(ix);
-    }
-    magic.Add(counters::DescriptorVmo::kMagic);
+    init_time.Add(current_time() / 1000000LL);
 }
 
-LK_INIT_HOOK(kcounters, counters_init, LK_INIT_LEVEL_PLATFORM_EARLY);
-
+LK_INIT_HOOK(kcounters, counters_init, LK_INIT_LEVEL_TARGET)

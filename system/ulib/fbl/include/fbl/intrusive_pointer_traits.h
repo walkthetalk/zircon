@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_INTRUSIVE_POINTER_TRAITS_H_
+#define FBL_INTRUSIVE_POINTER_TRAITS_H_
 
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
-#include <fbl/type_support.h>
 #include <memory>
 #include <stdint.h>
 #include <zircon/compiler.h>
@@ -122,3 +122,5 @@ struct ContainerPtrTraits<::fbl::RefPtr<T>> {
 
 }  // namespace internal
 }  // namespace fbl
+
+#endif  // FBL_INTRUSIVE_POINTER_TRAITS_H_

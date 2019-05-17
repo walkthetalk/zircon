@@ -11,7 +11,7 @@
 #if __cplusplus
 
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <ddktl/protocol/display/controller.h>
 #include <fbl/unique_ptr.h>
 #include <lib/zx/vmo.h>
@@ -32,8 +32,12 @@ public:
     zx_status_t Bind(const char* name, fbl::unique_ptr<SimpleDisplay>* controller_ptr);
 
     void DisplayControllerImplSetDisplayControllerInterface(
-            const display_controller_interface_t* intf);
+            const display_controller_interface_protocol_t* intf);
     zx_status_t DisplayControllerImplImportVmoImage(image_t* image, zx::vmo vmo, size_t offset);
+    zx_status_t DisplayControllerImplImportImage(image_t* image, zx_unowned_handle_t handle,
+                                                 uint32_t index) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
     void DisplayControllerImplReleaseImage(image_t* image);
     uint32_t DisplayControllerImplCheckConfiguration(const display_config_t** display_configs,
                                                  size_t display_count, uint32_t** layer_cfg_results,
@@ -42,6 +46,15 @@ public:
                                              size_t display_count);
     uint32_t DisplayControllerImplComputeLinearStride(uint32_t width, zx_pixel_format_t format);
     zx_status_t DisplayControllerImplAllocateVmo(uint64_t size, zx::vmo* vmo_out);
+    zx_status_t DisplayControllerImplGetSysmemConnection(zx::channel connection) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+    zx_status_t DisplayControllerImplSetBufferCollectionConstraints(const image_t* config,
+                                                                    uint32_t collection) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+    zx_status_t DisplayControllerImplGetSingleBufferFramebuffer(zx::vmo* out_vmo,
+                                                                uint32_t* out_stride);
 
 private:
     ddk::MmioBuffer framebuffer_mmio_;
@@ -52,7 +65,7 @@ private:
     uint32_t stride_;
     zx_pixel_format_t format_;
 
-    ddk::DisplayControllerInterfaceClient intf_;
+    ddk::DisplayControllerInterfaceProtocolClient intf_;
 };
 
 #endif // __cplusplus

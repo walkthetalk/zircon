@@ -10,6 +10,7 @@
 
 #include <kernel/event.h>
 #include <object/dispatcher.h>
+#include <object/handle.h>
 #include <object/message_packet.h>
 
 #include <zircon/rights.h>
@@ -26,12 +27,12 @@ class ChannelDispatcher final :
 public:
     class MessageWaiter;
 
-    static zx_status_t Create(fbl::RefPtr<Dispatcher>* dispatcher0,
-                              fbl::RefPtr<Dispatcher>* dispatcher1, zx_rights_t* rights);
+    static zx_status_t Create(KernelHandle<ChannelDispatcher>* handle0,
+                              KernelHandle<ChannelDispatcher>* handle1, zx_rights_t* rights);
 
     ~ChannelDispatcher() final;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_CHANNEL; }
-    zx_status_t add_observer(StateObserver* observer) final;
+    zx_status_t AddObserver(StateObserver* observer) final;
 
     // Read from this endpoint's message queue.
     // |msg_size| and |msg_handle_count| are in-out parameters. As input, they specify the maximum
@@ -85,7 +86,7 @@ public:
         void Cancel(zx_status_t status);
         fbl::RefPtr<ChannelDispatcher> get_channel() { return channel_; }
         zx_txid_t get_txid() const { return txid_; }
-        void set_txid(zx_txid_t txid) { txid_ = txid; };
+        void set_txid(zx_txid_t txid) { txid_ = txid; }
         zx_status_t Wait(const Deadline& deadline);
         // Returns any delivered message via out and the status.
         zx_status_t EndWait(MessagePacketPtr* out);
@@ -116,8 +117,6 @@ private:
     void Init(fbl::RefPtr<ChannelDispatcher> other);
     void WriteSelf(MessagePacketPtr msg) TA_REQ(get_lock());
     zx_status_t UserSignalSelf(uint32_t clear_mask, uint32_t set_mask) TA_REQ(get_lock());
-
-    fbl::Canary<fbl::magic("CHAN")> canary_;
 
     MessageList messages_ TA_GUARDED(get_lock());
     uint64_t message_count_ TA_GUARDED(get_lock()) = 0;

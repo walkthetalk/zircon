@@ -10,14 +10,21 @@
 #include <lib/fidl/llcpp/traits.h>
 
 #ifdef __Fuchsia__
-#include <zircon/syscalls.h>
 #include <lib/zx/channel.h>
+#include <zircon/syscalls.h>
 #endif
 
 namespace fidl {
 
+namespace internal {
+
+// Predefined error messages in the binding
+constexpr char kErrorRequestBufferTooSmall[] = "request buffer too small";
+
+} // namespace internal
+
 // The request/response type of any FIDL method with zero in/out parameters.
-struct AnyZeroArgMessage {
+struct AnyZeroArgMessage final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
 
@@ -32,8 +39,13 @@ struct IsFidlType<AnyZeroArgMessage> : public std::true_type {};
 template <>
 struct IsFidlMessage<AnyZeroArgMessage> : public std::true_type {};
 
-template<typename FidlType>
-struct DecodeResult {
+// Holds a |DecodedMessage| in addition to |status| and |error|.
+// This is typically the return type of fidl::Decode and FIDL methods which require
+// a decode step for the response.
+// If |status| is ZX_OK, |message| contains a valid decoded message of type FidlType.
+// Otherwise, |error| contains a human-readable string for debugging purposes.
+template <typename FidlType>
+struct DecodeResult final {
     zx_status_t status = ZX_ERR_INTERNAL;
     const char* error = nullptr;
     DecodedMessage<FidlType> message;
@@ -43,11 +55,18 @@ struct DecodeResult {
     DecodeResult(zx_status_t status,
                  const char* error,
                  DecodedMessage<FidlType> message = DecodedMessage<FidlType>())
-        : status(status), error(error), message(std::move(message)) {}
+        : status(status), error(error), message(std::move(message)) {
+        ZX_DEBUG_ASSERT(status != ZX_OK || this->message.is_valid());
+    }
 };
 
-template<typename FidlType>
-struct EncodeResult {
+// Holds a |EncodedMessage| in addition to |status| and |error|.
+// This is typically the return type of fidl::Encode and other FIDL methods which
+// have encoding as the last step.
+// If |status| is ZX_OK, |message| contains a valid encoded message of type FidlType.
+// Otherwise, |error| contains a human-readable string for debugging purposes.
+template <typename FidlType>
+struct EncodeResult final {
     zx_status_t status = ZX_ERR_INTERNAL;
     const char* error = nullptr;
     EncodedMessage<FidlType> message;
@@ -60,8 +79,13 @@ struct EncodeResult {
         : status(status), error(error), message(std::move(message)) {}
 };
 
+// Holds a |DecodedMessage| in addition to |status| and |error|.
+// This is typically the return type of fidl::Linearize and other FIDL methods which
+// have linearization as the last step.
+// If |status| is ZX_OK, |message| contains a valid message in decoded form, of type FidlType.
+// Otherwise, |error| contains a human-readable string for debugging purposes.
 template <typename FidlType>
-struct LinearizeResult {
+struct LinearizeResult final {
     zx_status_t status = ZX_ERR_INTERNAL;
     const char* error = nullptr;
     DecodedMessage<FidlType> message;
@@ -106,24 +130,24 @@ DecodeResult<FidlType> Decode(EncodedMessage<FidlType> msg) {
 template <typename FidlType>
 EncodeResult<FidlType> Encode(DecodedMessage<FidlType> msg) {
     EncodeResult<FidlType> result;
-    result.status = result.message.Initialize([&msg, &result] (BytePart& msg_bytes,
-                                                               HandlePart& msg_handles) {
-        msg_bytes = std::move(msg.bytes_);
+    result.status = result.message.Initialize([&msg, &result](BytePart* out_msg_bytes,
+                                                              HandlePart* msg_handles) {
+        *out_msg_bytes = std::move(msg.bytes_);
         if (NeedsEncodeDecode<FidlType>::value) {
             uint32_t actual_handles = 0;
             zx_status_t status = fidl_encode(FidlType::Type,
-                                             msg_bytes.data(), msg_bytes.actual(),
-                                             msg_handles.data(), msg_handles.capacity(),
+                                             out_msg_bytes->data(), out_msg_bytes->actual(),
+                                             msg_handles->data(), msg_handles->capacity(),
                                              &actual_handles, &result.error);
-            msg_handles.set_actual(actual_handles);
+            msg_handles->set_actual(actual_handles);
             return status;
         } else {
             // Boring type does not need encoding
-            if (msg_bytes.actual() != FidlType::PrimarySize) {
+            if (out_msg_bytes->actual() != FidlType::PrimarySize) {
                 result.error = "invalid size encoding";
                 return ZX_ERR_INVALID_ARGS;
             }
-            msg_handles.set_actual(0);
+            msg_handles->set_actual(0);
             return ZX_OK;
         }
     });
@@ -172,6 +196,50 @@ struct MaybeSelectResponseType<true, RequestType, ResponseType> {
 
 } // namespace
 
+template <typename FidlType>
+DecodeResult<FidlType> DecodeAs(fidl_msg_t* msg) {
+    static_assert(IsFidlMessage<FidlType>::value, "FIDL transactional message type required");
+    if (msg->num_handles > EncodedMessage<FidlType>::kResolvedMaxHandles) {
+        zx_handle_close_many(msg->handles, msg->num_handles);
+        return DecodeResult<FidlType>(ZX_ERR_INVALID_ARGS, "too many handles");
+    }
+    return fidl::Decode(fidl::EncodedMessage<FidlType>(msg));
+}
+
+// Write |encoded_msg| down a channel. Used for sending one-way calls and events.
+template <typename FidlType>
+zx_status_t Write(const zx::unowned_channel& chan, EncodedMessage<FidlType> encoded_msg) {
+    static_assert(IsFidlMessage<FidlType>::value, "FIDL transactional message type required");
+    auto status = chan->write(0,
+                              encoded_msg.bytes().data(), encoded_msg.bytes().actual(),
+                              encoded_msg.handles().data(), encoded_msg.handles().actual());
+    encoded_msg.ReleaseBytesAndHandles();
+    return status;
+}
+
+// Write |encoded_msg| down a channel. Used for sending one-way calls and events.
+template <typename FidlType>
+zx_status_t Write(const zx::channel& chan, EncodedMessage<FidlType> encoded_msg) {
+    return Write(zx::unowned_channel(chan), std::move(encoded_msg));
+}
+
+// Encode and write |decoded_msg| down a channel. Used for sending one-way calls and events.
+template <typename FidlType>
+zx_status_t Write(const zx::unowned_channel& chan, DecodedMessage<FidlType> decoded_msg) {
+    static_assert(IsFidlMessage<FidlType>::value, "FIDL transactional message type required");
+    fidl::EncodeResult<FidlType> encode_result = fidl::Encode(std::move(decoded_msg));
+    if (encode_result.status != ZX_OK) {
+        return encode_result.status;
+    }
+    return Write(chan, std::move(encode_result.message));
+}
+
+// Encode and write |decoded_msg| down a channel. Used for sending one-way calls and events.
+template <typename FidlType>
+zx_status_t Write(const zx::channel& chan, DecodedMessage<FidlType> decoded_msg) {
+    return Write(zx::unowned_channel(chan), std::move(decoded_msg));
+}
+
 // If |RequestType::ResponseType| exists, use that. Otherwise, fallback to |ResponseType|.
 template <typename RequestType, typename ResponseType>
 struct SelectResponseType {
@@ -180,13 +248,13 @@ struct SelectResponseType {
                                                   ResponseType>::type;
 };
 
-// Perform a synchronous FIDL channel call.
+// Perform a synchronous FIDL channel call. This overload takes a |zx::unowned_channel|.
 // Sends the request message down the channel, then waits for the desired reply message, and
 // wraps it in an EncodeResult for the response type.
 // If |RequestType| is |AnyZeroArgMessage|, the caller may explicitly specify an expected response
 // type by overriding the template parameter |ResponseType|.
 template <typename RequestType, typename ResponseType = typename RequestType::ResponseType>
-EncodeResult<ResponseType> Call(zx::channel& chan,
+EncodeResult<ResponseType> Call(zx::unowned_channel chan,
                                 EncodedMessage<RequestType> request,
                                 BytePart response_buffer) {
     static_assert(IsFidlMessage<RequestType>::value, "FIDL transactional message type required");
@@ -197,35 +265,50 @@ EncodeResult<ResponseType> Call(zx::channel& chan,
                   "RequestType and ResponseType are incompatible");
 
     EncodeResult<ResponseType> result;
-    result.message.Initialize([&](BytePart& bytes, HandlePart& handles) {
-        bytes = std::move(response_buffer);
+    result.message.Initialize([&response_buffer, &request, &chan, &result](BytePart* out_bytes,
+                                                                           HandlePart* handles) {
+        *out_bytes = std::move(response_buffer);
         zx_channel_call_args_t args = {
             .wr_bytes = request.bytes().data(),
             .wr_handles = request.handles().data(),
-            .rd_bytes = bytes.data(),
-            .rd_handles = handles.data(),
+            .rd_bytes = out_bytes->data(),
+            .rd_handles = handles->data(),
             .wr_num_bytes = request.bytes().actual(),
             .wr_num_handles = request.handles().actual(),
-            .rd_num_bytes = bytes.capacity(),
-            .rd_num_handles = handles.capacity()
-        };
+            .rd_num_bytes = out_bytes->capacity(),
+            .rd_num_handles = handles->capacity()};
 
         uint32_t actual_num_bytes = 0u;
         uint32_t actual_num_handles = 0u;
-        result.status = chan.call(
+        result.status = chan->call(
             0u, zx::time::infinite(), &args, &actual_num_bytes, &actual_num_handles);
+        request.ReleaseBytesAndHandles();
         if (result.status != ZX_OK) {
             return;
         }
 
-        bytes.set_actual(actual_num_bytes);
-        handles.set_actual(actual_num_handles);
+        out_bytes->set_actual(actual_num_bytes);
+        handles->set_actual(actual_num_handles);
     });
     return result;
+}
+
+// Perform a synchronous FIDL channel call. This overload takes a |zx::channel&|.
+// Sends the request message down the channel, then waits for the desired reply message, and
+// wraps it in an EncodeResult for the response type.
+// If |RequestType| is |AnyZeroArgMessage|, the caller may explicitly specify an expected response
+// type by overriding the template parameter |ResponseType|.
+template <typename RequestType, typename ResponseType = typename RequestType::ResponseType>
+EncodeResult<ResponseType> Call(zx::channel& chan,
+                                EncodedMessage<RequestType> request,
+                                BytePart response_buffer) {
+    return Call<RequestType, ResponseType>(zx::unowned_channel(chan),
+                                           std::move(request),
+                                           std::move(response_buffer));
 }
 
 #endif
 
 } // namespace fidl
 
-#endif  // LIB_FIDL_LLCPP_CODING_H_
+#endif // LIB_FIDL_LLCPP_CODING_H_

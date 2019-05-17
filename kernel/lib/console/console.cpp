@@ -45,7 +45,9 @@ static char* debug_buffer;
 static bool echo = true;
 
 /* command processor state */
-static mutex_t command_lock;
+namespace {
+DECLARE_SINGLETON_MUTEX(CommandLock);
+}  // namespace
 int lastresult;
 static bool abort_script;
 
@@ -82,7 +84,7 @@ STATIC_COMMAND_MASKED("test", "test the command processor", &cmd_test, CMD_AVAIL
 STATIC_COMMAND_MASKED("history", "command history", &cmd_history, CMD_AVAIL_ALWAYS)
 #endif
 #endif
-STATIC_COMMAND_END(help);
+STATIC_COMMAND_END(help)
 
 static void console_init(uint level) {
 #if CONSOLE_ENABLE_HISTORY
@@ -90,7 +92,7 @@ static void console_init(uint level) {
 #endif
 }
 
-LK_INIT_HOOK(console, console_init, LK_INIT_LEVEL_HEAP);
+LK_INIT_HOOK(console, console_init, LK_INIT_LEVEL_HEAP)
 
 #if CONSOLE_ENABLE_HISTORY
 static int cmd_history(int argc, const cmd_args* argv, uint32_t flags) {
@@ -578,7 +580,7 @@ static zx_status_t command_loop(int (*get_line)(const char**, void*),
         }
 
         if (!locked)
-            mutex_acquire(&command_lock);
+            CommandLock::Get()->lock().Acquire();
 
         abort_script = false;
         lastresult = command->cmd_callback(argc, args, 0);
@@ -605,7 +607,7 @@ static zx_status_t command_loop(int (*get_line)(const char**, void*),
         abort_script = false;
 
         if (!locked)
-            mutex_release(&command_lock);
+            CommandLock::Get()->lock().Release();
     }
 
     free(outbuf);
@@ -835,4 +837,4 @@ static void kernel_shell_init(uint level) {
     }
 }
 
-LK_INIT_HOOK(kernel_shell, kernel_shell_init, LK_INIT_LEVEL_USER);
+LK_INIT_HOOK(kernel_shell, kernel_shell_init, LK_INIT_LEVEL_USER)

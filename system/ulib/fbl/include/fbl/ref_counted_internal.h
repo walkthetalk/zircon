@@ -2,10 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_REF_COUNTED_INTERNAL_H_
+#define FBL_REF_COUNTED_INTERNAL_H_
 
 #include <atomic>
-#include <fbl/canary.h>
 #include <zircon/assert.h>
 #include <zircon/compiler.h>
 
@@ -131,3 +131,5 @@ protected:
 
 } // namespace internal
 } // namespace fbl
+
+#endif  // FBL_REF_COUNTED_INTERNAL_H_

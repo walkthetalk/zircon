@@ -15,8 +15,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <ddk/device.h>
 #include <fuchsia/device/manager/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <fuchsia/kernel/c/fidl.h>
+#include <lib/fdio/directory.h>
 #include <pretty/hexdump.h>
 #include <zircon/syscalls.h>
 
@@ -460,64 +462,200 @@ usage:
     return -1;
 }
 
-static int send_dmctl(const char* command, size_t length) {
-    int fd = open("/dev/misc/dmctl", O_WRONLY);
-    if (fd < 0) {
-        fprintf(stderr, "error: cannot open dmctl: %d\n", fd);
-        return fd;
-    }
-    zx_handle_t dmctl;
-    zx_status_t status = fdio_get_service_handle(fd, &dmctl);
+//TODO(edcoyne): move "dm" command to its own file.
+static int print_dm_help() {
+    printf("dump              - dump device tree\n"
+           "poweroff          - power off the system\n"
+           "shutdown          - power off the system\n"
+           "suspend           - suspend the system to RAM\n"
+           "reboot            - reboot the system\n"
+           "reboot-bootloader - reboot the system into bootloader\n"
+           "reboot-recovery   - reboot the system into recovery\n"
+           "kerneldebug       - send a command to the kernel\n"
+           "ktraceoff         - stop kernel tracing\n"
+           "ktraceon          - start kernel tracing\n"
+           "devprops          - dump published devices and their binding properties\n"
+           "drivers           - list discovered drivers and their properties\n");
+    return 0;
+}
+
+static const uint32_t kVmoBufferSize = 512*1024;
+
+typedef struct {
+    zx_handle_t vmo;
+    zx_handle_t vmo_copy;
+    size_t bytes_in_buffer;
+    size_t bytes_available_on_service;
+} VmoBuffer;
+
+static zx_status_t initialize_vmo_buffer(VmoBuffer* buffer) {
+    buffer->bytes_in_buffer = 0;
+    buffer->bytes_available_on_service = 0;
+
+    zx_status_t status = zx_vmo_create(kVmoBufferSize, 0, &buffer->vmo);
     if (status != ZX_OK) {
+        return status;
+    }
+
+    status = zx_handle_duplicate(buffer->vmo, ZX_RIGHTS_IO | ZX_RIGHT_TRANSFER, &buffer->vmo_copy);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return ZX_OK;
+}
+
+static zx_status_t print_vmo_buffer(VmoBuffer* buffer) {
+    // It is possible this will be larger than kVmoBufferSize so we dynamically
+    // allocate memory for buffer.
+    char* to_print = (char*)malloc(buffer->bytes_in_buffer);
+    if (to_print == NULL) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    zx_status_t status = zx_vmo_read(buffer->vmo, to_print, 0, buffer->bytes_in_buffer);
+    if (status == ZX_OK) {
+        size_t written = 0;
+        while (written < buffer->bytes_in_buffer) {
+            ssize_t count = write(STDOUT_FILENO, to_print + written,
+                                  buffer->bytes_in_buffer - written);
+            if (count < 0) {
+                break;
+            }
+            written += count;
+        }
+    } else {
+      printf("Call to service failed, status: %d\n", status);
+    }
+
+    if (buffer->bytes_in_buffer < buffer->bytes_available_on_service) {
+      printf("\n-- OUTPUT TRUNCATED; %zu bytes available, %u buffer size --\n",
+             buffer->bytes_available_on_service, kVmoBufferSize);
+    }
+
+    free(to_print);
+    return ZX_OK;
+}
+
+static zx_status_t connect_to_service(const char* service, zx_handle_t* channel) {
+    zx_handle_t channel_local, channel_remote;
+    zx_status_t status = zx_channel_create(0, &channel_local, &channel_remote);
+    if (status != ZX_OK) {
+        fprintf(stderr, "failed to create channel: %d\n", status);
+        return ZX_ERR_INTERNAL;
+    }
+
+    status = fdio_service_connect(service, channel_remote);
+    if (status != ZX_OK) {
+        zx_handle_close(channel_local);
+        fprintf(stderr, "failed to connect to service: %d\n", status);
+        return ZX_ERR_INTERNAL;
+    }
+
+    *channel = channel_local;
+    return ZX_OK;
+
+}
+
+static int send_kernel_debug_command(const char* command, size_t length) {
+    if (length > fuchsia_kernel_DEBUG_COMMAND_MAX) {
+        fprintf(stderr, "error: kernel debug command longer than %u bytes: '%.*s'\n",
+                fuchsia_kernel_DEBUG_COMMAND_MAX, (int)length, command);
         return -1;
     }
 
-    if (length > fuchsia_device_manager_COMMAND_MAX) {
-        fprintf(stderr, "error: dmctl command longer than %u bytes: '%.*s'\n",
-                fuchsia_device_manager_COMMAND_MAX, (int)length, command);
-        return -1;
-    }
-
-    zx_handle_t local, remote;
-    if (zx_socket_create(0, &remote, &local) != ZX_OK) {
-        zx_handle_close(dmctl);
-        return -1;
+    zx_handle_t channel;
+    zx_status_t status = connect_to_service("/svc/fuchsia.kernel.DebugBroker", &channel);
+    if (status != ZX_OK) {
+        return status;
     }
 
     zx_status_t call_status;
-    status = fuchsia_device_manager_ExternalControllerExecuteCommand(dmctl, remote, command,
-                                                                     length, &call_status);
-    remote = ZX_HANDLE_INVALID;
-    zx_handle_close(dmctl);
+    status = fuchsia_kernel_DebugBrokerSendDebugCommand(channel, command, length, &call_status);
+    zx_handle_close(channel);
     if (status != ZX_OK || call_status != ZX_OK) {
-        zx_handle_close(local);
         return -1;
     }
 
-    for (;;) {
-        char buf[32768];
-        size_t actual;
-        if ((status = zx_socket_read(local, 0, buf, sizeof(buf), &actual)) < 0) {
-            if (status == ZX_ERR_SHOULD_WAIT) {
-                zx_object_wait_one(local, ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED,
-                                   ZX_TIME_INFINITE, NULL);
-                continue;
-            }
-            break;
-        }
-        size_t written = 0;
-        while (written < actual) {
-            ssize_t count = write(1, buf + written, actual - written);
-            if (count < 0) {
-                break;
-            } else {
-                written += count;
-            }
-        }
+    return 0;
+}
+
+static int send_kernel_tracing_enabled(bool enabled) {
+    zx_handle_t channel;
+    zx_status_t status = connect_to_service("/svc/fuchsia.kernel.DebugBroker", &channel);
+    if (status != ZX_OK) {
+        return status;
     }
-    zx_handle_close(local);
+
+    zx_status_t call_status;
+    status = fuchsia_kernel_DebugBrokerSetTracingEnabled(channel, enabled, &call_status);
+    zx_handle_close(channel);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        return -1;
+    }
 
     return 0;
+}
+
+static int send_dump(zx_status_t(*fidl_call)(zx_handle_t, zx_handle_t,
+                                             zx_status_t*, size_t*, size_t*)) {
+    zx_handle_t channel;
+    zx_status_t status = connect_to_service("/svc/fuchsia.device.manager.DebugDumper", &channel);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    VmoBuffer buffer;
+    status = initialize_vmo_buffer(&buffer);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    zx_status_t call_status;
+    status = fidl_call(channel, buffer.vmo_copy,
+                       &call_status, &buffer.bytes_in_buffer, &buffer.bytes_available_on_service);
+
+    zx_handle_close(channel);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        return -1;
+    }
+
+    status = print_vmo_buffer(&buffer);
+    if (zx_handle_close(buffer.vmo) != ZX_OK) {
+        printf("Failed to close vmo handle.\n");
+    }
+    return status;
+}
+
+static int send_suspend(uint32_t flags) {
+    zx_handle_t channel;
+    zx_status_t status = connect_to_service("/svc/fuchsia.device.manager.Administrator", &channel);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    zx_status_t call_status;
+    status = fuchsia_device_manager_AdministratorSuspend(channel, flags, &call_status);
+    zx_handle_close(channel);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static bool command_cmp(const char* command, const char* input, int* command_length) {
+  *command_length = strlen(command);
+  const size_t input_length = strlen(input);
+  if (input_length < *command_length) {
+    return false;
+  }
+
+  // Ensure that the first command_length chars of input match and that it is
+  // either the whole input or there is a space after the command, we don't want
+  // partial command matching.
+  return strncmp(command, input, *command_length) == 0 &&
+      ((input_length == *command_length) || input[*command_length] == ' ');
 }
 
 int zxc_dm(int argc, char** argv) {
@@ -525,7 +663,53 @@ int zxc_dm(int argc, char** argv) {
         printf("usage: dm <command>\n");
         return -1;
     }
-    return send_dmctl(argv[1], strlen(argv[1]));
+
+    // Handle service backed commands.
+    int command_length = 0;
+    if (command_cmp("kerneldebug", argv[1], &command_length)) {
+        return send_kernel_debug_command(argv[1] + command_length,
+                                         strlen(argv[1]) - command_length);
+    } else if (command_cmp("ktraceon", argv[1], &command_length)) {
+        return send_kernel_tracing_enabled(true);
+
+    } else if (command_cmp("ktraceoff", argv[1], &command_length)) {
+        return send_kernel_tracing_enabled(false);
+
+    } else if (command_cmp("help", argv[1], &command_length)) {
+        return print_dm_help();
+
+    } else if (command_cmp("dump", argv[1], &command_length)) {
+        return send_dump(fuchsia_device_manager_DebugDumperDumpTree);
+
+    } else if (command_cmp("drivers", argv[1], &command_length)) {
+        return send_dump(fuchsia_device_manager_DebugDumperDumpDrivers);
+
+    } else if (command_cmp("devprops", argv[1], &command_length)) {
+        return send_dump(fuchsia_device_manager_DebugDumperDumpBindingProperties);
+
+    } else if (command_cmp("reboot", argv[1], &command_length)) {
+        return send_suspend(DEVICE_SUSPEND_FLAG_REBOOT);
+
+    } else if (command_cmp("reboot-bootloader", argv[1], &command_length)) {
+        return send_suspend(DEVICE_SUSPEND_FLAG_REBOOT_BOOTLOADER);
+
+    } else if (command_cmp("reboot-recovery", argv[1], &command_length)) {
+        return send_suspend(DEVICE_SUSPEND_FLAG_REBOOT_RECOVERY);
+
+    } else if (command_cmp("suspend", argv[1], &command_length)) {
+        return send_suspend(DEVICE_SUSPEND_FLAG_SUSPEND_RAM);
+
+    } else if (command_cmp("poweroff", argv[1], &command_length) ||
+               command_cmp("shutdown", argv[1], &command_length)) {
+        return send_suspend(DEVICE_SUSPEND_FLAG_POWEROFF);
+
+    } else {
+        printf("Unknown command '%s'\n\n", argv[1]);
+        printf("Valid commands:\n");
+        print_dm_help();
+    }
+
+    return -1;
 }
 
 static char* join(char* buffer, size_t buffer_length, int argc, char** argv) {
@@ -552,26 +736,22 @@ int zxc_k(int argc, char** argv) {
         return -1;
     }
 
-    const char* prefix = "kerneldebug ";
     char buffer[256];
-
     size_t command_length = 0u;
+
     // If we detect someone trying to use the LK poweroff/reboot,
     // divert it to devmgr backed one instead.
     if (!strcmp(argv[1], "poweroff") || !strcmp(argv[1], "reboot")
         || !strcmp(argv[1], "reboot-bootloader")) {
-        strcpy(buffer, argv[1]);
-        command_length = strlen(buffer);
-    } else {
-        strcpy(buffer, prefix);
-        size_t prefix_length = strlen(prefix);
-        char* command_end = join(buffer + prefix_length, sizeof(buffer) - prefix_length, argc - 1, &argv[1]);
-        if (!command_end) {
-            fprintf(stderr, "error: kernel debug command too long\n");
-            return -1;
-        }
-        command_length = command_end - buffer;
+        return zxc_dm(argc, argv);
     }
 
-    return send_dmctl(buffer, command_length);
+    char* command_end = join(buffer, sizeof(buffer), argc - 1, &argv[1]);
+    if (!command_end) {
+        fprintf(stderr, "error: kernel debug command too long\n");
+        return -1;
+    }
+    command_length = command_end - buffer;
+
+    return send_kernel_debug_command(buffer, command_length);
 }

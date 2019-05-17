@@ -1,5 +1,10 @@
 # Fuchsia's libc
 
+Fuchsia's libc started as a fork of musl libc. It has since diverged
+significantly, but the approximate source code layout remains the same. The
+source can be found in
+[`zircon/third_party/ulib/musl`](../third_party/ulib/musl).
+
 TODO(ZX-1598) Type more here.
 
 ## Standards
@@ -40,5 +45,5 @@ Statically linking libc is not supported. Everything dynamically links libc.so.
 libc.so is also the dynamic linker.
 
 [c11std]: https://en.wikipedia.org/wiki/C11_(C_standard_revision)
-[dotdot]: https://fuchsia.googlesource.com/docs/+/master/dotdot.md
+[dotdot]: https://fuchsia.googlesource.com/fuchsia/+/master/docs/dotdot.md
 [fdio]: ../system/ulib/fdio

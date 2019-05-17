@@ -18,7 +18,7 @@ function HELP {
     echo "-l                   : use ThinLTO build"
     echo "-d                   : run with emulated disk"
     echo "-D <disk file|device>: specify disk file or device path on host, default is blk.bin"
-    echo "--disktype[=<type>]  : should be one of (ahci, virtio, nvme), default is ahci"
+    echo "--disktype[=<type>]  : should be one of (ahci, virtio, nvme, virtio-scsi), default is ahci"
     echo "--diskfmt[=<format>] : disk format (raw, qcow2, etc), default is raw"
     echo "-g                   : use graphical console"
     echo "-G <version>         : use GIC v2 or v3"
@@ -53,13 +53,10 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 AHCI=()
 ARCH=
-ASAN=0
 AUDIO=
 AUDIO_WAVFILE="/tmp/qemu.wav"
 BUILD=0
-CLANG=0
 DEBUGGER=0
-BUILD_DEBUG=0
 DISK=0
 DISKFILE="blk.bin"
 DISKTYPE=
@@ -78,6 +75,7 @@ NET=0
 QEMUDIR=
 RELEASE=0
 UPSCRIPT=no
+VARIANT=gcc
 VNC=
 VIRTIO=0
 SERIAL=1
@@ -90,6 +88,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   IFNAME="tap0"
 else
   IFNAME="qemu"
+fi
+
+# Propagate our TERM environment variable as a kernel command line
+# argument.  This is first so that an explicit -c TERM=foo argument
+# goes into CMDLINE later and overrides this.
+if [[ -n $TERM ]]; then
+    CMDLINE+="TERM=$TERM "
 fi
 
 # QEMU looks for its own files in its current directory before looking in its
@@ -108,33 +113,36 @@ abspath() {
   esac
 }
 
+VARIANT=gcc
+BUILD_SWITCH=
+
 while getopts "Aa:bc:CdD:gG:I:kLlm:nNo:Pq:rs:t::u:VXz:h-:" FLAG; do
     case $FLAG in
-        A) ASAN=1;;
+        A) VARIANT=asan BUILD_SWITCH=-A ;;
         a) ARCH=$OPTARG;;
         b) BUILD=1;;
         c) CMDLINE+="$OPTARG ";;
-        C) CLANG=1;;
+        C) VARIANT=clang BUILD_SWITCH=-C ;;
         d) DISK=1;;
         D) DISKFILE="$(abspath "$OPTARG")";;
         g) GRAPHICS=1;;
         G) GIC=$OPTARG;;
         I) IFNAME=$OPTARG;;
         k) DO_KVM=1;;
-        L) LTO=1;;
-        l) THINLTO=1;;
+        L) VARIANT=lto BUILD_SWITCH=-L ;;
+        l) VARIANT=thinlto BUILD_SWITCH=-l ;;
         m) MEMSIZE=$OPTARG;;
         n) NET=1;;
         N) NET=2;;
         o) BUILDDIR=$OPTARG;;
-        P) PROFILE=1;;
+        P) VARIANT=profile BUILD_SWITCH=-P ;;
         q) QEMUDIR=${OPTARG}/;;
         r) RELEASE=1;;
         s) SMP=$OPTARG;;
         t) QEMU_KERNEL="$(abspath "$OPTARG")";;
         u) UPSCRIPT="$(abspath "$OPTARG")";;
         V) VIRTIO=1;;
-        X) XRAY=1;;
+        X) VARIANT=xray BUILD_SWITCH=-X ;;
         z) QEMU_INITRD="$(abspath "$OPTARG")";;
         h) HELP;;
         \?)
@@ -147,7 +155,7 @@ while getopts "Aa:bc:CdD:gG:I:kLlm:nNo:Pq:rs:t::u:VXz:h-:" FLAG; do
             audio) AUDIO=none;;
             audio=*) AUDIO=${OPTARG#*=};;
             wavfile=*) AUDIO_WAVFILE="$(abspath "${OPTARG#*=}")";;
-            build-debug) BUILD_DEBUG=1;;
+            build-debug) BUILD=1 VARIANT=noopt BUILD_SWITCH=-d;;
             debugger) DEBUGGER=1;;
             disktype=*) DISKTYPE=${OPTARG#*=};;
             diskfmt=*) DISKFMT=${OPTARG#*=};;
@@ -169,45 +177,13 @@ if [[ -z $ARCH ]]; then
     HELP
 fi
 
-PROJECT="$ARCH"
-
-BUILDDIR_SUFFIX=
-BUILD_ARGS=
-
-if (( $ASAN )); then
-    BUILDDIR_SUFFIX+=-asan
-    BUILD_ARGS+=' -A'
-elif (( $LTO )); then
-    BUILDDIR_SUFFIX+=-lto
-    BUILD_ARGS+=' -L'
-elif (( $THINLTO )); then
-    BUILDDIR_SUFFIX+=-thinlto
-    BUILD_ARGS+=' -l'
-elif (( $PROFILE )); then
-    BUILDDIR_SUFFIX+=-profile
-    BUILD_ARGS+=' -P'
-elif (( $XRAY )); then
-    BUILDDIR_SUFFIX+=-xray
-    BUILD_ARGS+=' -X'
-elif (( $CLANG )); then
-    BUILDDIR_SUFFIX+=-clang
-    BUILD_ARGS+=' -C'
-fi
-
-if (( $RELEASE )); then
-    BUILDDIR_SUFFIX+=-release
-    BUILD_ARGS+=' -r'
-fi
-
-if (( $BUILD_DEBUG )); then
-    BUILD=1
-    BUILD_ARGS+=' -d'
+if [[ -z "$BUILDDIR" ]]; then
+    BUILDDIR="$(dirname "$DIR")/build-$VARIANT"
 fi
 
 # build the project if asked for
 if (( $BUILD )); then
-    # DIR is zircon/scripts, we need to make inside zircon.
-    $DIR/build-zircon -a $ARCH $BUILD_ARGS -- -C "$DIR/.." || exit 1
+    "$DIR/build-zircon" -a "$ARCH" $BUILD_SWITCH -o "$BUILDDIR" || exit
 fi
 
 # by default use the qemu binary located in the fuchsia buildtools
@@ -226,12 +202,8 @@ if [[ -z $QEMUDIR && -d "$DIR/../prebuilt/downloads/qemu/bin" ]]; then
     QEMUDIR="$DIR/../prebuilt/downloads/qemu/bin/"
 fi
 
-if [[ -z $BUILDDIR ]]; then
-  BUILDDIR="$(dirname "$DIR")/build-$PROJECT$BUILDDIR_SUFFIX"
-fi
-
 if [[ -z "$QEMU_INITRD" ]]; then
-    QEMU_INITRD="$(abspath "$BUILDDIR/zircon.zbi")"
+    QEMU_INITRD="$(abspath "$BUILDDIR/$ARCH.zbi")"
 fi
 
 if [[ -z "$QEMU_KERNEL" ]]; then
@@ -291,6 +263,8 @@ if (( $DISK )); then
         ARGS+=" -device ich9-ahci,id=ahci -device ide-drive,drive=mydisk,bus=ahci.0"
     elif [[ "$DISKTYPE" == "nvme" ]]; then
         ARGS+=" -device nvme,drive=mydisk,serial=zircon"
+    elif [[ "$DISKTYPE" == "virtio-scsi" ]]; then
+        ARGS+=" -device virtio-scsi-pci,id=scsi -device scsi-hd,drive=mydisk,scsi-id=1,lun=1"
     else
         echo unrecognized disk type \"$DISKTYPE\"
         exit
@@ -327,13 +301,11 @@ if [[ $NET == 2 ]]; then
         fi
         ARGS+=" -netdev type=tap,ifname=$IFNAME,script=$UPSCRIPT,downscript=no,id=net0"
     else
-        CHECK=$(tunctl -b -u $USER -t $IFNAME 2>/dev/null)
-        if [[ "$CHECK" != "$IFNAME" ]]; then
+        TAP_IFS=$(ip tuntap show 2>/dev/null)
+        if [[ ! "$TAP_IFS" =~ "${IFNAME}:" ]]; then
           echo "To use qemu with networking on Linux, configure tun/tap:"
-          if [[ ! -x "/usr/sbin/tunctl" ]]; then
-            echo "sudo apt-get install uml-utilities"
-          fi
-          echo "sudo tunctl -u $USER -t $IFNAME"
+          echo
+          echo "sudo ip tuntap add dev $IFNAME mode tap user $USER && \\"
           echo "sudo ifconfig $IFNAME up"
           exit 1
         fi
@@ -420,6 +392,14 @@ case $ARCH in
         ARGS+=" -device isa-debug-exit,iobase=0xf4,iosize=0x04"
         if (( $DO_KVM )); then
           ARGS+=" -enable-kvm -cpu host,migratable=no,+invtsc"
+          # ZX-3373: Work around KVM bug on AMD Zen machines
+          # where SMAP and CPL=3 MMIO accesses trigger a loop
+          # in the Linux kernel.
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            if [[ "$(lsmod | grep kvm_amd)" != "" ]]; then
+              ARGS+=",-smap"
+            fi
+          fi
         else
           ARGS+=" -cpu Haswell,+smap,-check,-fsgsbase"
         fi
@@ -436,21 +416,11 @@ case $ARCH in
         ;;
 esac
 
-# Propagate our TERM environment variable as a kernel command line
-# argument.  This is last so that an explicit -c TERM=foo argument
-# goes into CMDLINE first.  Kernel command line words become environment
-# variables, and the first variable in the list wins for getenv calls.
-if [[ -n $TERM ]]; then
-    CMDLINE+="TERM=$TERM "
-fi
-
 # Add entropy to the kernel
 CMDLINE+="kernel.entropy-mixin=$(head -c 32 /dev/urandom | shasum -a 256 | awk '{ print $1 }') "
 
 # Don't 'reboot' the emulator if the kernel crashes
 CMDLINE+="kernel.halt-on-panic=true "
-
-CMDLINE="`echo "$CMDLINE" | sed 's/,/,,/g'`"
 
 # run qemu
 echo CMDLINE: $CMDLINE

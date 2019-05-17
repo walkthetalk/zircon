@@ -7,13 +7,15 @@
 
 #include "xhci.h"
 
+namespace usb_xhci {
+
 zx_status_t xhci_transfer_ring_init(xhci_transfer_ring_t* ring, zx_handle_t bti_handle, int count) {
-    zx_status_t status = io_buffer_init(&ring->buffer, bti_handle,
-                                        count * sizeof(xhci_trb_t),
-                                        IO_BUFFER_RW | IO_BUFFER_CONTIG | XHCI_IO_BUFFER_UNCACHED);
+    zx_status_t status = ring->buffer.Init(bti_handle, count * sizeof(xhci_trb_t),
+                                           IO_BUFFER_RW | IO_BUFFER_CONTIG |
+                                           XHCI_IO_BUFFER_UNCACHED);
     if (status != ZX_OK) return status;
 
-    ring->start = static_cast<xhci_trb_t*>(io_buffer_virt(&ring->buffer));
+    ring->start = static_cast<xhci_trb_t*>(ring->buffer.virt());
     ring->current = ring->start;
     ring->dequeue_ptr = ring->start;
     ring->full = false;
@@ -21,13 +23,13 @@ zx_status_t xhci_transfer_ring_init(xhci_transfer_ring_t* ring, zx_handle_t bti_
     ring->pcs = TRB_C;
 
     // set link TRB at end to point back to the beginning
-    ring->start[count - 1].ptr = io_buffer_phys(&ring->buffer);
+    ring->start[count - 1].ptr = ring->buffer.phys();
     trb_set_control(&ring->start[count - 1], TRB_LINK, TRB_TC);
     return ZX_OK;
 }
 
 void xhci_transfer_ring_free(xhci_transfer_ring_t* ring) {
-    io_buffer_release(&ring->buffer);
+    ring->buffer.release();
 }
 
 // return the number of free TRBs in the ring
@@ -53,13 +55,13 @@ size_t xhci_transfer_ring_free_trbs(xhci_transfer_ring_t* ring) {
 zx_status_t xhci_event_ring_init(xhci_event_ring_t* ring, zx_handle_t bti_handle,
                                  erst_entry_t* erst_array, int count) {
     // allocate a read-only buffer for TRBs
-    zx_status_t status = io_buffer_init(&ring->buffer, bti_handle,
-                                        count * sizeof(xhci_trb_t),
-                                        IO_BUFFER_RO | IO_BUFFER_CONTIG | XHCI_IO_BUFFER_UNCACHED);
+    zx_status_t status = ring->buffer.Init(bti_handle, count * sizeof(xhci_trb_t),
+                                           IO_BUFFER_RO | IO_BUFFER_CONTIG |
+                                           XHCI_IO_BUFFER_UNCACHED);
     if (status != ZX_OK) return status;
 
-    ring->start = static_cast<xhci_trb_t*>(io_buffer_virt(&ring->buffer));
-    XHCI_WRITE64(&erst_array[0].ptr, io_buffer_phys(&ring->buffer));
+    ring->start = static_cast<xhci_trb_t*>(ring->buffer.virt());
+    XHCI_WRITE64(&erst_array[0].ptr, ring->buffer.phys());
     XHCI_WRITE32(&erst_array[0].size, count);
 
     ring->current = ring->start;
@@ -69,7 +71,7 @@ zx_status_t xhci_event_ring_init(xhci_event_ring_t* ring, zx_handle_t bti_handle
 }
 
 void xhci_event_ring_free(xhci_event_ring_t* ring) {
-    io_buffer_release(&ring->buffer);
+    ring->buffer.release();
 }
 
 void xhci_clear_trb(xhci_trb_t* trb) {
@@ -93,7 +95,7 @@ void xhci_set_transfer_noop_trb(xhci_trb_t* trb) {
 xhci_trb_t* xhci_read_trb_ptr(xhci_transfer_ring_t* ring, xhci_trb_t* trb) {
     // convert physical address to virtual
     uintptr_t ptr = trb->ptr;
-    ptr += ((uintptr_t)io_buffer_virt(&ring->buffer) - io_buffer_phys(&ring->buffer));
+    ptr += (reinterpret_cast<uintptr_t>(ring->buffer.virt()) - ring->buffer.phys());
     return reinterpret_cast<xhci_trb_t*>(ptr);
 }
 
@@ -151,3 +153,5 @@ xhci_trb_t* xhci_transfer_ring_phys_to_trb(xhci_transfer_ring_t* ring, zx_paddr_
     }
    return ring->start + ((phys - first_trb_phys) / sizeof(xhci_trb_t));
 }
+
+} // namespace usb_xhci

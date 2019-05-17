@@ -15,9 +15,9 @@
 #include <string.h>
 
 #include <kernel/cmdline.h>
-#include <vm/vm_object_paged.h>
 #include <lib/console.h>
 #include <lib/counters.h>
+#include <lib/elf-psabi/sp.h>
 #include <lib/vdso.h>
 #include <lk/init.h>
 #include <mexec.h>
@@ -30,9 +30,10 @@
 #include <object/thread_dispatcher.h>
 #include <object/vm_address_region_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
+#include <vm/vm_object_paged.h>
 
+#include <lib/zircon-internal/default_stack_size.h>
 #include <zircon/processargs.h>
-#include <zircon/stack.h>
 
 #if ENABLE_ENTROPY_COLLECTOR_TEST
 #include <lib/crypto/entropy/quality_test.h>
@@ -52,6 +53,8 @@ namespace {
 // gives details about the image's size and layout.
 extern "C" const char userboot_image[];
 
+KCOUNTER(init_time, "init.userboot.time.msec")
+
 class UserbootImage : private RoDso {
 public:
     explicit UserbootImage(const VDso* vdso)
@@ -69,25 +72,29 @@ public:
     zx_status_t Map(fbl::RefPtr<VmAddressRegionDispatcher> root_vmar,
                     uintptr_t* vdso_base, uintptr_t* entry) {
         // Create a VMAR (placed anywhere) to hold the combined image.
-        fbl::RefPtr<VmAddressRegionDispatcher> vmar;
+        KernelHandle<VmAddressRegionDispatcher> vmar_handle;
         zx_rights_t vmar_rights;
         zx_status_t status = root_vmar->Allocate(0, size(),
                                                  ZX_VM_CAN_MAP_READ |
                                                  ZX_VM_CAN_MAP_WRITE |
                                                  ZX_VM_CAN_MAP_EXECUTE |
                                                  ZX_VM_CAN_MAP_SPECIFIC,
-                                                 &vmar, &vmar_rights);
+                                                 &vmar_handle, &vmar_rights);
         if (status != ZX_OK)
             return status;
 
         // Map userboot proper.
-        status = RoDso::Map(vmar, 0);
+        status = RoDso::Map(vmar_handle.dispatcher(), 0);
         if (status == ZX_OK) {
-            *entry = vmar->vmar()->base() + USERBOOT_ENTRY;
+            *entry = vmar_handle.dispatcher()->vmar()->base() + USERBOOT_ENTRY;
 
             // Map the vDSO right after it.
-            *vdso_base = vmar->vmar()->base() + RoDso::size();
-            status = vdso_->Map(ktl::move(vmar), RoDso::size());
+            *vdso_base = vmar_handle.dispatcher()->vmar()->base() + RoDso::size();
+
+            // Releasing |vmar_handle| is safe because it has a no-op
+            // on_zero_handles(), otherwise the mapping routines would have
+            // to take ownership of the handle and manage its lifecycle.
+            status = vdso_->Map(vmar_handle.release(), RoDso::size());
         }
         return status;
     }
@@ -95,6 +102,10 @@ public:
 private:
     const VDso* vdso_;
 };
+
+// Keep a global reference to the kcounters vmo so that the kcounters
+// memory always remains valid, even if userspace closes the last handle.
+static fbl::RefPtr<VmObject> kcounters_vmo_ref;
 
 } // anonymous namespace
 
@@ -122,22 +133,30 @@ static zx_status_t get_vmo_handle(fbl::RefPtr<VmObject> vmo, bool readonly,
 
 static zx_status_t get_job_handle(Handle** ptr) {
     zx_rights_t rights;
-    fbl::RefPtr<Dispatcher> dispatcher;
-    zx_status_t result = JobDispatcher::Create(
-        0u, GetRootJobDispatcher(), &dispatcher, &rights);
-    if (result == ZX_OK)
-        *ptr = Handle::Make(ktl::move(dispatcher), rights).release();
-    return result;
+    KernelHandle<JobDispatcher> handle;
+    zx_status_t result = JobDispatcher::Create(0u, GetRootJobDispatcher(), &handle, &rights);
+    if (result != ZX_OK)
+        return result;
+
+    HandleOwner handle_owner = Handle::Make(ktl::move(handle), rights);
+    if (!handle_owner)
+        return ZX_ERR_NO_MEMORY;
+    *ptr = handle_owner.release();
+    return ZX_OK;
 }
 
 static zx_status_t get_resource_handle(Handle** ptr) {
     zx_rights_t rights;
-    fbl::RefPtr<ResourceDispatcher> root;
+    KernelHandle<ResourceDispatcher> root;
     zx_status_t result = ResourceDispatcher::Create(&root, &rights, ZX_RSRC_KIND_ROOT, 0, 0, 0,
                                                     "root");
-    if (result == ZX_OK)
-        *ptr = Handle::Make(fbl::RefPtr<Dispatcher>(root.get()),
-                            rights).release();
+    if (result != ZX_OK)
+        return result;
+
+    HandleOwner handle_owner = Handle::Make(ktl::move(root), rights);
+    if (!handle_owner)
+        return ZX_ERR_NO_MEMORY;
+    *ptr = handle_owner.release();
     return result;
 }
 
@@ -147,26 +166,28 @@ static zx_status_t make_bootstrap_channel(
     fbl::RefPtr<ProcessDispatcher> process,
     MessagePacketPtr msg,
     zx_handle_t* out) {
-    HandleOwner user_channel_handle;
-    fbl::RefPtr<ChannelDispatcher> kernel_channel;
+    HandleOwner user_handle_owner;
+    KernelHandle<ChannelDispatcher> kernel_handle;
     *out = ZX_HANDLE_INVALID;
     {
-        fbl::RefPtr<Dispatcher> mpd0, mpd1;
+        KernelHandle<ChannelDispatcher> user_handle;
         zx_rights_t rights;
-        zx_status_t status = ChannelDispatcher::Create(&mpd0, &mpd1, &rights);
+        zx_status_t status = ChannelDispatcher::Create(&user_handle, &kernel_handle, &rights);
         if (status != ZX_OK)
             return status;
-        user_channel_handle = Handle::Make(ktl::move(mpd0), rights);
-        kernel_channel = DownCastDispatcher<ChannelDispatcher>(&mpd1);
+
+        user_handle_owner = Handle::Make(ktl::move(user_handle), rights);
+        if (!user_handle_owner)
+            return ZX_ERR_NO_MEMORY;
     }
 
     // Here it goes!
-    zx_status_t status = kernel_channel->Write(ZX_KOID_INVALID, ktl::move(msg));
+    zx_status_t status = kernel_handle.dispatcher()->Write(ZX_KOID_INVALID, ktl::move(msg));
     if (status != ZX_OK)
         return status;
 
-    zx_handle_t hv = process->MapHandleToValue(user_channel_handle);
-    process->AddHandle(ktl::move(user_channel_handle));
+    zx_handle_t hv = process->MapHandleToValue(user_handle_owner);
+    process->AddHandle(ktl::move(user_handle_owner));
 
     *out = hv;
     return ZX_OK;
@@ -308,7 +329,7 @@ static zx_status_t attempt_userboot() {
     stack_vmo->set_name(STACK_VMO_NAME, sizeof(STACK_VMO_NAME) - 1);
 
     fbl::RefPtr<VmObject> rootfs_vmo;
-    status = VmObjectPaged::CreateFromROData(rbase, rsize, &rootfs_vmo);
+    status = VmObjectPaged::CreateFromWiredPages(rbase, rsize, true, &rootfs_vmo);
     if (status != ZX_OK)
         return status;
     rootfs_vmo->set_name(RAMDISK_VMO_NAME, sizeof(RAMDISK_VMO_NAME) - 1);
@@ -358,9 +379,9 @@ static zx_status_t attempt_userboot() {
         return status;
 
     fbl::RefPtr<VmObject> kcountdesc_vmo;
-    status = VmObjectPaged::CreateFromROData(CounterDesc().VmoData(),
-                                             CounterDesc().VmoDataSize(),
-                                             &kcountdesc_vmo);
+    status = VmObjectPaged::CreateFromWiredPages(CounterDesc().VmoData(),
+                                                 CounterDesc().VmoDataSize(),
+                                                 true, &kcountdesc_vmo);
     if (status != ZX_OK) {
         return status;
     }
@@ -371,13 +392,16 @@ static zx_status_t attempt_userboot() {
     if (status != ZX_OK) {
         return status;
     }
+
     fbl::RefPtr<VmObject> kcounters_vmo;
-    status = VmObjectPaged::CreateFromROData(CounterArena().VmoData(),
-                                             CounterArena().VmoDataSize(),
-                                             &kcounters_vmo);
+    status = VmObjectPaged::CreateFromWiredPages(CounterArena().VmoData(),
+                                                 CounterArena().VmoDataSize(),
+                                                 false, &kcounters_vmo);
     if (status != ZX_OK) {
         return status;
     }
+    kcounters_vmo_ref = kcounters_vmo;
+
     kcounters_vmo->set_name(counters::kArenaVmoName,
                              sizeof(counters::kArenaVmoName) - 1);
     status = get_vmo_handle(ktl::move(kcounters_vmo), true, nullptr,
@@ -386,21 +410,26 @@ static zx_status_t attempt_userboot() {
         return status;
     }
 
-    fbl::RefPtr<Dispatcher> proc_disp;
-    fbl::RefPtr<VmAddressRegionDispatcher> vmar;
+    KernelHandle<ProcessDispatcher> process_handle;
+    KernelHandle<VmAddressRegionDispatcher> vmar_handle;
     zx_rights_t rights, vmar_rights;
     status = ProcessDispatcher::Create(GetRootJobDispatcher(), "userboot", 0,
-                                       &proc_disp, &rights,
-                                       &vmar, &vmar_rights);
+                                       &process_handle, &rights,
+                                       &vmar_handle, &vmar_rights);
     if (status != ZX_OK)
         return status;
 
-    handles[BOOTSTRAP_PROC] = Handle::Make(proc_disp, rights).release();
+    auto proc = process_handle.dispatcher();
+    HandleOwner process_handle_owner = Handle::Make(ktl::move(process_handle), rights);
+    if (!process_handle_owner)
+        return ZX_ERR_NO_MEMORY;
+    handles[BOOTSTRAP_PROC] = process_handle_owner.release();
 
-    auto proc = DownCastDispatcher<ProcessDispatcher>(&proc_disp);
-    ASSERT(proc);
-
-    handles[BOOTSTRAP_VMAR_ROOT] = Handle::Make(vmar, vmar_rights).release();
+    auto vmar = vmar_handle.dispatcher();
+    HandleOwner vmar_handle_owner = Handle::Make(ktl::move(vmar_handle), vmar_rights);
+    if (!vmar_handle_owner)
+        return ZX_ERR_NO_MEMORY;
+    handles[BOOTSTRAP_VMAR_ROOT] = vmar_handle_owner.release();
 
     const VDso* vdso = VDso::Create();
     for (size_t i = BOOTSTRAP_VDSO; i <= BOOTSTRAP_VDSO_LAST_VARIANT; ++i) {
@@ -431,32 +460,39 @@ static zx_status_t attempt_userboot() {
     // Create the user thread and stash its handle for the bootstrap message.
     fbl::RefPtr<ThreadDispatcher> thread;
     {
-        fbl::RefPtr<Dispatcher> ut_disp;
-        // Make a copy of proc, as we need to a keep a copy for the
-        // bootstrap message.
-        status = ThreadDispatcher::Create(proc, 0, "userboot", &ut_disp, &rights);
+        KernelHandle<ThreadDispatcher> thread_handle;
+        // Make a copy of proc, as we need to a keep a copy to pass over
+        // the bootstrap channel below.
+        status = ThreadDispatcher::Create(proc, 0, "userboot", &thread_handle, &rights);
         if (status != ZX_OK)
             return status;
-        handles[BOOTSTRAP_THREAD] = Handle::Make(ut_disp, rights).release();
-        thread = DownCastDispatcher<ThreadDispatcher>(&ut_disp);
+
+        thread = thread_handle.dispatcher();
+        HandleOwner thread_handle_owner = Handle::Make(ktl::move(thread_handle), rights);
+        if (!thread_handle_owner)
+            return ZX_ERR_NO_MEMORY;
+        handles[BOOTSTRAP_THREAD] = thread_handle_owner.release();
     }
     DEBUG_ASSERT(thread);
 
     // All the handles are in place, so we can send the bootstrap message.
     zx_handle_t hv;
-    status = make_bootstrap_channel(proc, ktl::move(msg), &hv);
+    status = make_bootstrap_channel(ktl::move(proc), ktl::move(msg), &hv);
     if (status != ZX_OK)
         return status;
 
     dprintf(SPEW, "userboot: %-23s @ %#" PRIxPTR "\n", "entry point", entry);
 
     // Start the process's initial thread.
-    status = thread->Start(entry, sp, static_cast<uintptr_t>(hv), vdso_base,
-                           /* initial_thread= */ true);
+    status = thread->Start(
+        ThreadDispatcher::EntryState{entry, sp, static_cast<uintptr_t>(hv), vdso_base},
+        /* initial_thread= */ true);
     if (status != ZX_OK) {
         printf("userboot: failed to start initial thread: %d\n", status);
         return status;
     }
+
+    init_time.Add(current_time() / 1000000LL);
 
     return ZX_OK;
 }
@@ -465,4 +501,4 @@ void userboot_init(uint level) {
     attempt_userboot();
 }
 
-LK_INIT_HOOK(userboot, userboot_init, LK_INIT_LEVEL_USER);
+LK_INIT_HOOK(userboot, userboot_init, LK_INIT_LEVEL_USER)

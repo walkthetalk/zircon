@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef HW_INOUT_H_
+#define HW_INOUT_H_
 
 #include <zircon/compiler.h>
 #include <stdint.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 #if defined(__x86_64__) || defined(__i386__)
 static inline uint8_t inp(uint16_t _port) {
@@ -69,4 +70,6 @@ static inline void outpw(uint16_t _port, uint16_t _data) {}
 static inline void outpd(uint16_t _port, uint32_t _data) {}
 #endif
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // HW_INOUT_H_

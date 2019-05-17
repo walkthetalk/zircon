@@ -4,11 +4,12 @@
 
 #include "aml-gxl-gpio.h"
 
+#include <ddk/binding.h>
 #include <ddk/debug.h>
 #include <ddk/platform-defs.h>
+#include <ddk/protocol/platform-device-lib.h>
 #include <ddk/protocol/platform/bus.h>
 #include <ddk/protocol/platform/device.h>
-#include <ddk/protocol/platform-device-lib.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/array.h>
 #include <fbl/auto_lock.h>
@@ -17,8 +18,6 @@
 
 #include <utility>
 
-#include "s905-blocks.h"
-#include "s905x-blocks.h"
 #include "s912-blocks.h"
 
 namespace {
@@ -35,14 +34,14 @@ uint32_t GetUnusedIrqIndex(uint8_t status) {
     return __builtin_ctz(zero_bit_set);
 }
 
-}  // namespace
+} // namespace
 
 namespace gpio {
 
 // MMIO indices (based on vim-gpio.c gpio_mmios)
 enum {
-    MMIO_GPIO            = 0,
-    MMIO_GPIO_A0         = 1,
+    MMIO_GPIO = 0,
+    MMIO_GPIO_A0 = 1,
     MMIO_GPIO_INTERRUPTS = 2,
 };
 
@@ -105,18 +104,6 @@ zx_status_t AmlGxlGpio::Create(zx_device_t* parent) {
         gpio_interrupt = &s912_interrupt_block;
         block_count = countof(s912_gpio_blocks);
         break;
-    case PDEV_PID_AMLOGIC_S905X:
-        gpio_blocks = s905x_gpio_blocks;
-        pinmux_blocks = s905x_pinmux_blocks;
-        gpio_interrupt = &s905x_interrupt_block;
-        block_count = countof(s905x_gpio_blocks);
-        break;
-    case PDEV_PID_AMLOGIC_S905:
-        gpio_blocks = s905_gpio_blocks;
-        pinmux_blocks = s905_pinmux_blocks;
-        gpio_interrupt = &s905_interrupt_block;
-        block_count = countof(s905_gpio_blocks);
-        break;
     default:
         zxlogf(ERROR, "AmlGxlGpio::Create: unsupported SOC PID %u\n", info.pid);
         return ZX_ERR_INVALID_ARGS;
@@ -167,12 +154,10 @@ zx_status_t AmlGxlGpio::Create(zx_device_t* parent) {
 void AmlGxlGpio::Bind(const pbus_protocol_t& pbus) {
     gpio_impl_protocol_t gpio_proto = {
         .ops = &gpio_impl_protocol_ops_,
-        .ctx = this
+        .ctx = this,
     };
 
-    const platform_proxy_cb_t kCallback = {NULL, NULL};
-    pbus_register_protocol(&pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_proto, sizeof(gpio_proto),
-                           &kCallback);
+    pbus_register_protocol(&pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_proto, sizeof(gpio_proto));
 }
 
 zx_status_t AmlGxlGpio::AmlPinToBlock(const uint32_t pin, const AmlGpioBlock** out_block,
@@ -379,7 +364,7 @@ zx_status_t AmlGxlGpio::GpioImplGetInterrupt(uint32_t pin, uint32_t flags,
         }
     }
 
-    zxlogf(INFO, "GPIO Interrupt index %d allocated\n", (int)index);
+    zxlogf(TRACE, "GPIO Interrupt index %d allocated\n", (int)index);
 
     zx_status_t status;
     const AmlGpioBlock* block;
@@ -401,7 +386,7 @@ zx_status_t AmlGxlGpio::GpioImplGetInterrupt(uint32_t pin, uint32_t flags,
     // Create Interrupt Object
     if ((status = pdev_get_interrupt(&pdev_, index, flags_,
                                      out_irq->reset_and_get_address())) != ZX_OK) {
-        zxlogf(ERROR, "AmlGxlGpio::GpioImplGetInterrupt: pdev_map_interrupt failed %d\n", status);
+        zxlogf(ERROR, "AmlGxlGpio::GpioImplGetInterrupt: pdev_get_interrupt failed %d\n", status);
         return status;
     }
 
@@ -495,8 +480,24 @@ zx_status_t AmlGxlGpio::GpioImplSetPolarity(uint32_t pin, uint32_t polarity) {
     return ZX_OK;
 }
 
-}  // namespace gpio
-
-extern "C" zx_status_t aml_gpio_bind(void* ctx, zx_device_t* parent) {
+zx_status_t aml_gpio_bind(void* ctx, zx_device_t* parent) {
     return gpio::AmlGxlGpio::Create(parent);
 }
+
+static zx_driver_ops_t driver_ops = []() {
+    zx_driver_ops_t ops;
+    ops.version = DRIVER_OPS_VERSION;
+    ops.bind = aml_gpio_bind;
+    return ops;
+}();
+
+} // namespace gpio
+
+// clang-format off
+ZIRCON_DRIVER_BEGIN(aml_gpio, gpio::driver_ops, "zircon", "0.1", 4)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PDEV),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_AMLOGIC),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_DID, PDEV_DID_AMLOGIC_GPIO),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_AMLOGIC_S912),
+ZIRCON_DRIVER_END(aml_gpio)
+

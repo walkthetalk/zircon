@@ -18,7 +18,9 @@
 #include <fuchsia/device/manager/c/fidl.h>
 #include <inet6/inet6.h>
 #include <inet6/netifc.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <zircon/boot/netboot.h>
 #include <zircon/process.h>
 #include <zircon/processargs.h>
@@ -130,17 +132,20 @@ void netboot_advertise(const char* nodename) {
     if (xfer_active)
         return;
 
-    uint8_t buffer[sizeof(nbmsg) + MAX_ADVERTISE_DATA_LEN];
-    nbmsg* msg = reinterpret_cast<nbmsg*>(buffer);
+    struct {
+        nbmsg msg;
+        char data[MAX_ADVERTISE_DATA_LEN];
+    } packet_data;
+    nbmsg* msg = &packet_data.msg;
     msg->magic = NB_MAGIC;
     msg->cookie = 0;
     msg->cmd = NB_ADVERTISE;
     msg->arg = NB_VERSION_CURRENT;
 
-    snprintf(reinterpret_cast<char*>(msg->data), MAX_ADVERTISE_DATA_LEN, "version=%s;nodename=%s",
+    snprintf(packet_data.data, MAX_ADVERTISE_DATA_LEN, "version=%s;nodename=%s",
              BOOTLOADER_VERSION, nodename);
-    const size_t data_len = strlen(reinterpret_cast<char*>(msg->data)) + 1;
-    udp6_send(buffer, sizeof(nbmsg) + data_len, &ip6_ll_all_nodes, NB_ADVERT_PORT, NB_SERVER_PORT,
+    const size_t data_len = strlen(packet_data.data) + 1;
+    udp6_send(&packet_data, sizeof(nbmsg) + data_len, &ip6_ll_all_nodes, NB_ADVERT_PORT, NB_SERVER_PORT,
               false);
 }
 
@@ -269,6 +274,31 @@ static zx_status_t do_dmctl_mexec() {
     }
     // if we get here, mexec failed
     return ZX_ERR_INTERNAL;
+}
+
+static zx_status_t reboot() {
+    zx_handle_t local, remote;
+    zx_status_t status = zx_channel_create(0, &local, &remote);
+    if (status != ZX_OK) {
+        return ZX_ERR_INTERNAL;
+    }
+
+    status = fdio_service_connect("/svc/fuchsia.device.manager.Administrator", remote);
+    if (status != ZX_OK) {
+        zx_handle_close(local);
+        return ZX_ERR_INTERNAL;
+    }
+
+    zx_status_t call_status;
+    status = fuchsia_device_manager_AdministratorSuspend(local,
+                                                         fuchsia_device_manager_SUSPEND_FLAG_REBOOT,
+                                                         &call_status);
+    zx_handle_close(local);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return call_status;
 }
 
 static void bootloader_recv(void* data, size_t len, const ip6_addr_t* daddr, uint16_t dport,
@@ -404,22 +434,20 @@ transmit:
     }
 
     if (do_boot) {
-        if (do_dmctl_mexec() != ZX_OK) {
+        zx_status_t status = do_dmctl_mexec();
+        if (status != ZX_OK) {
             // TODO: This will return before the system actually mexecs.
             // We can't pass an event to wait on here because fdio
             // has a limit of 3 handles, and we're already using
             // all 3 to pass boot parameters.
-            printf("netboot: Boot failed\n");
+            printf("netboot: Boot failed. status = %d\n", status);
         }
     }
 
     if (do_reboot) {
-        int fd = open("/dev/misc/dmctl", O_WRONLY);
-        if (fd < 0) {
-            printf("netboot: Reboot failed: %s\n", strerror(errno));
-        } else {
-            dprintf(fd, "reboot");
-            close(fd);
+        zx_status_t status = reboot();
+        if (status != ZX_OK) {
+            printf("netboot: Reboot failed. status = %d\n", status);
         }
     }
 }

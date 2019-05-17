@@ -9,6 +9,7 @@
 #include <ddk/metadata.h>
 #include <ddk/metadata/camera.h>
 #include <ddk/protocol/i2c-lib.h>
+#include <endian.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
@@ -33,40 +34,46 @@ constexpr uint32_t kMasterClock = 288000000;
 } // namespace
 
 zx_status_t Imx227Device::InitPdev(zx_device_t* parent) {
-    if (!pdev_.is_valid()) {
-        zxlogf(ERROR, "%s: ZX_PROTOCOL_PDEV not available\n", __FUNCTION__);
-        return ZX_ERR_NO_RESOURCES;
-    }
-
-    for (uint32_t i = 0; i < countof(gpios_); i++) {
-        gpios_[i] = pdev_.GetGpio(i);
-        if (!gpios_[i].is_valid()) {
-            return ZX_ERR_NO_RESOURCES;
-        }
-        // Set the GPIO to output and set initial value to 0.
-        gpios_[i].ConfigOut(0);
-    }
 
     // I2c for communicating with the sensor.
     if (!i2c_.is_valid()) {
+        zxlogf(ERROR, "%s; I2C not available\n", __func__);
         return ZX_ERR_NO_RESOURCES;
     }
 
     // Clk for gating clocks for sensor.
-    if (!clk_.is_valid()) {
+    if (!clk24_.is_valid()) {
+        zxlogf(ERROR, "%s; clk24_ not available\n", __func__);
         return ZX_ERR_NO_RESOURCES;
     }
 
     // Mipi for init and de-init.
     if (!mipi_.is_valid()) {
+        zxlogf(ERROR, "%s; mipi_ not available\n", __func__);
         return ZX_ERR_NO_RESOURCES;
     }
 
-    // IspImpl for registering callbacks.
-    if (!ispimpl_.is_valid()) {
+    // GPIOs
+    if (!gpio_vana_enable_.is_valid()) {
+        zxlogf(ERROR, "%s; gpio_vana_enable_ not available\n", __func__);
         return ZX_ERR_NO_RESOURCES;
     }
 
+    if (!gpio_vdig_enable_.is_valid()) {
+        zxlogf(ERROR, "%s; gpio_vdig_enable_ not available\n", __func__);
+        return ZX_ERR_NO_RESOURCES;
+    }
+
+    if (!gpio_cam_rst_.is_valid()) {
+        zxlogf(ERROR, "%s; gpio_cam_rst_ not available\n", __func__);
+        return ZX_ERR_NO_RESOURCES;
+    }
+
+    // Set the GPIO to output and set them to their initial values
+    // before the power up sequence.
+    gpio_cam_rst_.ConfigOut(1);
+    gpio_vana_enable_.ConfigOut(0);
+    gpio_vdig_enable_.ConfigOut(0);
     return ZX_OK;
 }
 
@@ -139,20 +146,19 @@ zx_status_t Imx227Device::InitSensor(uint8_t idx) {
     return ZX_OK;
 }
 
-zx_status_t Imx227Device::Init() {
-
+zx_status_t Imx227Device::CameraSensorInit() {
     // Power up sequence. Reference: Page 51- IMX227-0AQH5-C datasheet.
-    gpios_[VANA_ENABLE].ConfigOut(1);
+    gpio_vana_enable_.Write(1);
     zx_nanosleep(zx_deadline_after(ZX_MSEC(50)));
 
-    gpios_[VDIG_ENABLE].ConfigOut(1);
+    gpio_vdig_enable_.Write(1);
     zx_nanosleep(zx_deadline_after(ZX_MSEC(50)));
 
     // Enable 24M clock for sensor.
-    clk_.Enable(0);
+    clk24_.Enable();
     zx_nanosleep(zx_deadline_after(ZX_MSEC(10)));
 
-    gpios_[CAM_SENSOR_RST].ConfigOut(0);
+    gpio_cam_rst_.Write(0);
     zx_nanosleep(zx_deadline_after(ZX_MSEC(50)));
 
     // Get Sensor ID to validate initialization sequence.
@@ -176,18 +182,42 @@ zx_status_t Imx227Device::Init() {
     ctx_.param.integration_time_apply_delay = 2;
     ctx_.param.isp_exposure_channel_delay = 0;
 
+    zxlogf(INFO, "%s IMX227 Camera Sensor Brought out of reset\n", __func__);
     return ZX_OK;
 }
 
-void Imx227Device::DeInit() {
+void Imx227Device::CameraSensorDeInit() {
     mipi_.DeInit();
 }
 
-zx_status_t Imx227Device::GetInfo(sensor_info_t* out_info) {
-    return ZX_ERR_NOT_SUPPORTED;
+zx_status_t Imx227Device::CameraSensorGetInfo(sensor_info_t* out_info) {
+    if (out_info == nullptr) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    memcpy(out_info, &ctx_.param, sizeof(sensor_info_t));
+    return ZX_OK;
 }
 
-zx_status_t Imx227Device::SetMode(uint8_t mode) {
+zx_status_t Imx227Device::CameraSensorGetSupportedModes(sensor_mode_t* out_modes_list,
+                                                        size_t modes_count,
+                                                        size_t* out_modes_actual) {
+    if (out_modes_list == nullptr || out_modes_actual == nullptr) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    if (modes_count > countof(supported_modes)) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    memcpy(out_modes_list, &supported_modes, sizeof(sensor_mode_t) * countof(supported_modes));
+    *out_modes_actual = countof(supported_modes);
+    return ZX_OK;
+}
+
+zx_status_t Imx227Device::CameraSensorSetMode(uint8_t mode) {
+    zxlogf(INFO, "%s IMX227 Camera Sensor Mode Set request to %d\n", __func__, mode);
+
     // Get Sensor ID to see if sensor is initialized.
     if (!ValidateSensorID()) {
         return ZX_ERR_INTERNAL;
@@ -198,7 +228,7 @@ zx_status_t Imx227Device::SetMode(uint8_t mode) {
     }
 
     switch (supported_modes[mode].wdr_mode) {
-    case kWDR_MODE_LINEAR: {
+    case WDR_MODE_LINEAR: {
 
         InitSensor(supported_modes[mode].idx);
 
@@ -218,7 +248,7 @@ zx_status_t Imx227Device::SetMode(uint8_t mode) {
     ctx_.param.active.height = supported_modes[mode].resolution.height;
     ctx_.HMAX = static_cast<uint16_t>(ReadReg(0x342) << 8 | ReadReg(0x343));
     ctx_.VMAX = static_cast<uint16_t>(ReadReg(0x340) << 8 | ReadReg(0x341));
-    ctx_.int_max = 0x0A8C; // Max allowed for 30fps = 2782 (dec), 0x0A8E (hex)
+    ctx_.int_max = 0x0ADE; // Max allowed for 30fps = 2782 (dec), 0x0ADE (hex)
     ctx_.int_time_min = 1;
     ctx_.int_time_limit = ctx_.int_max;
     ctx_.param.total.height = ctx_.VMAX;
@@ -260,100 +290,91 @@ zx_status_t Imx227Device::SetMode(uint8_t mode) {
     adap_info.resolution.width = supported_modes[mode].resolution.width;
     adap_info.resolution.height = supported_modes[mode].resolution.height;
     adap_info.path = MIPI_PATH_PATH0;
-    adap_info.mode = MIPI_MODES_DDR_MODE;
+    adap_info.mode = MIPI_MODES_DIR_MODE;
     return mipi_.Init(&mipi_info, &adap_info);
 }
 
-void Imx227Device::StartStreaming() {
+void Imx227Device::CameraSensorStartStreaming() {
+    zxlogf(INFO, "%s Camera Sensor Start Streaming\n", __func__);
     ctx_.streaming_flag = 1;
     WriteReg(0x0100, 0x01);
 }
 
-void Imx227Device::StopStreaming() {
+void Imx227Device::CameraSensorStopStreaming() {
     ctx_.streaming_flag = 0;
     WriteReg(0x0100, 0x00);
 }
 
-int32_t Imx227Device::SetAnalogGain(int32_t gain) {
+int32_t Imx227Device::CameraSensorSetAnalogGain(int32_t gain) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-int32_t Imx227Device::SetDigitalGain(int32_t gain) {
+int32_t Imx227Device::CameraSensorSetDigitalGain(int32_t gain) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-void Imx227Device::SetIntegrationTime(int32_t int_time,
-                                      int32_t int_time_M,
-                                      int32_t int_time_L) {
+void Imx227Device::CameraSensorSetIntegrationTime(int32_t int_time,
+                                                  int32_t int_time_M,
+                                                  int32_t int_time_L) {
 }
 
-zx_status_t Imx227Device::Update() {
+zx_status_t Imx227Device::CameraSensorUpdate() {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t Imx227Device::Create(zx_device_t* parent) {
+zx_status_t Imx227Device::Create(void* ctx, zx_device_t* parent) {
+    ddk::CompositeProtocolClient composite(parent);
+    if (!composite.is_valid()) {
+        zxlogf(ERROR, "%s could not get composite protocoln", __func__);
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    zx_device_t* components[COMPONENT_COUNT];
+    size_t actual;
+    composite.GetComponents(components, COMPONENT_COUNT, &actual);
+    if (actual != COMPONENT_COUNT) {
+        zxlogf(ERROR, "%s Could not get components\n", __func__);
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
     fbl::AllocChecker ac;
-    auto sensor_device = std::unique_ptr<Imx227Device>(new (&ac) Imx227Device(parent));
+    auto sensor_device = std::unique_ptr<Imx227Device>(
+        new (&ac) Imx227Device(parent,
+                               components[COMPONENT_I2C],
+                               components[COMPONENT_GPIO_VANA],
+                               components[COMPONENT_GPIO_VDIG],
+                               components[COMPONENT_GPIO_CAM_RST],
+                               components[COMPONENT_CLK24],
+                               components[COMPONENT_MIPICSI]));
     if (!ac.check()) {
+        zxlogf(ERROR, "%s Could not create Imx227Device device\n", __func__);
         return ZX_ERR_NO_MEMORY;
     }
 
     zx_status_t status = sensor_device->InitPdev(parent);
     if (status != ZX_OK) {
+        zxlogf(ERROR, "%s InitPdev failed\n", __func__);
         return status;
     }
 
-    status = sensor_device->DdkAdd("imx227");
+
+    zx_device_prop_t props[] = {
+        {BIND_PLATFORM_DEV_VID, 0, PDEV_VID_SONY},
+        {BIND_PLATFORM_DEV_PID, 0, PDEV_PID_SONY_IMX227},
+        {BIND_PLATFORM_DEV_DID, 0, PDEV_DID_CAMERA_SENSOR},
+    };
+
+
+    status = sensor_device->DdkAdd("imx227", 0, props, countof(props));
     if (status != ZX_OK) {
         zxlogf(ERROR, "imx227: Could not create imx227 sensor device: %d\n", status);
         return status;
+    } else {
+        zxlogf(INFO, "imx227 driver added\n");
     }
 
     // sensor_device intentionally leaked as it is now held by DevMgr.
-    auto* dev = sensor_device.release();
-
-    isp_callbacks_t cb;
-    isp_callbacks_ops ops;
-
-    ops.init = [](void* ctx) {
-        return static_cast<Imx227Device*>(ctx)->Init();
-    };
-    ops.de_init = [](void* ctx) {
-        return static_cast<Imx227Device*>(ctx)->DeInit();
-    };
-    ops.set_mode = [](void* ctx, uint8_t mode) {
-        return static_cast<Imx227Device*>(ctx)->SetMode(mode);
-    };
-    ops.start_streaming = [](void* ctx) {
-        return static_cast<Imx227Device*>(ctx)->StartStreaming();
-    };
-    ops.stop_streaming = [](void* ctx) {
-        return static_cast<Imx227Device*>(ctx)->StopStreaming();
-    };
-    ops.set_analog_gain = [](void* ctx, int32_t gain) {
-        return static_cast<Imx227Device*>(ctx)->SetAnalogGain(gain);
-    };
-    ops.set_digital_gain = [](void* ctx, int32_t gain) {
-        return static_cast<Imx227Device*>(ctx)->SetDigitalGain(gain);
-    };
-    ops.set_integration_time = [](void* ctx,
-                                  int32_t int_time,
-                                  int32_t int_time_M,
-                                  int32_t int_time_L) {
-        return static_cast<Imx227Device*>(ctx)->SetIntegrationTime(int_time,
-                                                                   int_time_M,
-                                                                   int_time_L);
-    };
-    ops.get_info = [](void* ctx, sensor_info_t* out_info) {
-        return static_cast<Imx227Device*>(ctx)->GetInfo(out_info);
-    };
-    ops.update = [](void* ctx) {
-        return static_cast<Imx227Device*>(ctx)->Update();
-    };
-
-    cb.ops = &ops;
-    cb.ctx = dev;
-    return dev->ispimpl_.RegisterCallbacks(&cb);
+    __UNUSED auto* dev = sensor_device.release();
     return ZX_OK;
 }
 
@@ -370,7 +391,7 @@ void Imx227Device::DdkRelease() {
 }
 
 zx_status_t imx227_bind(void* ctx, zx_device_t* device) {
-    return camera::Imx227Device::Create(device);
+    return camera::Imx227Device::Create(ctx, device);
 }
 
 static zx_driver_ops_t driver_ops = []() {
@@ -383,7 +404,8 @@ static zx_driver_ops_t driver_ops = []() {
 } // namespace camera
 
 // clang-format off
-ZIRCON_DRIVER_BEGIN(imx227, camera::driver_ops, "imx227", "0.1", 3)
+ZIRCON_DRIVER_BEGIN(imx227, camera::driver_ops, "imx227", "0.1", 4)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_COMPOSITE),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_SONY),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_SONY_IMX227),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_CAMERA_SENSOR),

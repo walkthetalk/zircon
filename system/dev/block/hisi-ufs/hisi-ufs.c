@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <ddk/binding.h>
@@ -249,13 +250,17 @@ static zx_status_t hisi_ufs_bind(void* ctx, zx_device_t* parent) {
         .flags = DEVICE_ADD_NON_BINDABLE,
     };
 
-    status = pdev_device_add(&dev->pdev, 0, &args, &dev->zxdev);
+    status = device_add(parent, &args, &dev->zxdev);
     if (status != ZX_OK) {
-        status = device_add(parent, &args, &dev->zxdev);
-        if (status != ZX_OK) {
-            UFS_ERROR("hisi UFS device pdev_add status: %d\n", status);
-            goto fail;
-        }
+        UFS_ERROR("hisi UFS device pdev_add status: %d\n", status);
+        goto fail;
+    }
+
+    status = ufs_create_worker_thread(dev);
+    if (status != ZX_OK) {
+        UFS_ERROR("UFS worker_thread create fail! status:%d\n", status);
+        device_remove(dev->zxdev);
+        goto fail;
     }
 
     return ZX_OK;

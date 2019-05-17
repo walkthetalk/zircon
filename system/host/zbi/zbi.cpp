@@ -13,12 +13,14 @@
 #include <deque>
 #include <dirent.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <fnmatch.h>
 #include <forward_list>
 #include <functional>
 #include <getopt.h>
 #include <limits>
 #include <list>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -26,15 +28,22 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include <fbl/auto_call.h>
 #include <fbl/macros.h>
 #include <fbl/unique_fd.h>
 #include <lib/cksum.h>
 #include <lz4/lz4frame.h>
+#include <zircon/boot/bootfs.h>
 #include <zircon/boot/image.h>
+#include <zstd/zstd.h>
 
 namespace {
 
@@ -44,16 +53,13 @@ bool Aligned(uint32_t length) {
     return length % ZBI_ALIGNMENT == 0;
 }
 
-// It's not clear where this magic number comes from.
-constexpr size_t kLZ4FMaxHeaderFrameSize = 128;
-
 // iovec.iov_base is void* but we only use pointers to const.
 template <typename T>
 iovec Iovec(const T* buffer, size_t size = sizeof(T)) {
     return {const_cast<void*>(static_cast<const void*>(buffer)), size};
 }
 
-class AppendBuffer {
+class AppendBuffer final {
 public:
     explicit AppendBuffer(size_t size)
         : buffer_(std::make_unique<std::byte[]>(size)), ptr_(buffer_.get()) {
@@ -94,7 +100,7 @@ private:
 class Item;
 using ItemPtr = std::unique_ptr<Item>;
 
-class OutputStream {
+class OutputStream final {
 public:
     OutputStream() = delete;
 
@@ -236,10 +242,13 @@ private:
     }
 };
 
-class FileWriter {
+class FileWriter final {
 public:
-    FileWriter(const char* outfile, std::string prefix)
+    FileWriter(const char* outfile, std::filesystem::path prefix)
         : prefix_(std::move(prefix)), outfile_(outfile) {
+        if (prefix_.empty()) {
+            prefix_ = ".";
+        }
     }
 
     unsigned int NextFileNumber() const {
@@ -257,61 +266,93 @@ public:
                 return CreateFile(outfile_);
             }
         } else {
-            auto file = prefix_ + name;
+            auto file = prefix_ / name;
             return CreateFile(file.c_str());
         }
     }
 
+    template <typename T1, typename T2>
+    void HardLink(const T1& target, const T2& link) {
+        const auto target_path = prefix_ / target;
+        const auto link_path = prefix_ / link;
+        auto linkit =
+            [&]() {
+                std::error_code ec;
+                std::filesystem::create_hard_link(target_path, link_path, ec);
+                return ec;
+            };
+        std::error_code ec = linkit();
+        if (ec) {
+            switch (ec.value()) {
+            case ENOENT:
+                MakeDirs(link_path);
+                ec = linkit();
+                break;
+            case EEXIST:
+                std::filesystem::remove(link_path, ec);
+                ec = linkit();
+                break;
+            }
+        }
+        if (ec) {
+            fprintf(stderr, "cannot link %s to %s: %s\n",
+                    target_path.c_str(), link_path.c_str(),
+                    ec.message().c_str());
+            exit(1);
+        }
+    }
+
 private:
-    std::string prefix_;
+    std::filesystem::path prefix_;
     const char* outfile_ = nullptr;
     unsigned int files_ = 0;
 
-    OutputStream CreateFile(const char* outfile) {
-        // Remove the file in case it exists.  This makes it safe to
-        // to do e.g. `zbi -o boot.zbi boot.zbi --entry=bin/foo=mybuild/foo`
-        // to modify a file "in-place" because the input `boot.zbi` will
-        // already have been opened before the new `boot.zbi` is created.
-        remove(outfile);
+    void MakeDirs(std::filesystem::path path) {
+        path.remove_filename();
+        std::error_code ec;
+        if (!std::filesystem::create_directories(path, ec) && ec) {
+            fprintf(stderr, "cannot create directory %s: %s\n",
+                    path.c_str(), ec.message().c_str());
+            exit(1);
+        }
+    }
 
-        fbl::unique_fd fd(open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666));
-        if (!fd && errno == ENOENT) {
-            MakeDirs(outfile);
-            fd.reset(open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0666));
+    OutputStream CreateFile(const char* outfile) {
+        auto openit = [outfile]() {
+            return fbl::unique_fd(
+                open(outfile, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0666));
+        };
+
+        fbl::unique_fd fd = openit();
+        if (!fd) {
+            switch (errno) {
+            case ENOENT: {
+                MakeDirs(outfile);
+                fd = openit();
+                break;
+            }
+
+            case EEXIST:
+                // Remove the file in case it exists.  This makes it safe to do
+                // e.g. `zbi -o boot.zbi boot.zbi --entry=bin/foo=my/foo` to
+                // modify a file "in-place" because the input `boot.zbi` will
+                // already have been opened before the new `boot.zbi` is
+                // created.
+                remove(outfile);
+                fd = openit();
+                break;
+            }
         }
         if (!fd) {
-            fprintf(stderr, "cannot create %s: %s\n",
-                    outfile, strerror(errno));
+            fprintf(stderr, "cannot create %s: %s\n", outfile, strerror(errno));
             exit(1);
         }
 
         return OutputStream(std::move(fd));
     }
-
-    static void MakeDirs(const std::string& name) {
-        auto lastslash = name.rfind('/');
-        if (lastslash == std::string::npos) {
-            return;
-        }
-        auto dir = name.substr(0, lastslash);
-        if (mkdir(dir.c_str(), 0777) == 0) {
-            return;
-        }
-        if (errno == ENOENT) {
-            MakeDirs(dir);
-            if (mkdir(dir.c_str(), 0777) == 0) {
-                return;
-            }
-        }
-        if (errno != EEXIST) {
-            fprintf(stderr, "mkdir: %s: %s\n",
-                    dir.c_str(), strerror(errno));
-            exit(1);
-        }
-    }
 };
 
-class NameMatcher {
+class NameMatcher final {
 public:
     NameMatcher(const char* const* patterns, int count)
         : begin_(patterns), end_(&patterns[count]) {
@@ -366,8 +407,9 @@ private:
             if (ptn[0] == '!' || ptn[0] == '^') {
                 excludes = true;
             } else {
-                included = (included || fnmatch(
-                                            ptn, name, casefold ? FNM_CASEFOLD : 0) == 0);
+                included =
+                    (included ||
+                     fnmatch(ptn, name, casefold ? FNM_CASEFOLD : 0) == 0);
             }
         }
         if (included && excludes) {
@@ -381,11 +423,11 @@ private:
                 }
             }
         }
-        return false;
+        return included;
     }
 };
 
-class Checksummer {
+class Checksummer final {
 public:
     void Write(const iovec& buffer) {
         crc_ = crc32(crc_, static_cast<const uint8_t*>(buffer.iov_base),
@@ -409,89 +451,119 @@ private:
     uint32_t crc_ = 0;
 };
 
-// This tells LZ4f_compressUpdate it can keep a pointer to data.
-constexpr const LZ4F_compressOptions_t kCompressOpt = {1, {}};
+template <typename Func, typename... Args>
+auto Lz4Call(Func f, Args... args) {
+    auto result = f(args...);
+    if (LZ4F_isError(result)) {
+        fprintf(stderr, "LZ4 failure: %s\n", LZ4F_getErrorName(result));
+        exit(1);
+    }
+    return result;
+}
 
-class Compressor {
+template <typename Func, typename... Args>
+auto ZstdCall(const char* what, Func f, Args... args) {
+    auto result = f(args...);
+    if (ZSTD_isError(result)) {
+        fprintf(stderr, "ZSTD %s failure: %s\n",
+                what, ZSTD_getErrorName(result));
+        exit(1);
+    }
+    return result;
+}
+
+class Compressor final {
+    // Private forward declarations;
+    class Lz4;
+    class Zstd;
+
 public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(Compressor);
-    Compressor() = default;
 
-#define LZ4F_CALL(func, ...)                                               \
-    [&]() {                                                                \
-        auto result = func(__VA_ARGS__);                                   \
-        if (LZ4F_isError(result)) {                                        \
-            fprintf(stderr, "%s: %s\n", #func, LZ4F_getErrorName(result)); \
-            exit(1);                                                       \
-        }                                                                  \
-        return result;                                                     \
-    }()
+    enum Algo {
+        kNone,
+        kLz4,
+        kZstd,
+        kInvalid,
+    };
 
-    void Init(OutputStream* out, const zbi_header_t& header) {
-        header_ = header;
-        assert(header_.flags & ZBI_FLAG_STORAGE_COMPRESSED);
-        assert(header_.flags & ZBI_FLAG_CRC32);
+    struct Config {
+        // Default for -c with no argument (or no switches at all).
+        using Default = Lz4;
 
-        // Write a place-holder for the header, which we will go back
-        // and fill in once we know the payload length and CRC.
-        header_pos_ = out->PlaceHeader();
+        Algo algo_ = Default::kAlgo;
+        int level_ = Default::DefaultLevel();
 
-        prefs_.frameInfo.contentSize = header_.length;
+        static constexpr Config None() { return Config{kNone, 0}; }
 
-        prefs_.frameInfo.blockSizeID = LZ4F_max64KB;
-        prefs_.frameInfo.blockMode = LZ4F_blockIndependent;
+        operator bool() const {
+            return algo_ != kNone;
+        }
 
-        // LZ4 compression levels 1-3 are for "fast" compression, and 4-16
-        // are for higher compression. The additional compression going from
-        // 4 to 16 is not worth the extra time needed during compression.
-        prefs_.compressionLevel = 4;
+        void clear() { algo_ = kNone; }
 
-        LZ4F_CALL(LZ4F_createCompressionContext, &ctx_, LZ4F_VERSION);
+        template <typename T>
+        void Set(int level = T::DefaultLevel()) {
+            algo_ = T::kAlgo;
+            level_ = level;
+        }
 
-        // Record the original uncompressed size in header_.extra.
-        // WriteBuffer will accumulate the compressed size in header_.length.
-        header_.extra = header_.length;
-        header_.length = 0;
+        template <typename T>
+        void SetMax() {
+            Set<T>(T::MaxLevel());
+        }
 
-        // This might start writing compression format headers before it
-        // receives any data.
-        auto buffer = GetBuffer(kLZ4FMaxHeaderFrameSize);
-        size_t size = LZ4F_CALL(LZ4F_compressBegin, ctx_,
-                                buffer.data.get(), buffer.size, &prefs_);
-        assert(size <= buffer.size);
-        WriteBuffer(out, std::move(buffer), size);
+        bool Parse(const char* arg) {
+            int level;
+            if (!arg) {
+                *this = {};
+            } else if (!strcasecmp(arg, "none")) {
+                *this = None();
+            } else if (!strcasecmp(arg, "lz4,max")) {
+                SetMax<Lz4>();
+            } else if (!strcasecmp(arg, "lz4")) {
+                Set<Lz4>();
+            } else if (!strcasecmp(arg, "lz4,max")) {
+                SetMax<Lz4>();
+            } else if (sscanf(arg, "%*1[lL]%*1[zZ]4,%i", &level) == 1) {
+                Set<Lz4>(level);
+            } else if (!strcasecmp(arg, "zstd")) {
+                Set<Zstd>();
+            } else if (!strcasecmp(arg, "zstd,max")) {
+                SetMax<Zstd>();
+            } else if (!strcasecmp(arg, "zstd,overclock")) {
+                Set<Zstd>(Zstd::OverclockLevel());
+            } else if (sscanf(arg, "%*1[Zz]%*1[Ss]%*1[Tt]%*1[Dd],%i",
+                              &level) == 1) {
+                Set<Zstd>(level);
+            } else if (!strcasecmp(arg, "max")) {
+                SetMax<Default>();
+            } else if (sscanf(arg, "%i", &level) == 1) {
+                Set<Default>(level);
+            } else {
+                return false;
+            }
+            return true;
+        }
+    };
+
+    explicit Compressor(const Config& config)
+        : config_(config) {
+        switch (config_.algo_) {
+        case kLz4:
+            algo_.emplace<Lz4>();
+            break;
+        case kZstd:
+            algo_.emplace<Zstd>();
+            break;
+        default:
+            abort();
+        }
     }
 
-    ~Compressor() {
-        LZ4F_CALL(LZ4F_freeCompressionContext, ctx_);
-    }
-
-    // NOTE: Input buffer may be referenced for the life of the Compressor!
-    void Write(OutputStream* out, const iovec& input) {
-        auto buffer = GetBuffer(LZ4F_compressBound(input.iov_len, &prefs_));
-        size_t actual_size = LZ4F_CALL(LZ4F_compressUpdate,
-                                       ctx_, buffer.data.get(), buffer.size,
-                                       input.iov_base, input.iov_len,
-                                       &kCompressOpt);
-        WriteBuffer(out, std::move(buffer), actual_size);
-    }
-
-    uint32_t Finish(OutputStream* out) {
-        // Write the closing chunk from the compressor.
-        auto buffer = GetBuffer(LZ4F_compressBound(0, &prefs_));
-        size_t actual_size = LZ4F_CALL(LZ4F_compressEnd,
-                                       ctx_, buffer.data.get(), buffer.size,
-                                       &kCompressOpt);
-
-        WriteBuffer(out, std::move(buffer), actual_size);
-
-        // Complete the checksum.
-        crc_.FinalizeHeader(&header_);
-
-        // Write the header back where its place was held.
-        out->PatchHeader(header_, header_pos_);
-        return header_.length;
-    }
+    void Init(OutputStream* out, const zbi_header_t& header);
+    void Write(OutputStream* out, const iovec& input);
+    uint32_t Finish(OutputStream* out);
 
 private:
     struct Buffer {
@@ -511,14 +583,179 @@ private:
         }
         std::unique_ptr<std::byte[]> data;
         size_t size = 0;
-    } unused_buffer_;
+    };
+
+    auto BufferGetter() {
+        return [this](size_t x) { return GetBuffer(x); };
+    }
+
+    auto BufferPutter(OutputStream* out) {
+        return [out, this](auto buffer, size_t size) {
+            assert(size <= buffer.size);
+            WriteBuffer(out, std::move(buffer), size);
+        };
+    }
+
+    class Lz4 {
+    public:
+        static constexpr Algo kAlgo = kLz4;
+
+        Lz4() = default;
+
+        // LZ4 compression levels 1-3 are for "fast" compression, and 4-16 are
+        // for higher compression.  The additional compression going from 4 to
+        // 16 is not worth the extra time needed during compression.
+        static constexpr int DefaultLevel() { return 4; }
+
+        static constexpr int MaxLevel() { return 16; }
+
+        ~Lz4() {
+            Lz4Call(LZ4F_freeCompressionContext, ctx_);
+        }
+
+        template <typename T1, typename T2>
+        void Init(T1 get_buffer, T2 put_buffer,
+                  int level, size_t uncompressed_size) {
+            prefs_.frameInfo.contentSize = uncompressed_size;
+
+            prefs_.frameInfo.blockSizeID = LZ4F_max64KB;
+            prefs_.frameInfo.blockMode = LZ4F_blockIndependent;
+            prefs_.compressionLevel = level;
+
+            Lz4Call(LZ4F_createCompressionContext, &ctx_, LZ4F_VERSION);
+
+            // This might start writing compression format headers before it
+            // receives any data.
+            auto buffer = get_buffer(kLz4FMaxHeaderFrameSize);
+            size_t wrote = Lz4Call(LZ4F_compressBegin, ctx_,
+                                   buffer.data.get(), buffer.size, &prefs_);
+            put_buffer(std::move(buffer), wrote);
+        }
+
+        template <typename T1, typename T2>
+        void Update(T1 get_buffer, T2 put_buffer, const iovec& input) {
+            auto buffer = get_buffer(
+                LZ4F_compressBound(input.iov_len, &prefs_));
+            size_t wrote = Lz4Call(LZ4F_compressUpdate,
+                                   ctx_, buffer.data.get(), buffer.size,
+                                   input.iov_base, input.iov_len,
+                                   &kCompressOpt);
+            put_buffer(std::move(buffer), wrote);
+        }
+
+        template <typename T1, typename T2>
+        void Finish(T1 get_buffer, T2 put_buffer) {
+            auto buffer = get_buffer(LZ4F_compressBound(0, &prefs_));
+            size_t wrote = Lz4Call(LZ4F_compressEnd,
+                                   ctx_, buffer.data.get(), buffer.size,
+                                   &kCompressOpt);
+            put_buffer(std::move(buffer), wrote);
+        }
+
+    private:
+        LZ4F_compressionContext_t ctx_{};
+        LZ4F_preferences_t prefs_{};
+
+        // It's not clear where this magic number comes from.
+        static constexpr size_t kLz4FMaxHeaderFrameSize = 128;
+    };
+
+    class Zstd {
+    public:
+        static constexpr Algo kAlgo = kZstd;
+
+        // Quite good compression, quite fast.  Compression gets better up to
+        // 10 or so, but slower.  Level 19 is quite slow but best compression,
+        // substantially better than level 5 or 10.
+        static constexpr int DefaultLevel() { return 4; }
+
+        // "The library supports regular compression levels from 1 up to
+        // ZSTD_maxCLevel()."
+        static int OverclockLevel() { return ZSTD_maxCLevel(); }
+
+        // "Levels >= 20, labeled `--ultra`, should be used with caution, as
+        // they require more memory."  So sayeth <zstd/zstd.h>.
+        static constexpr int MaxLevel() { return 19; }
+
+        Zstd() = default;
+
+        ~Zstd() {
+            ZstdCall("free", ZSTD_freeCCtx, ctx_);
+        }
+
+        template <typename T1, typename T2>
+        void Init(T1 get_buffer, T2 put_buffer,
+                  int level, size_t uncompressed_size) {
+            ctx_ = ZSTD_createCCtx();
+            if (!ctx_) {
+                fprintf(stderr, "out of memory\n");
+                exit(1);
+            }
+            ZstdCall("nbWorkers",
+                     ZSTD_CCtx_setParameter, ctx_, ZSTD_c_nbWorkers,
+                     std::thread::hardware_concurrency());
+            ZstdCall("compressionLevel",
+                     ZSTD_CCtx_setParameter, ctx_, ZSTD_c_compressionLevel,
+                     level);
+            ZstdCall("PledgedSrcSize",
+                     ZSTD_CCtx_setPledgedSrcSize, ctx_, uncompressed_size);
+        }
+
+        template <typename T1, typename T2>
+        void Update(T1 get_buffer, T2 put_buffer, const iovec& input) {
+            auto buffer = get_buffer(ZSTD_compressBound(input.iov_len));
+            ZSTD_outBuffer out = {
+                buffer.data.get(),
+                buffer.size,
+                0,
+            };
+            ZSTD_inBuffer in = {
+                input.iov_base,
+                input.iov_len,
+                0,
+            };
+            do {
+                ZstdCall("compress", ZSTD_compressStream2, ctx_,
+                         &out, &in, ZSTD_e_continue);
+            } while (in.pos < in.size);
+            put_buffer(std::move(buffer), out.pos);
+        }
+
+        template <typename T1, typename T2>
+        void Finish(T1 get_buffer, T2 put_buffer) {
+            size_t left;
+            do {
+                auto buffer = get_buffer(ZSTD_CStreamOutSize());
+                ZSTD_outBuffer out = {
+                    buffer.data.get(),
+                    buffer.size,
+                    0,
+                };
+                ZSTD_inBuffer in = {};
+                left = ZstdCall("finish", ZSTD_compressStream2, ctx_,
+                                &out, &in, ZSTD_e_end);
+                put_buffer(std::move(buffer), out.pos);
+            } while (left > 0);
+        }
+
+    private:
+        ZSTD_CCtx* ctx_ = nullptr;
+    };
+
+    using AlgoData = std::variant<Lz4, Zstd>;
+
+    Config config_;
+    AlgoData algo_{};
+    Buffer unused_buffer_;
     zbi_header_t header_;
     Checksummer crc_;
-    LZ4F_compressionContext_t ctx_;
-    LZ4F_preferences_t prefs_{};
     uint32_t header_pos_ = 0;
+
     // IOV_MAX buffers might be live at once.
     static constexpr const size_t kMinBufferSize = (128 << 20) / IOV_MAX;
+
+    // This tells LZ4f_compressUpdate it can keep a pointer to data.
+    static constexpr const LZ4F_compressOptions_t kCompressOpt = {1, {}};
 
     Buffer GetBuffer(size_t max_size) {
         if (unused_buffer_.size >= max_size) {
@@ -546,16 +783,98 @@ private:
     }
 };
 
-const size_t Compressor::kMinBufferSize;
+void Compressor::Init(OutputStream* out, const zbi_header_t& header) {
+    header_ = header;
+    assert(header_.flags & ZBI_FLAG_STORAGE_COMPRESSED);
+    assert(header_.flags & ZBI_FLAG_CRC32);
 
-constexpr const LZ4F_decompressOptions_t kDecompressOpt{};
+    // Write a place-holder for the header, which we will go back
+    // and fill in once we know the payload length and CRC.
+    header_pos_ = out->PlaceHeader();
+
+    // Record the original uncompressed size in header_.extra.
+    // WriteBuffer will accumulate the compressed size in header_.length.
+    header_.extra = header_.length;
+    header_.length = 0;
+
+    std::visit(
+        [&](auto&& v) {
+            v.Init(BufferGetter(), BufferPutter(out),
+                   config_.level_, header_.extra);
+        },
+        algo_);
+}
+
+// NOTE: Input buffer may be referenced for the life of the Compressor!
+void Compressor::Write(OutputStream* out, const iovec& input) {
+    std::visit(
+        [&](auto&& v) {
+            v.Update(BufferGetter(), BufferPutter(out), input);
+        },
+        algo_);
+}
+
+uint32_t Compressor::Finish(OutputStream* out) {
+    // Write the closing chunk from the compressor.
+    std::visit(
+        [&](auto&& v) {
+            v.Finish(BufferGetter(), BufferPutter(out));
+        },
+        algo_);
+
+    // Complete the checksum.
+    crc_.FinalizeHeader(&header_);
+
+    // Write the header back where its place was held.
+    out->PatchHeader(header_, header_pos_);
+    return header_.length;
+}
+
+struct Decompressor {
+    using Function =
+        std::unique_ptr<std::byte[]>(const std::list<const iovec>& payload,
+                                     uint32_t decompressed_length);
+
+    Function* decompress;
+    uint32_t magic;
+};
+
+Decompressor::Function DecompressLz4, DecompressZstd;
+
+constexpr Decompressor kDecompressors[] = {
+    {DecompressLz4, 0x184D2204},
+    {DecompressZstd, 0xFD2FB528},
+};
 
 std::unique_ptr<std::byte[]> Decompress(const std::list<const iovec>& payload,
                                         uint32_t decompressed_length) {
+    if (payload.empty() || payload.front().iov_len < sizeof(uint32_t)) {
+        fprintf(stderr, "compressed payload too small for header\n");
+        exit(1);
+    }
+
+    const uint32_t magic =
+        *static_cast<const uint32_t*>(payload.front().iov_base);
+
+    for (const auto d : kDecompressors) {
+        if (d.magic == magic) {
+            return d.decompress(payload, decompressed_length);
+        }
+    }
+
+    fprintf(stderr, "compressed payload magic number %#x not recognized\n",
+            magic);
+    exit(1);
+}
+
+std::unique_ptr<std::byte[]> DecompressLz4(
+    const std::list<const iovec>& payload, uint32_t decompressed_length) {
     auto buffer = std::make_unique<std::byte[]>(decompressed_length);
 
     LZ4F_decompressionContext_t ctx;
-    LZ4F_CALL(LZ4F_createDecompressionContext, &ctx, LZ4F_VERSION);
+    Lz4Call(LZ4F_createDecompressionContext, &ctx, LZ4F_VERSION);
+    auto cleanup = fbl::MakeAutoCall(
+        [&]() { Lz4Call(LZ4F_freeDecompressionContext, ctx); });
 
     std::byte* dst = buffer.get();
     size_t dst_size = decompressed_length;
@@ -569,8 +888,9 @@ std::unique_ptr<std::byte[]> Decompress(const std::list<const iovec>& payload,
             }
 
             size_t nwritten = dst_size, nread = src_size;
-            LZ4F_CALL(LZ4F_decompress, ctx, dst, &nwritten, src, &nread,
-                      &kDecompressOpt);
+            static constexpr const LZ4F_decompressOptions_t kDecompressOpt{};
+            Lz4Call(LZ4F_decompress, ctx, dst, &nwritten, src, &nread,
+                    &kDecompressOpt);
 
             assert(nread <= src_size);
             src += nread;
@@ -588,14 +908,60 @@ std::unique_ptr<std::byte[]> Decompress(const std::list<const iovec>& payload,
         exit(1);
     }
 
-    LZ4F_CALL(LZ4F_freeDecompressionContext, ctx);
+    return buffer;
+}
+
+std::unique_ptr<std::byte[]> DecompressZstd(
+    const std::list<const iovec>& payload, uint32_t decompressed_length) {
+    auto buffer = std::make_unique<std::byte[]>(decompressed_length);
+
+    auto stream = ZSTD_createDStream();
+    if (!stream) {
+        fprintf(stderr, "out of memory\n");
+        exit(1);
+    }
+    auto cleanup =
+        fbl::MakeAutoCall([&]() {
+            ZstdCall("free", ZSTD_freeDStream, stream);
+        });
+
+    ZstdCall("init", ZSTD_initDStream, stream);
+
+    ZSTD_outBuffer out = {
+        buffer.get(),
+        decompressed_length,
+        0,
+    };
+    for (const auto& iov : payload) {
+        ZSTD_inBuffer in = {
+            iov.iov_base,
+            iov.iov_len,
+            0,
+        };
+        while (in.pos < in.size) {
+            if (out.pos == out.size) {
+                fprintf(stderr, "decompression produced too much data\n");
+                exit(1);
+            }
+            ZstdCall("decompress", ZSTD_decompressStream, stream, &out, &in);
+        }
+    }
+    if (out.pos < out.size) {
+        fprintf(stderr,
+                "decompression produced too little data by %zu bytes\n",
+                out.size - out.pos);
+        exit(1);
+    }
 
     return buffer;
 }
 
-#undef LZ4F_CALL
+template <typename T>
+std::size_t HashValue(const T& x) {
+    return std::hash<std::decay_t<T>>()(x);
+}
 
-class FileContents {
+class FileContents final {
 public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(FileContents);
     FileContents() = default;
@@ -639,6 +1005,23 @@ public:
     size_t exact_size() const { return exact_size_; }
     size_t mapped_size() const { return mapped_size_; }
 
+    // Equality means pointer equality, so two separately-reached
+    // slices of the same piece of an input BOOTFS, for example.
+    bool operator==(const FileContents& other) const {
+        return (exact_size() == other.exact_size() &&
+                mapped_ == other.mapped_);
+    }
+
+    bool operator!=(const FileContents& other) const {
+        return !(*this == other);
+    }
+
+    struct Hash {
+        std::size_t operator()(const FileContents& file) const {
+            return HashValue(file.mapped_);
+        }
+    };
+
     static FileContents Map(const fbl::unique_fd& fd,
                             const struct stat& st,
                             const char* filename) {
@@ -674,6 +1057,7 @@ public:
         return result;
     }
 
+    const iovec View() const { return View(0, exact_size()); }
     const iovec View(size_t offset, size_t length) const {
         assert(offset <= exact_size_);
         assert(exact_size_ - offset >= length);
@@ -693,260 +1077,343 @@ private:
     bool owned_ = true;
 };
 
-class FileOpener {
+// File represents one node in the BOOTFS directory graph.  It holds either a
+// FileContents (for a file) or a Directory (for a directory).
+class File;
+
+// Directory represents a subdirectory in the BOOTFS directory graph.
+// It maps names (with no slashes) to File nodes.
+using Directory = std::map<std::string, const File*>;
+
+class File final {
+public:
+    File() = default;
+
+    explicit File(std::unique_ptr<const FileContents> file)
+        : file_(std::move(file)) {}
+
+    explicit File(std::unique_ptr<Directory> dir)
+        : dir_(std::move(dir)) {}
+
+    operator bool() const {
+        return dir_ || file_;
+    }
+
+    bool operator==(const File& other) const {
+        assert(!dir_);
+        assert(!other.dir_);
+        return *file_ == *other.file_;
+    }
+
+    bool operator!=(const File& other) const {
+        return !(*this == other);
+    }
+
+    struct Hash {
+        std::size_t operator()(const File& file) const {
+            assert(!file.dir_);
+            return FileContents::Hash()(*file.file_);
+        }
+    };
+
+    bool IsDir() const {
+        return bool(dir_);
+    }
+
+    auto AsDir() const {
+        return dir_.get();
+    }
+
+    auto AsContents() const {
+        return file_.get();
+    }
+
+private:
+    std::unique_ptr<const FileContents> file_;
+    std::unique_ptr<Directory> dir_;
+};
+
+// Treat a Directory tree like a list of leaves.
+class DirectoryTree final {
+public:
+    DirectoryTree(Directory* root)
+        : root_(root) {}
+
+    class const_iterator {
+    public:
+        using value_type = std::pair<std::filesystem::path, const File*>;
+
+        const_iterator() = default;
+
+        bool operator==(const const_iterator& other) const {
+            if (other.pos_.empty()) {
+                return pos_.empty();
+            }
+            return !pos_.empty() && pos_.front().pos == other.pos_.front().pos;
+        }
+
+        bool operator!=(const const_iterator& other) const {
+            return !(*this == other);
+        }
+
+        value_type operator*() const {
+            return {std::accumulate(pos_.crbegin(), pos_.crend(),
+                                    std::filesystem::path(),
+                                    [](const auto& acc, const auto& elt) {
+                                        return acc / elt.pos->first;
+                                    }),
+                    pos_.front().pos->second};
+        }
+
+        const_iterator& operator++() {
+            ++pos_.front().pos;
+            AfterAdvance();
+            return *this;
+        }
+
+        // Remove the current entry from its directory and advance past it.
+        void Remove() {
+            pos_.front().pos = pos_.front().dir->erase(pos_.front().pos);
+            AfterAdvance();
+        }
+
+    private:
+        struct DirectoryPosition {
+            Directory* dir = nullptr;
+            Directory::iterator pos;
+        };
+        std::list<DirectoryPosition> pos_;
+
+        // Only DirectoryTree can use the non-default constructor.
+        friend DirectoryTree;
+        explicit const_iterator(Directory* dir) {
+            Descend(dir);
+            AfterAdvance();
+        }
+
+        void Descend(Directory* dir) {
+            pos_.push_front({dir, dir->begin()});
+        }
+
+        // If the current entry is a directory, go down a level.
+        // The iterator never yields a directory, only a leaf file.
+        bool DescendIfDirectory() {
+            const File* current_entry = pos_.front().pos->second;
+            if (current_entry->IsDir()) {
+                Descend(current_entry->AsDir());
+                return true;
+            }
+            return false;
+        }
+
+        void AfterAdvance() {
+            do {
+                // While the current position is at the end of its directory,
+                // go up a level and advance.
+                while (pos_.front().pos == pos_.front().dir->end()) {
+                    pos_.pop_front();
+                    if (pos_.empty()) {
+                        return;
+                    }
+                    ++pos_.front().pos;
+                }
+                // Descend and iterate if now at a directory.
+            } while (DescendIfDirectory());
+        }
+    };
+    using iterator = const_iterator;
+
+    const_iterator begin() const { return const_iterator(root_); }
+    const_iterator end() const { return {}; }
+
+private:
+    Directory* root_;
+};
+
+struct PathHash final {
+    std::size_t operator()(const std::filesystem::path& file) const {
+        return HashValue(file.native());
+    }
+};
+
+// This is used for all opening of files and directories for input.
+// It tracks all files opened so a depfile can be written at the end.
+//
+// The opener caches FileContents objects representing every file mapped
+// in.  These objects live in the cache for the lifetime of the opener.
+// Opener methods return const FileContents* raw pointers to indicate
+// they are never owned by the caller.
+//
+// The opener caches on multiple levels:
+//  * input file names are cached so reuse doesn't hit the filesystem at all
+//  * opened files' contents are cached by file identity so multiple
+//    input file names reaching the same actual file (via different
+//    unnormalized paths or links) reuse the same mapped contents
+//  * directories read are cached fully
+//  * TODO(mcgrathr): identical contents from disparate sources
+class FileOpener final {
 public:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(FileOpener);
     FileOpener() = default;
 
-    void Init(const char* output_file, const char* depfile) {
+    template <typename T>
+    void ChangeDirectory(const T& dir) {
+        cwd_ /= dir;
+    }
+
+    // The returned FileContents is cached and lives forever (for the lifetime
+    // of the FileOpener).
+    const FileContents* OpenFile(std::filesystem::path file) {
+        file.make_preferred();
+        auto& cache = name_cache_[file];
+        if (!cache) {
+            struct stat st;
+            auto [cached_file, fd] = Open(file, &st);
+            OpenFile(cached_file, std::move(fd), st, file);
+            cache = cached_file;
+        }
+        return cache->AsContents();
+    }
+
+    // Like OpenFile, but also accept a directory.
+    const File* OpenFileOrDir(std::filesystem::path file) {
+        file.make_preferred();
+        auto& cache = name_cache_[file];
+        if (!cache) {
+            struct stat st;
+            auto [cached_file, fd] = Open(file, &st);
+            if (S_ISDIR(st.st_mode)) {
+                OpenDirectory(cached_file, std::move(fd), std::move(file));
+            } else {
+                OpenFile(cached_file, std::move(fd), st, std::move(file));
+            }
+            cache = cached_file;
+        }
+        return cache;
+    }
+
+    // Construct a new "unowned" FileContents in place.  The returned
+    // pointer lives for the lifetime of the FileOpener.  Hence, the
+    // true owner of the data this FileContents points to must be kept
+    // alive for the lifetime of the FileOpener.
+    template <typename... Args>
+    const File* Emplace(Args&&... args) {
+        auto [it, fresh] = memory_cache_.emplace(
+            std::make_unique<FileContents>(std::forward<Args>(args)...));
+        return &*it;
+    }
+
+    void WriteDepfile(const char* output_file, const char* depfile) {
         if (depfile) {
-            depfile_ = fopen(depfile, "w");
-            if (!depfile_) {
+            auto f = fopen(depfile, "w");
+            if (!f) {
                 perror(depfile);
                 exit(1);
             }
-            fprintf(depfile_, "%s:", output_file);
+            fprintf(f, "%s:", output_file);
+            for (const auto& [file, _] : name_cache_) {
+                fprintf(f, " %s", file.c_str());
+            }
+            putc('\n', f);
+            fclose(f);
         }
     }
 
-    fbl::unique_fd Open(const char* file, struct stat* st = nullptr) {
-        fbl::unique_fd fd(open(file, O_RDONLY));
+private:
+    class FileId final {
+    public:
+        explicit FileId(const struct stat& st)
+            : dev_(st.st_dev), ino_(st.st_ino) {}
+
+        bool operator==(const FileId& other) const {
+            return dev_ == other.dev_ && ino_ == other.ino_;
+        }
+
+        bool operator!=(const FileId& other) const {
+            return !(*this == other);
+        }
+
+        bool operator<(const FileId& other) const {
+            return (dev_ < other.dev_ ||
+                    (dev_ == other.dev_ && ino_ < other.ino_));
+        }
+
+    private:
+        decltype((struct stat){}.st_dev) dev_;
+        decltype((struct stat){}.st_ino) ino_;
+    };
+
+    // Cache of contents by file identity.  The cache owns the File
+    // objects, so they all live forever and raw const File* pointers
+    // are used to access them.
+    std::map<FileId, File> file_cache_;
+
+    // Cache of contents by file name.  These point into the file_cache_.
+    std::unordered_map<std::filesystem::path, const File*,
+                       PathHash>
+        name_cache_;
+
+    // These are created by Emplace() and kept here both to de-duplicate them
+    // and to tie their lifetimes to the FileOpener (to parallel file_cache_).
+    // De-duplication here only actually occurs for files extracted from an
+    // input BOOTFS in Item::ReadBootFS in case the input filesystem used
+    // "hard links" (i.e. multiple directory entries pointing to the same
+    // region of the image).
+    std::unordered_set<File, File::Hash> memory_cache_;
+
+    // State of -C switches.
+    std::filesystem::path cwd_{"."};
+
+    std::pair<File*, fbl::unique_fd> Open(const std::filesystem::path& file,
+                                          struct stat* st) {
+        auto path = cwd_ / file;
+        fbl::unique_fd fd(open(path.c_str(), O_RDONLY));
         if (!fd) {
-            perror(file);
+            perror(file.c_str());
             exit(1);
         }
-        if (st && fstat(fd.get(), st) < 0) {
+        if (fstat(fd.get(), st) < 0) {
             perror("fstat");
             exit(1);
         }
-        if (depfile_) {
-            fprintf(depfile_, " %s", file);
-        }
-        return fd;
+        return {&file_cache_[FileId(*st)], std::move(fd)};
     }
 
-    fbl::unique_fd Open(const std::string& file, struct stat* st = nullptr) {
-        return Open(file.c_str(), st);
-    }
-
-    ~FileOpener() {
-        if (depfile_) {
-            fputc('\n', depfile_);
-            fclose(depfile_);
-        }
-    }
-
-private:
-    FILE* depfile_ = nullptr;
-};
-
-void RequireRegularFile(const struct stat& st, const char* file) {
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "%s: not a regular file\n", file);
-        exit(1);
-    }
-}
-
-class GroupFilter {
-public:
-    DISALLOW_COPY_ASSIGN_AND_MOVE(GroupFilter);
-    GroupFilter() = default;
-
-    void SetFilter(const char* groups) {
-        if (!strcmp(groups, "all")) {
-            groups_.reset();
-        } else {
-            not_ = groups[0] == '!';
-            if (not_) {
-                ++groups;
-            }
-            groups_ = std::make_unique<std::set<std::string>>();
-            while (const char* p = strchr(groups, ',')) {
-                groups_->emplace(groups, p - groups);
-                groups = p + 1;
-            }
-            groups_->emplace(groups);
-        }
-    }
-
-    bool AllowsUnspecified() const {
-        return !groups_ || not_;
-    }
-
-    bool Allows(const std::string& group) const {
-        return !groups_ || (groups_->find(group) == groups_->end()) == not_;
-    }
-
-private:
-    std::unique_ptr<std::set<std::string>> groups_;
-    bool not_ = false;
-};
-
-// Base class for ManifestInputFileGenerator and DirectoryInputFileGenerator.
-// These both deliver target name -> file contents mappings until they don't.
-struct InputFileGenerator {
-    struct value_type {
-        std::string target;
-        FileContents file;
-    };
-    virtual ~InputFileGenerator() = default;
-    virtual bool Next(FileOpener*, const std::string& prefix, value_type*) = 0;
-};
-
-using InputFileGeneratorList =
-    std::deque<std::unique_ptr<InputFileGenerator>>;
-
-class ManifestInputFileGenerator : public InputFileGenerator {
-public:
-    ManifestInputFileGenerator(FileContents file, std::string prefix,
-                               const GroupFilter* filter)
-        : file_(std::move(file)), prefix_(std::move(prefix)), filter_(filter) {
-        read_ptr_ = static_cast<const char*>(
-            file_.View(0, file_.exact_size()).iov_base);
-        eof_ = read_ptr_ + file_.exact_size();
-    }
-
-    ~ManifestInputFileGenerator() override = default;
-
-    bool Next(FileOpener* opener, const std::string& prefix,
-              value_type* value) override {
-        while (read_ptr_ != eof_) {
-            auto eol = static_cast<const char*>(
-                memchr(read_ptr_, '\n', eof_ - read_ptr_));
-            auto line = read_ptr_;
-            if (eol) {
-                read_ptr_ = eol + 1;
-            } else {
-                read_ptr_ = eol = eof_;
-            }
-            auto eq = static_cast<const char*>(memchr(line, '=', eol - line));
-            if (!eq) {
-                fprintf(stderr, "manifest entry has no '=' separator: %.*s\n",
-                        static_cast<int>(eol - line), line);
-                exit(1);
-            }
-
-            line = AllowEntry(line, eq, eol);
-            if (line) {
-                std::string target(line, eq - line);
-                std::string source(eq + 1, eol - (eq + 1));
-                struct stat st;
-                auto fd = opener->Open(source, &st);
-                RequireRegularFile(st, source.c_str());
-                auto file = FileContents::Map(fd, st, source.c_str());
-                *value = value_type{prefix + target, std::move(file)};
-                return true;
-            }
-        }
-        return false;
-    }
-
-private:
-    FileContents file_;
-    const std::string prefix_;
-    const GroupFilter* filter_ = nullptr;
-    const char* read_ptr_ = nullptr;
-    const char* eof_ = nullptr;
-
-    // Returns the beginning of the `target=source` portion of the entry
-    // if the entry is allowed by the filter, otherwise nullptr.
-    const char* AllowEntry(const char* start, const char* eq, const char* eol) {
-        if (*start != '{') {
-            // This entry doesn't specify a group.
-            return filter_->AllowsUnspecified() ? start : nullptr;
-        }
-        auto end_group = static_cast<const char*>(
-            memchr(start + 1, '}', eq - start));
-        if (!end_group) {
-            fprintf(stderr,
-                    "manifest entry has '{' but no '}': %.*s\n",
-                    static_cast<int>(eol - start), start);
+    void OpenFile(File* cached,
+                  fbl::unique_fd fd, const struct stat& st,
+                  std::filesystem::path file) {
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "%s: not a regular file\n", file.c_str());
             exit(1);
         }
-        std::string group(start + 1, end_group - 1 - start);
-        return filter_->Allows(group) ? end_group + 1 : nullptr;
-    }
-};
-
-class DirectoryInputFileGenerator : public InputFileGenerator {
-public:
-    DirectoryInputFileGenerator(fbl::unique_fd fd, std::string prefix)
-        : source_prefix_(std::move(prefix)) {
-        walk_pos_.emplace_front(MakeUniqueDir(std::move(fd)), 0);
+        *cached =
+            File(std::make_unique<const FileContents>(
+                FileContents::Map(std::move(fd), st, file.c_str())));
     }
 
-    ~DirectoryInputFileGenerator() override = default;
-
-    bool Next(FileOpener* opener, const std::string& prefix,
-              value_type* value) override {
-        do {
-            const dirent* d = readdir(walk_pos_.front().dir.get());
-            if (!d) {
-                Ascend();
-                continue;
-            }
-            if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, "..")) {
-                continue;
-            }
-            std::string target = prefix + walk_prefix_ + d->d_name;
-            std::string source = source_prefix_ + walk_prefix_ + d->d_name;
-            struct stat st;
-            auto fd = opener->Open(source, &st);
-            if (S_ISDIR(st.st_mode)) {
-                Descend(std::move(fd), d->d_name);
-            } else {
-                RequireRegularFile(st, source.c_str());
-                auto file = FileContents::Map(std::move(fd), st,
-                                              source.c_str());
-                *value = value_type{std::move(target), std::move(file)};
-                return true;
-            }
-        } while (!walk_pos_.empty());
-        return false;
-    }
-
-private:
-    // std::unique_ptr for fdopendir/closedir.
-    static void DeleteUniqueDir(DIR* dir) {
-        closedir(dir);
-    }
-    using UniqueDir = std::unique_ptr<DIR, decltype(&DeleteUniqueDir)>;
-    UniqueDir MakeUniqueDir(fbl::unique_fd fd) {
+    void OpenDirectory(File* cached, fbl::unique_fd fd,
+                       std::filesystem::path file) {
         DIR* dir = fdopendir(fd.release());
         if (!dir) {
             perror("fdopendir");
             exit(1);
         }
-        return UniqueDir(dir, &DeleteUniqueDir);
-    }
-
-    // State of our depth-first directory tree walk.
-    struct WalkState {
-        WalkState(UniqueDir d, size_t len)
-            : dir(std::move(d)), parent_prefix_len(len) {
+        auto dirmap = std::make_unique<Directory>();
+        const dirent* d;
+        while ((d = readdir(dir)) != nullptr) {
+            if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, "..")) {
+                continue;
+            }
+            file /= d->d_name;
+            (*dirmap)[d->d_name] = OpenFileOrDir(file);
+            file.remove_filename();
         }
-        UniqueDir dir;
-        size_t parent_prefix_len;
-    };
-
-    const std::string source_prefix_;
-    std::forward_list<WalkState> walk_pos_;
-    std::string walk_prefix_;
-
-    void Descend(fbl::unique_fd fd, const char* name) {
-        size_t parent = walk_prefix_.size();
-        walk_prefix_ += name;
-        walk_prefix_ += "/";
-        walk_pos_.emplace_front(MakeUniqueDir(std::move(fd)), parent);
-    }
-
-    void Ascend() {
-        walk_prefix_.resize(walk_pos_.front().parent_prefix_len);
-        walk_pos_.pop_front();
+        closedir(dir);
+        *cached = File(std::move(dirmap));
     }
 };
 
-class Item {
+class Item final {
 public:
     // Only the static methods below can create an Item.
     Item() = delete;
@@ -968,24 +1435,25 @@ public:
         return sscanf(name, "%x%n", abi_type, &i) == 1 && name[i] == '\0';
     }
 
-    static std::string ExtractedFileName(unsigned int n, uint32_t zbi_type,
-                                         bool raw) {
-        std::string name;
+    static std::filesystem::path ExtractedFileName(
+        unsigned int n, uint32_t zbi_type, bool raw) {
+        std::filesystem::path path;
         char buf[32];
         const auto info = ItemTypeInfo(zbi_type);
         if (info.name) {
             snprintf(buf, sizeof(buf), "%03u.", n);
-            name = buf;
+            std::string name(buf);
             name += info.name;
             for (auto& c : name) {
                 c = static_cast<unsigned char>(std::tolower(c));
             }
+            path = std::move(name);
         } else {
             snprintf(buf, sizeof(buf), "%03u.%08x", n, zbi_type);
-            name = buf;
+            path = buf;
         }
-        name += (raw && info.extension) ? info.extension : ".zbi";
-        return name;
+        return path.replace_extension(
+            (raw && info.extension) ? info.extension : ".zbi");
     }
 
     static void PrintTypeUsage(FILE* out) {
@@ -1097,15 +1565,11 @@ Extracted items use the file names shown below:\n\
     void OwnBuffer(std::unique_ptr<std::byte[]> buffer) {
         buffers_.push_front(std::move(buffer));
     }
-    void OwnFile(FileContents file) {
-        files_.push_front(std::move(file));
-    }
 
     // Consume another Item while keeping its owned buffers and files alive.
     void TakeOwned(ItemPtr other) {
         if (other) {
             buffers_.splice_after(buffers_.before_begin(), other->buffers_);
-            files_.splice_after(files_.before_begin(), other->files_);
         }
     }
 
@@ -1131,11 +1595,14 @@ Extracted items use the file names shown below:\n\
 
     // Create from raw file contents.
     static ItemPtr CreateFromFile(
-        FileContents file, uint32_t type, bool compress) {
+        const File* filenode, uint32_t type, Compressor::Config compress) {
         bool null_terminate = type == ZBI_TYPE_CMDLINE;
-        compress = compress && TypeIsStorage(type);
+        if (!TypeIsStorage(type)) {
+            compress.clear();
+        }
 
-        size_t size = file.exact_size() + (null_terminate ? 1 : 0);
+        const auto file = filenode->AsContents();
+        size_t size = file->exact_size() + (null_terminate ? 1 : 0);
         if (size > UINT32_MAX) {
             fprintf(stderr, "input file too large\n");
             exit(1);
@@ -1145,125 +1612,102 @@ Extracted items use the file names shown below:\n\
 
         // If we need some zeros, see if they're already right there
         // in the last mapped page past the exact end of the file.
-        if (size <= file.mapped_size()) {
+        if (size <= file->mapped_size()) {
             // Use the padding that's already there.
-            item->payload_.emplace_front(file.PageRoundedView(0, size));
+            item->payload_.emplace_front(file->PageRoundedView(0, size));
         } else {
             // No space, so we need a separate padding buffer.
             if (null_terminate) {
                 item->payload_.emplace_front(Iovec("", 1));
             }
-            item->payload_.emplace_front(file.View(0, file.exact_size()));
+            item->payload_.emplace_front(file->View());
         }
 
         if (!compress) {
             // Compute the checksum now so the item is ready to write out.
             Checksummer crc;
-            crc.Write(file.View(0, file.exact_size()));
+            crc.Write(file->View());
             if (null_terminate) {
                 crc.Write(Iovec("", 1));
             }
             crc.FinalizeHeader(&item->header_);
         }
 
-        // The item now owns the file mapping that its payload points into.
-        item->OwnFile(std::move(file));
-
         return item;
     }
 
     // Create from an existing fully-baked item in an input file.
-    static ItemPtr CreateFromItem(const FileContents& file,
+    static ItemPtr CreateFromItem(const FileContents* file,
                                   uint32_t offset) {
-        if (offset > file.exact_size() ||
-            file.exact_size() - offset < sizeof(zbi_header_t)) {
+        if (offset > file->exact_size() ||
+            file->exact_size() - offset < sizeof(zbi_header_t)) {
             fprintf(stderr, "input file too short for next header\n");
             exit(1);
         }
         const zbi_header_t* header = static_cast<const zbi_header_t*>(
-            file.View(offset, sizeof(zbi_header_t)).iov_base);
+            file->View(offset, sizeof(zbi_header_t)).iov_base);
         offset += sizeof(zbi_header_t);
-        if (file.exact_size() - offset < header->length) {
+        if (file->exact_size() - offset < header->length) {
             fprintf(stderr, "input file too short for payload of %u bytes\n",
                     header->length);
             exit(1);
         }
         auto item = MakeItem(*header);
-        item->payload_.emplace_front(file.View(offset, header->length));
+        item->payload_.emplace_front(file->View(offset, header->length));
         return item;
     }
 
     // Create by decompressing a fully-baked item that is compressed.
-    static ItemPtr CreateFromCompressed(const Item& compressed) {
+    static ItemPtr CreateFromCompressed(
+        const Item& compressed,
+        Compressor::Config compress = Compressor::Config::None()) {
         assert(compressed.AlreadyCompressed());
-        auto item = MakeItem(compressed.header_);
+        auto item = MakeItem(compressed.header_, compress);
         item->header_.flags &= ~ZBI_FLAG_STORAGE_COMPRESSED;
         item->header_.length = item->header_.extra;
         auto buffer = Decompress(compressed.payload_, item->header_.length);
         item->payload_.emplace_front(
             Iovec(buffer.get(), item->header_.length));
         item->OwnBuffer(std::move(buffer));
+        if (compress) {
+            // This item will be compressed afresh on output.
+            item->header_.flags |= ZBI_FLAG_STORAGE_COMPRESSED;
+        }
         return item;
     }
 
     // Same, but consumes the compressed item while keeping its
     // owned buffers alive in the new uncompressed item.
-    static ItemPtr CreateFromCompressed(ItemPtr compressed) {
-        auto uncompressed = CreateFromCompressed(*compressed);
+    static ItemPtr CreateFromCompressed(
+        ItemPtr compressed,
+        Compressor::Config compress = Compressor::Config::None()) {
+        auto uncompressed = CreateFromCompressed(*compressed, compress);
         uncompressed->TakeOwned(std::move(compressed));
         return uncompressed;
     }
 
     // Create a BOOTFS item.
-    template <typename Filter>
-    static ItemPtr CreateBootFS(FileOpener* opener,
-                                const InputFileGeneratorList& input,
-                                const Filter& include_file,
-                                bool sort,
-                                const std::string& prefix,
-                                bool compress) {
+    static ItemPtr CreateBootFS(Directory* root, Compressor::Config compress) {
         auto item = MakeItem(NewHeader(ZBI_TYPE_STORAGE_BOOTFS, 0), compress);
 
-        // Collect the names and exact sizes here and the contents in payload_.
-        struct Entry {
-            std::string name;
-            uint32_t data_len = 0;
-        };
-        std::deque<Entry> entries;
-        size_t dirsize = 0, bodysize = 0;
-        for (const auto& generator : input) {
-            InputFileGenerator::value_type next;
-            while (generator->Next(opener, prefix, &next)) {
-                if (!include_file(next.target.c_str())) {
-                    continue;
-                }
-                // Accumulate the space needed for each zbi_bootfs_dirent_t.
-                dirsize += ZBI_BOOTFS_DIRENT_SIZE(next.target.size() + 1);
-                Entry entry;
-                entry.name.swap(next.target);
-                entry.data_len = static_cast<uint32_t>(next.file.exact_size());
-                if (entry.data_len != next.file.exact_size()) {
-                    fprintf(stderr,
-                            "input file size exceeds format maximum\n");
-                    exit(1);
-                }
-                uint32_t size = ZBI_BOOTFS_PAGE_ALIGN(entry.data_len);
-                bodysize += size;
-                item->payload_.emplace_back(
-                    next.file.PageRoundedView(0, size));
-                entries.push_back(std::move(entry));
-                item->OwnFile(std::move(next.file));
-            }
+        // Collect the names and contents, calculating the final directory size.
+        std::vector<std::pair<std::string, const FileContents*>> entries;
+        std::unordered_map<const FileContents*, uint32_t> files;
+        size_t dirsize = 0;
+
+        for (const auto& [path, file] : DirectoryTree{root}) {
+            auto name = path.generic_string();
+            const auto contents = file->AsContents();
+
+            // Accumulate the space needed for each zbi_bootfs_dirent_t.
+            dirsize += ZBI_BOOTFS_DIRENT_SIZE(name.size() + 1);
+
+            entries.emplace_back(std::move(name), contents);
+            files.emplace(contents, 0);
         }
 
-        if (sort) {
-            std::sort(entries.begin(), entries.end(),
-                      [](const Entry& a, const Entry& b) {
-                          return a.name < b.name;
-                      });
-        }
-
-        // Now we can calculate the final sizes.
+        // Now fill a buffer with the BOOTFS header and directory entries,
+        // appending each unique file to the payload.
         const zbi_bootfs_header_t header = {
             ZBI_BOOTFS_MAGIC,               // magic
             static_cast<uint32_t>(dirsize), // dirsize
@@ -1271,34 +1715,50 @@ Extracted items use the file names shown below:\n\
             0,                              // reserved1
         };
         size_t header_size = ZBI_BOOTFS_PAGE_ALIGN(sizeof(header) + dirsize);
-        item->header_.length = static_cast<uint32_t>(header_size + bodysize);
-        if (item->header_.length != header_size + bodysize) {
-            fprintf(stderr, "BOOTFS image size exceeds format maximum\n");
-            exit(1);
-        }
-
-        // Now fill a buffer with the BOOTFS header and directory entries.
         AppendBuffer buffer(header_size);
         buffer.Append(&header);
         uint32_t data_off = static_cast<uint32_t>(header_size);
-        for (const auto& file : item->payload_) {
-            const auto& entry = entries.front();
+        for (const auto& [name, contents] : entries) {
+            // Place the file contents if this is the first name for them.
+            uint32_t* location = &files[contents];
+            if (*location == 0) {
+                size_t layout_size =
+                    ((contents->exact_size() + ZBI_BOOTFS_PAGE_SIZE - 1) &
+                     -size_t{ZBI_BOOTFS_PAGE_SIZE});
+                if (layout_size > std::numeric_limits<uint32_t>::max()) {
+                    fprintf(stderr,
+                            "input file size exceeds format maximum\n");
+                    exit(1);
+                }
+                if (data_off + layout_size >
+                    std::numeric_limits<uint32_t>::max()) {
+                    fprintf(stderr,
+                            "BOOTFS image size exceeds format maximum\n");
+                    exit(1);
+                }
+                *location = data_off;
+                data_off += layout_size;
+                item->payload_.emplace_back(
+                    contents->PageRoundedView(0, layout_size));
+            }
+
+            // Emit the directory entry.
             const zbi_bootfs_dirent_t entry_hdr = {
-                static_cast<uint32_t>(entry.name.size() + 1), // name_len
-                entry.data_len,                               // data_len
-                data_off,                                     // data_off
+                static_cast<uint32_t>(name.size() + 1),        // name_len
+                static_cast<uint32_t>(contents->exact_size()), // data_len
+                *location,                                     // data_off
             };
-            data_off += static_cast<uint32_t>(file.iov_len);
             buffer.Append(&entry_hdr);
-            buffer.Append(entry.name.c_str(), entry_hdr.name_len);
+            buffer.Append(name.c_str(), entry_hdr.name_len);
             buffer.Pad(
                 ZBI_BOOTFS_DIRENT_SIZE(entry_hdr.name_len) -
                 offsetof(zbi_bootfs_dirent_t, name[entry_hdr.name_len]));
-            entries.pop_front();
         }
-        assert(data_off == item->header_.length);
         // Zero fill to the end of the page.
         buffer.Pad(header_size - buffer.size());
+
+        // Only now do we know the total size of the image.
+        item->header_.length = data_off;
 
         if (!compress) {
             // Checksum the BOOTFS image right now: header and then payload.
@@ -1315,27 +1775,32 @@ Extracted items use the file names shown below:\n\
         return item;
     }
 
-    // The generator consumes the Item.  The FileContents it generates
-    // point into the Item's storage, so the generator must be kept
-    // alive as long as any of those FileContents is alive.
+    // Returns [iterator, owner] where `owner` must be kept alive as long as
+    // any of the FileContents generated by the iterator is alive.
     static auto ReadBootFS(ItemPtr item) {
-        return std::unique_ptr<InputFileGenerator>(
-            new BootFSInputFileGenerator(std::move(item)));
+        if (item->AlreadyCompressed()) {
+            item = CreateFromCompressed(std::move(item));
+        }
+        BootFSDirectoryIterator it;
+        int status = BootFSDirectoryIterator::Create(item.get(), &it);
+        if (status) {
+            exit(status);
+        }
+        return std::make_pair(std::move(it), std::move(item));
     }
 
     void ExtractItem(FileWriter* writer, NameMatcher* matcher) {
-        std::string namestr = ExtractedFileName(writer->NextFileNumber(),
-                                                type(), false);
-        auto name = namestr.c_str();
+        auto path = ExtractedFileName(writer->NextFileNumber(),
+                                      type(), false);
+        auto name = path.c_str();
         if (matcher->Matches(name, true)) {
             WriteZBI(writer, name, (Item* const[]){this});
         }
     }
 
     void ExtractRaw(FileWriter* writer, NameMatcher* matcher) {
-        std::string namestr = ExtractedFileName(writer->NextFileNumber(),
-                                                type(), true);
-        auto name = namestr.c_str();
+        auto path = ExtractedFileName(writer->NextFileNumber(), type(), true);
+        auto name = path.c_str();
         if (matcher->Matches(name, true)) {
             if (type() == ZBI_TYPE_CMDLINE) {
                 // Drop a trailing NUL.
@@ -1392,14 +1857,27 @@ Extracted items use the file names shown below:\n\
         }
     }
 
+    static ItemPtr Recompress(ItemPtr item, Compressor::Config how) {
+        if (TypeIsStorage(item->type())) {
+            if (item->AlreadyCompressed()) {
+                item = CreateFromCompressed(std::move(item), how);
+            } else if (how) {
+                auto old = std::move(item);
+                item = MakeItem(old->header_, how);
+                std::swap(old->payload_, item->payload_);
+                std::swap(old->buffers_, item->buffers_);
+            }
+        }
+        return item;
+    }
+
 private:
     zbi_header_t header_;
     std::list<const iovec> payload_;
     // The payload_ items might point into these buffers.  They're just
     // stored here to own the buffers until the payload is exhausted.
-    std::forward_list<FileContents> files_;
     std::forward_list<std::unique_ptr<std::byte[]>> buffers_;
-    const bool compress_;
+    const Compressor::Config compress_;
 
     struct ItemTypeInfo {
         uint32_t type;
@@ -1411,7 +1889,6 @@ private:
         ZBI_ALL_TYPES(kITemTypes_Element)
 #undef kitemtypes_element
     };
-    ;
 
     static constexpr ItemTypeInfo ItemTypeInfo(uint32_t zbi_type) {
         for (const auto& t : kItemTypes_) {
@@ -1435,7 +1912,7 @@ private:
         };
     }
 
-    Item(const zbi_header_t& header, bool compress)
+    Item(const zbi_header_t& header, Compressor::Config compress)
         : header_(header), compress_(compress) {
         if (compress_) {
             // We'll compress and checksum on the way out.
@@ -1443,8 +1920,9 @@ private:
         }
     }
 
-    static ItemPtr MakeItem(const zbi_header_t& header,
-                            bool compress = false) {
+    static ItemPtr MakeItem(
+        const zbi_header_t& header,
+        Compressor::Config compress = Compressor::Config::None()) {
         return ItemPtr(new Item(header, compress));
     }
 
@@ -1465,7 +1943,7 @@ private:
 
     uint32_t StreamCompressed(OutputStream* out) {
         // Compress and checksum the payload.
-        Compressor compressor;
+        Compressor compressor(compress_);
         compressor.Init(out, header_);
         do {
             // The compressor streams the header and compressed payload out.
@@ -1517,7 +1995,7 @@ private:
         return static_cast<const std::byte*>(payload_.front().iov_base);
     }
 
-    class BootFSDirectoryIterator {
+    class BootFSDirectoryIterator final {
     public:
         operator bool() const {
             return left_ > 0;
@@ -1531,6 +2009,13 @@ private:
 
         const zbi_bootfs_dirent_t* operator->() const {
             return &**this;
+        }
+
+        auto Open(FileOpener* opener, Item* fs) const {
+            if (!fs->CheckBootFSDirent(**this, false)) {
+                exit(1);
+            }
+            return opener->Emplace(**this, fs->payload_data());
         }
 
         BootFSDirectoryIterator& operator++() {
@@ -1621,76 +2106,13 @@ private:
         }
         return status;
     }
-
-    class BootFSInputFileGenerator : public InputFileGenerator {
-    public:
-        explicit BootFSInputFileGenerator(ItemPtr item)
-            : item_(std::move(item)) {
-            if (item_->AlreadyCompressed()) {
-                item_ = CreateFromCompressed(std::move(item_));
-            }
-            int status = BootFSDirectoryIterator::Create(item_.get(), &dir_);
-            if (status != 0) {
-                exit(status);
-            }
-        }
-
-        ~BootFSInputFileGenerator() override = default;
-
-        // Copying from an existing BOOTFS ignores the --prefix setting.
-        bool Next(FileOpener*, const std::string&,
-                  value_type* value) override {
-            if (!dir_) {
-                return false;
-            }
-            if (!item_->CheckBootFSDirent(*dir_, false)) {
-                exit(1);
-            }
-            value->target = dir_->name;
-            value->file = FileContents(*dir_, item_->payload_data());
-            ++dir_;
-            return true;
-        }
-
-    private:
-        ItemPtr item_;
-        BootFSDirectoryIterator dir_;
-    };
 };
 
 constexpr decltype(Item::kItemTypes_) Item::kItemTypes_;
 
-using ItemList = std::vector<ItemPtr>;
-
-bool ImportFile(const FileContents& file, const char* filename,
-                ItemList* items) {
-    if (file.exact_size() <= (sizeof(zbi_header_t) * 2)) {
-        return false;
-    }
-    const zbi_header_t* header = static_cast<const zbi_header_t*>(
-        file.View(0, sizeof(zbi_header_t)).iov_base);
-    if (!(header->type == ZBI_TYPE_CONTAINER &&
-          header->extra == ZBI_CONTAINER_MAGIC &&
-          header->magic == ZBI_ITEM_MAGIC)) {
-        return false;
-    }
-    size_t file_size = file.exact_size() - sizeof(zbi_header_t);
-    if (file_size != header->length) {
-        fprintf(stderr, "%s: header size doesn't match file size\n", filename);
-        exit(1);
-    }
-    if (!Aligned(header->length)) {
-        fprintf(stderr, "ZBI item misaligned\n");
-        exit(1);
-    }
-    uint32_t pos = sizeof(zbi_header_t);
-    do {
-        auto item = Item::CreateFromItem(file, pos);
-        pos += item->TotalSize();
-        items->push_back(std::move(item));
-    } while (pos < file.exact_size());
-    return true;
-}
+// DirectoryTreeBuilder keeps pointers to elements, so this must be a
+// container with stable element pointers across insertions.
+using ItemList = std::deque<ItemPtr>;
 
 const uint32_t kImageArchUndefined = ZBI_TYPE_DISCARD;
 
@@ -1719,25 +2141,286 @@ const char* IncompleteImage(const ItemList& items, const uint32_t image_arch) {
     return nullptr;
 }
 
-constexpr const char kOptString[] = "-B:cd:e:FxXRg:hto:p:sT:uv";
+class DirectoryTreeBuilder final {
+public:
+    DISALLOW_COPY_ASSIGN_AND_MOVE(DirectoryTreeBuilder);
+    DirectoryTreeBuilder() = delete;
+
+    explicit DirectoryTreeBuilder(FileOpener* opener)
+        : opener_(opener) {}
+
+    Directory* tree() { return &tree_; }
+
+    void ReplaceFiles() { replace_ = true; }
+
+    const std::filesystem::path& SetPrefix(const std::filesystem::path& arg) {
+        if (arg.empty()) {
+            // Normalize to a nonempty prefix so /= works right.
+            // We'll normalize the concatenation before using it anyway.
+            prefix_ = ".";
+        } else {
+            prefix_ = arg.lexically_normal();
+        }
+        return prefix_;
+    }
+
+    // Note an input ZBI item in BOOTFS format.  The argument is a stable
+    // pointer to an element in the caller's ItemList.  We can freely null out
+    // the element now or on any later push_back or Insert call if we start
+    // building a directory tree.
+    void push_back(ItemPtr* item) {
+        const InputItem input{item, replace_};
+        if (tree_.empty()) {
+            // Just save the item for later.
+            items_.push_back(input);
+        } else {
+            // Already building a tree, so merge this right now.
+            Merge(input);
+        }
+    }
+
+    // Insert a file with complete target path, e.g. from a manifest entry.
+    void Insert(std::filesystem::path at, const File* file) {
+        Insert(std::move(at), file, replace_);
+    }
+
+    void ImportManifest(const FileContents& file, const char* manifest_name) {
+        auto root = std::make_unique<Directory>();
+
+        auto read_ptr = static_cast<const char*>(file.View().iov_base);
+        const auto eof = read_ptr + file.exact_size();
+        for (unsigned int ln = 1; read_ptr != eof; ++ln) {
+            auto eol = static_cast<const char*>(
+                memchr(read_ptr, '\n', eof - read_ptr));
+            auto line = read_ptr;
+            if (eol) {
+                read_ptr = eol + 1;
+            } else {
+                read_ptr = eol = eof;
+            }
+            auto eq = static_cast<const char*>(memchr(line, '=', eol - line));
+            if (!eq) {
+                fprintf(stderr,
+                        "%s:%u: manifest entry has no '=' separator: %.*s\n",
+                        manifest_name, ln, static_cast<int>(eol - line), line);
+                exit(1);
+            }
+            Insert({line, eq}, opener_->OpenFileOrDir({eq + 1, eol}),
+                   replace_);
+        }
+    }
+
+    void MergeRootDirectory(const Directory& dir) {
+        MergeDirectory(&tree_, ".", dir, replace_);
+    }
+
+private:
+    Directory tree_;
+    std::deque<File> built_dirs_;
+
+    struct InputItem {
+        // This points into the input items list and can be nulled out
+        // to elide the item when it gets merged into the tree.
+        ItemPtr* item;
+        // True if --replace preceded the item.
+        bool replace;
+    };
+    std::deque<InputItem> items_;
+
+    // This holds items that have been merged in.  They need to be kept
+    // alive here since the FileOpener now points into their contents.
+    std::forward_list<ItemPtr> merged_items_;
+
+    std::filesystem::path prefix_ = ".";
+    FileOpener* opener_;
+    bool replace_ = false;
+
+    static auto SubPath(const std::filesystem::path::const_iterator& first,
+                        const std::filesystem::path::const_iterator& last) {
+        return std::accumulate(first, last, std::filesystem::path(),
+                               std::divides<std::filesystem::path>());
+    }
+
+    // Insert a single node in a given directory.  Inserting a directory
+    // where one already exists recurses to merge the new directory into
+    // the existing one.  If file is nullptr then a new directory is
+    // created if needed.  Returns the file inserted (passed or new directory).
+    const File* Insert(Directory* dir, std::filesystem::path path,
+                       const std::string& name, const File* file,
+                       bool replace) {
+        if (name == "." || name == "..") {
+            fprintf(stderr, "%s: no . or .. allowed\n", (path / name).c_str());
+            exit(1);
+        }
+
+        if (!items_.empty()) {
+            // The new tree is being built, so old BOOTFS items must be merged.
+            Merge();
+        }
+
+        auto it = dir->try_emplace(name, file).first;
+        const auto old = it->second;
+        if (old != file) {
+            // There is already a different node at this name.
+            path /= name;
+            path = path.lexically_normal();
+            if (old->IsDir()) {
+                if (!file) {
+                    // Just creating an intermediate directory, so the
+                    // existing one is fine.
+                    return old;
+                } else if (file->IsDir()) {
+                    // Recurse on each entry in the incoming directory.
+                    MergeDirectory(old->AsDir(), path,
+                                   *file->AsDir(), replace);
+                    return old;
+                } else if (!replace) {
+                    fprintf(stderr, "\
+duplicate target path (directory vs file) without --replace: %s\n",
+                            path.c_str());
+                    exit(1);
+                }
+            } else if (!replace) {
+                fprintf(stderr,
+                        "duplicate target path without --replace: %s\n",
+                        path.c_str());
+                exit(1);
+            }
+        }
+
+        if (!file) {
+            // Make a new directory.
+            built_dirs_.emplace_back(std::make_unique<Directory>());
+            file = &built_dirs_.back();
+        }
+
+        // Replace the old file with the new one.
+        it->second = file;
+        return file;
+    }
+
+    void MergeDirectory(Directory* old, std::filesystem::path path,
+                        const Directory& dir, bool replace) {
+        for (const auto& [child, entry] : dir) {
+            Insert(old, path, child, entry, replace);
+        }
+    }
+
+    // Insert a file with complete target path, e.g. from a manifest entry.
+    void Insert(const std::filesystem::path& at, const File* file,
+                bool replace) {
+
+        Directory* dir = &tree_;
+        std::filesystem::path dirpath = ".";
+
+        const auto path = (prefix_ / at).lexically_normal();
+        auto it = path.begin();
+        while (true) {
+            const auto component = *it;
+            ++it;
+            if (it == path.end()) {
+                Insert(dir, dirpath, component, file, replace);
+                break;
+            }
+            dir = Insert(dir, dirpath, component, nullptr, replace)->AsDir();
+            dirpath /= component;
+        }
+    }
+
+    // Merge a single old BOOTFS item into the new directory tree.
+    void Merge(const InputItem& input) {
+        // Null out the list entry.
+        ItemPtr old;
+        input.item->swap(old);
+
+        // Iterate through individual files in the BOOTFS in whatever order.
+        auto [it, fs] = Item::ReadBootFS(std::move(old));
+        while (it) {
+            Insert(it->name, it.Open(opener_, fs.get()), input.replace);
+            ++it;
+        }
+
+        // Hold onto the item (original or decompressed version), since
+        // opener_->memory_cache_ now points into it.
+        merged_items_.push_front(std::move(fs));
+    }
+
+    // Merge all the old BOOTFS items into the new directory tree.
+    void Merge() {
+        // Clear the old list before any Insert calls reenter.
+        decltype(items_) items;
+        items_.swap(items);
+
+        // Merge each item;
+        while (!items.empty()) {
+            Merge(items.front());
+            items.pop_front();
+        }
+    }
+};
+
+bool ImportFile(const FileContents* file, const char* filename,
+                ItemList* items, DirectoryTreeBuilder* bootfs,
+                std::optional<Compressor::Config> recompress) {
+    if (file->exact_size() <= (sizeof(zbi_header_t) * 2)) {
+        return false;
+    }
+    const zbi_header_t* header = static_cast<const zbi_header_t*>(
+        file->View(0, sizeof(zbi_header_t)).iov_base);
+    if (!(header->type == ZBI_TYPE_CONTAINER &&
+          header->extra == ZBI_CONTAINER_MAGIC &&
+          header->magic == ZBI_ITEM_MAGIC)) {
+        return false;
+    }
+    size_t file_size = file->exact_size() - sizeof(zbi_header_t);
+    if (file_size != header->length) {
+        fprintf(stderr, "%s: header size doesn't match file size\n", filename);
+        exit(1);
+    }
+    if (!Aligned(header->length)) {
+        fprintf(stderr, "ZBI item misaligned\n");
+        exit(1);
+    }
+    uint32_t pos = sizeof(zbi_header_t);
+    do {
+        auto item = Item::CreateFromItem(file, pos);
+        pos += item->TotalSize();
+        if (recompress) {
+            item = Item::Recompress(std::move(item), *recompress);
+        }
+        items->push_back(std::move(item));
+        if (items->back()->type() == ZBI_TYPE_STORAGE_BOOTFS) {
+            bootfs->push_back(&items->back());
+        }
+    } while (pos < file->exact_size());
+    return true;
+}
+
+enum LongOnlyOpt : int {
+    kOptRecompress = 0x100,
+};
+
+constexpr const char kOptString[] = "-B:c::C:d:D:e:FxXRhto:p:T:uv";
 constexpr const option kLongOpts[] = {
     {"complete", required_argument, nullptr, 'B'},
-    {"compressed", no_argument, nullptr, 'c'},
+    {"compressed", optional_argument, nullptr, 'c'},
+    {"directory", required_argument, nullptr, 'C'},
     {"depfile", required_argument, nullptr, 'd'},
     {"entry", required_argument, nullptr, 'e'},
-    {"files", no_argument, nullptr, 'F'},
     {"extract", no_argument, nullptr, 'x'},
     {"extract-items", no_argument, nullptr, 'X'},
     {"extract-raw", no_argument, nullptr, 'R'},
-    {"groups", required_argument, nullptr, 'g'},
+    {"files", no_argument, nullptr, 'F'},
     {"help", no_argument, nullptr, 'h'},
     {"list", no_argument, nullptr, 't'},
     {"output", required_argument, nullptr, 'o'},
+    {"output-dir", required_argument, nullptr, 'D'},
     {"prefix", required_argument, nullptr, 'p'},
-    {"sort", no_argument, nullptr, 's'},
     {"type", required_argument, nullptr, 'T'},
     {"uncompressed", no_argument, nullptr, 'u'},
     {"verbose", no_argument, nullptr, 'v'},
+    {"recompress", no_argument, nullptr, kOptRecompress},
+    {"replace", no_argument, nullptr, 'r'},
     {nullptr, no_argument, nullptr, 0},
 };
 
@@ -1752,58 +2435,91 @@ Diagnostic switches:\n\
     --extract-items, -X            extract items as pseudo-files (see below)\n\
     --extract-raw, -R              extract original payloads, not ZBI format\n\
 \n\
-Output file switches must come before input arguments:\n\
+Output file switches:\n\
     --output=FILE, -o FILE         output file name\n\
     --depfile=FILE, -d FILE        makefile dependency output file name\n\
+    --output-dir=DIR, -D FILE      extracted files go under DIR (default: .)\n\
 \n\
 The `--output` FILE is always removed and created fresh after all input\n\
 files have been opened.  So it is safe to use the same file name as an input\n\
 file and the `--output` FILE, to append more items.\n\
 \n\
 Input control switches apply to subsequent input arguments:\n\
+    --directory=DIR, -C DIR        change directory to DIR\n\
     --files, -F                    read BOOTFS manifest files (default)\n\
-    --groups=GROUPS, -g GROUPS     comma-separated list of manifest groups\n\
     --prefix=PREFIX, -p PREFIX     prepend PREFIX/ to target file names\n\
+    --replace, -r                  duplicate target file name OK (see below)\n\
     --type=TYPE, -T TYPE           input files are TYPE items (see below)\n\
-    --compressed, -c               compress RAMDISK images (default)\n\
-    --uncompressed, -u             do not compress RAMDISK images\n\
+    --compressed[=HOW], -c [HOW]   compress storage images (see below)\n\
+    --uncompressed, -u             do not compress storage images\n\
+    --recompress                   recompress input items already compressed\n\
 \n\
 Input arguments:\n\
-    --entry=TEXT, -e  TEXT         like an input file containing only TEXT\n\
+    --entry=TEXT, -e TEXT          like an input file containing only TEXT\n\
     FILE                           input or manifest file\n\
     DIRECTORY                      directory tree copied to BOOTFS PREFIX/\n\
+\n\
+The `--directory` or `-C` switch affects subsequent input arguments but\n\
+it never affects output arguments, which are always relative to the original\n\
+current working directory (`zbi` doesn't actually do `chdir()` at all).\n\
 \n\
 With `--files` or `-F` (the default state), files with ZBI_TYPE_CONTAINER\n\
 headers are incomplete boot files and other files are BOOTFS manifest files.\n\
 Each DIRECTORY is listed recursively and handled just like a manifest file\n\
 using the path relative to DIRECTORY as the target name (before any PREFIX).\n\
-Each `--group`, `--prefix`, `-g`, or `-p` switch affects each file from a\n\
-manifest or directory in subsequent FILE or DIRECTORY arguments.\n\
-If GROUPS starts with `!` then only manifest entries that match none of\n\
-the listed groups are used.\n\
+Each `--prefix` or `-p` switch affects each file from a manifest or\n\
+directory in subsequent FILE, DIRECTORY, or TEXT arguments.\n\
 \n\
 With `--type` or `-T`, input files are treated as TYPE instead of manifest\n\
 files, and directories are not permitted.  See below for the TYPE strings.\n\
 \n\
+ZBI items from input ZBI files are normally emitted unchanged.  (However,\n\
+see below about BOOTFS items.)  With `--recompress`, input items of storage\n\
+types well be decompressed (if needed) on input and then freshly compressed\n\
+(or not) according to the preceding `--compressed=...` or `--uncompressed`.\n\
+\n\
 Format control switches (last switch affects all output):\n\
     --complete=ARCH, -B ARCH       verify result is a complete boot image\n\
-    --compressed, -c               compress BOOTFS images (default)\n\
+    --compressed[=HOW], -c [HOW]   compress BOOTFS images (see below)\n\
     --uncompressed, -u             do not compress BOOTFS images\n\
-    --sort, -s                     sort BOOTFS entries by name\n\
 \n\
-In all cases there is only a single BOOTFS item (if any) written out.\n\
+HOW defaults to `lz4` and can be one of (case-insensitive):\n\
+ * `none` (same as `--uncompressed`)\n\
+ * `LEVEL` (an integer) or `max` (default algorithm, currently `lz4`)\n\
+ * `lz4` or `lz4,LEVEL` (an integer) or `lz4,max`\n\
+ * `zstd` or `zstd,LEVEL` (an integer) or `zstd,max` or `zstd,overclock`\n\
+The meaning of LEVEL depends on the algorithm.  The default is chosen for\n\
+good compression ratios with fast compression time.  `max` is for the best\n\
+compression ratios but much slower compression time (e.g. release builds).\n\
+\n\
+If there are no PATTERN arguments and no files named to add to the BOOTFS\n\
+(via manifest file entries, nonempty directories, or `--entry` switches)\n\
+then any ZBI input items of BOOTFS type are passed through as they are,\n\
+except for possibly compressing raw `--type=bootfs` input items.\n\
+In all other cases there is only a single BOOTFS item (if any) written out.\n\
+So `-- \\*` will force merging when no individual files are being added.\n\
+\n\
 The BOOTFS image contains all files from BOOTFS items in ZBI input files,\n\
-manifest files, directories, and `--entry` switches (in input order unless\n\
-`--sort` was specified).\n\
+manifest files, directories, and `--entry` switches.  The BOOTFS directory\n\
+table is always sorted.  By default it's an error to have duplicate target\n\
+file names in the input (even with the same source).  `--replace` or `-r`\n\
+allows it: the last entry in input order wins.\n\
+**TODO(mcgrathr):** not quite true yet\n\
 \n\
-Each argument after -- is shell filename PATTERN (* matches even /)\n\
+Each argument after -- is a shell filename PATTERN (`*` matches even `/`)\n\
 to filter the files that will be packed into BOOTFS, extracted, or listed.\n\
-For a PATTERN that starts with ! or ^ matching names are excluded after\n\
-including matches for all positive PATTERN arguments.\n\
+For a PATTERN that starts with `!` or `^` matching names are excluded after\n\
+including matches for all positive PATTERN arguments.  Note that PATTERN\n\
+is compared to the final BOOTFS target file name with any PREFIX applied.\n\
 \n\
 When extracting a single file, `--output` or `-o` can be used.\n\
 Otherwise multiple files are created with their BOOTFS file names\n\
 relative to PREFIX (default empty, so in the current directory).\n\
+Note that the last PREFIX on the command line affects extraction,\n\
+though each PREFIX also (first) affects BOOTFS files added due to arguments\n\
+that follow it.  So if any PREFIX appears before such input arguments when\n\
+extracting, the extracted file names will have a doubled PREFIX unless a\n\
+`--prefix=.` or other PREFIX value follows the input arguments.\n\
 \n\
 With `--extract-items` or `-X`, instead of BOOTFS files the names are\n\
 synthesized as shown below, numbered in the order items appear in the input\n\
@@ -1811,7 +2527,6 @@ starting with 001.  Output files are ZBI files that can be input later.\n\
 \n\
 With `--extract-raw` or `-R`, each file is written with just the\n\
 uncompressed payload of the item and no ZBI headers.\n\
-\n\
 ";
 
 void usage(const char* progname) {
@@ -1823,22 +2538,21 @@ void usage(const char* progname) {
 
 int main(int argc, char** argv) {
     FileOpener opener;
-    GroupFilter filter;
     const char* outfile = nullptr;
     const char* depfile = nullptr;
     uint32_t complete_arch = kImageArchUndefined;
     bool input_manifest = true;
     uint32_t input_type = ZBI_TYPE_DISCARD;
-    bool compressed = true;
+    Compressor::Config compressed;
     bool extract = false;
     bool extract_items = false;
     bool extract_raw = false;
     bool list_contents = false;
-    bool sort = false;
     bool verbose = false;
+    bool recompress = false;
     ItemList items;
-    InputFileGeneratorList bootfs_input;
-    std::string prefix;
+    DirectoryTreeBuilder bootfs(&opener);
+    std::filesystem::path outdir;
     int opt;
     while ((opt = getopt_long(argc, argv,
                               kOptString, kLongOpts, nullptr)) != -1) {
@@ -1849,33 +2563,19 @@ int main(int argc, char** argv) {
             break;
 
         case 'o':
-            if (outfile) {
-                fprintf(stderr, "only one output file\n");
-                exit(1);
-            }
-            if (!items.empty()) {
-                fprintf(stderr, "--output or -o must precede inputs\n");
-                exit(1);
-            }
             outfile = optarg;
             continue;
 
         case 'd':
-            if (depfile) {
-                fprintf(stderr, "only one depfile\n");
-                exit(1);
-            }
-            if (!outfile) {
-                fprintf(stderr,
-                        "--output -or -o must precede --depfile or -d\n");
-                exit(1);
-            }
-            if (!items.empty()) {
-                fprintf(stderr, "--depfile or -d must precede inputs\n");
-                exit(1);
-            }
             depfile = optarg;
-            opener.Init(outfile, depfile);
+            continue;
+
+        case 'D':
+            outdir = optarg;
+            continue;
+
+        case 'C':
+            opener.ChangeDirectory(optarg);
             continue;
 
         case 'F':
@@ -1892,27 +2592,12 @@ int main(int argc, char** argv) {
             continue;
 
         case 'p':
-            // A nonempty prefix should have no leading slashes and
-            // exactly one trailing slash.
-            prefix = optarg;
-            while (!prefix.empty() && prefix.front() == '/') {
-                prefix.erase(0, 1);
-            }
-            if (!prefix.empty() && prefix.back() == '/') {
-                prefix.pop_back();
-            }
-            if (prefix.empty() && optarg[0] != '\0') {
-                fprintf(stderr, "\
---prefix cannot be /; use --prefix= (empty) instead\n");
+            // The directory prefix must be a relative path.
+            if (bootfs.SetPrefix(optarg).is_absolute()) {
+                fprintf(stderr,
+                        "--prefix must be relative (no leading slash)\n");
                 exit(1);
             }
-            if (!prefix.empty()) {
-                prefix.push_back('/');
-            }
-            continue;
-
-        case 'g':
-            filter.SetFilter(optarg);
             continue;
 
         case 't':
@@ -1934,16 +2619,22 @@ int main(int argc, char** argv) {
                 exit(1);
             }
             continue;
+
         case 'c':
-            compressed = true;
+            if (!compressed.Parse(optarg)) {
+                fprintf(stderr,
+                        "unrecognized compression algorithm syntax: %s\n",
+                        optarg);
+                exit(1);
+            }
             continue;
 
         case 'u':
-            compressed = false;
+            compressed.clear();
             continue;
 
-        case 's':
-            sort = true;
+        case kOptRecompress:
+            recompress = true;
             continue;
 
         case 'x':
@@ -1955,6 +2646,10 @@ int main(int argc, char** argv) {
             extract_items = true;
             continue;
 
+        case 'r':
+            bootfs.ReplaceFiles();
+            continue;
+
         case 'R':
             extract = true;
             extract_items = true;
@@ -1963,9 +2658,7 @@ int main(int argc, char** argv) {
 
         case 'e':
             if (input_manifest) {
-                bootfs_input.emplace_back(
-                    new ManifestInputFileGenerator(FileContents(optarg, false),
-                                                   prefix, &filter));
+                bootfs.ImportManifest({optarg, false}, "<command-line>");
             } else if (input_type == ZBI_TYPE_CONTAINER) {
                 fprintf(stderr,
                         "cannot use --entry (-e) with --target=CONTAINER\n");
@@ -1973,8 +2666,11 @@ int main(int argc, char** argv) {
             } else {
                 items.push_back(
                     Item::CreateFromFile(
-                        FileContents(optarg, input_type == ZBI_TYPE_CMDLINE),
+                        opener.Emplace(optarg, input_type == ZBI_TYPE_CMDLINE),
                         input_type, compressed));
+                if (input_type == ZBI_TYPE_STORAGE_BOOTFS) {
+                    bootfs.push_back(&items.back());
+                }
             }
             continue;
 
@@ -1985,45 +2681,31 @@ int main(int argc, char** argv) {
         }
         assert(opt == 1);
 
-        struct stat st;
-        auto fd = opener.Open(optarg, &st);
+        auto input = opener.OpenFileOrDir(optarg);
 
-        // A directory populates the BOOTFS.
-        if (input_manifest && S_ISDIR(st.st_mode)) {
-            // Calculate the prefix for opening files within the directory.
-            // This won't be part of the BOOTFS file name.
-            std::string dir_prefix(optarg);
-            if (dir_prefix.back() != '/') {
-                dir_prefix.push_back('/');
+        if (input->IsDir()) {
+            // A directory populates the BOOTFS.
+            if (!input_manifest) {
+                fprintf(stderr, "%s: %s\n", optarg, strerror(EISDIR));
+                exit(1);
             }
-            bootfs_input.emplace_back(
-                new DirectoryInputFileGenerator(std::move(fd),
-                                                std::move(dir_prefix)));
-            continue;
-        }
-
-        // Anything else must be a regular file.
-        RequireRegularFile(st, optarg);
-        auto file = FileContents::Map(std::move(fd), st, optarg);
-
-        if (input_manifest || input_type == ZBI_TYPE_CONTAINER) {
-            if (ImportFile(file, optarg, &items)) {
-                // It's another file in ZBI format.  The last item will own
-                // the file buffer, so it lives until all earlier items are
-                // exhausted.
-                items.back()->OwnFile(std::move(file));
+            bootfs.MergeRootDirectory(*input->AsDir());
+        } else if (input_manifest || input_type == ZBI_TYPE_CONTAINER) {
+            if (ImportFile(input->AsContents(), optarg, &items, &bootfs,
+                           recompress ? compressed :
+                           std::optional<Compressor::Config>())) {
+                // It's another file in ZBI format.
             } else if (input_manifest) {
                 // It must be a manifest file.
-                bootfs_input.emplace_back(
-                    new ManifestInputFileGenerator(std::move(file),
-                                                   prefix, &filter));
+                bootfs.ImportManifest(*input->AsContents(), optarg);
             } else {
-                fprintf(stderr, "%s: not a Zircon Boot container\n", optarg);
+                fprintf(stderr, "%s: not a Zircon Boot Image file\n", optarg);
                 exit(1);
             }
         } else {
-            items.push_back(Item::CreateFromFile(std::move(file),
-                                                 input_type, compressed));
+            // --type told us how to pack it.
+            items.push_back(
+                Item::CreateFromFile(input, input_type, compressed));
         }
     }
 
@@ -2049,26 +2731,6 @@ int main(int argc, char** argv) {
     auto is_bootfs = [](const ItemPtr& item) {
         return item->type() == ZBI_TYPE_STORAGE_BOOTFS;
     };
-
-    // If there are multiple BOOTFS input items, or any BOOTFS items when
-    // we're also creating a fresh BOOTFS, merge them all into the new one.
-    const bool merge_bootfs =
-        ((!extract_items && !name_matcher.MatchesAll()) ||
-         ((merge || !bootfs_input.empty()) &&
-          ((bootfs_input.empty() ? 0 : 1) +
-           std::count_if(items.begin(), items.end(), is_bootfs)) > 1));
-
-    if (merge_bootfs) {
-        for (auto& item : items) {
-            if (is_bootfs(item)) {
-                // Null out the list entry.
-                ItemPtr old;
-                item.swap(old);
-                // The generator consumes the old item.
-                bootfs_input.push_back(Item::ReadBootFS(std::move(old)));
-            }
-        }
-    }
 
     ItemPtr keepalive;
     if (merge) {
@@ -2111,13 +2773,22 @@ int main(int argc, char** argv) {
     // Compact out the null entries.
     items.erase(std::remove(items.begin(), items.end(), nullptr), items.end());
 
-    if (!bootfs_input.empty()) {
+    if (!extract && !extract_items && !name_matcher.MatchesAll()) {
+        // Apply the filter to the directory tree collected.
+        DirectoryTree tree{bootfs.tree()};
+        auto it = tree.begin();
+        while (it != tree.end()) {
+            if (name_matcher.Matches((*it).first.c_str())) {
+                ++it;
+            } else {
+                it.Remove();
+            }
+        }
+    }
+
+    if (!bootfs.tree()->empty()) {
         // Pack up the BOOTFS.
-        items.push_back(
-            Item::CreateBootFS(&opener, bootfs_input, [&](const char* name) {
-                return extract_items || name_matcher.Matches(name);
-            },
-                               sort, prefix, compressed));
+        items.push_back(Item::CreateBootFS(bootfs.tree(), compressed));
     }
 
     if (items.empty()) {
@@ -2150,7 +2821,8 @@ int main(int argc, char** argv) {
     }
 
     // Now we're ready to start writing output!
-    FileWriter writer(outfile, std::move(prefix));
+    opener.WriteDepfile(outfile, depfile);
+    FileWriter writer(outfile, std::move(outdir));
 
     if (list_contents || verbose || extract) {
         if (list_contents || verbose) {
@@ -2180,12 +2852,24 @@ int main(int argc, char** argv) {
                     item->ExtractItem(&writer, &name_matcher);
                 }
             } else if (extract && is_bootfs(item)) {
-                auto generator = Item::ReadBootFS(std::move(item));
-                InputFileGenerator::value_type next;
-                while (generator->Next(&opener, prefix, &next)) {
-                    if (name_matcher.Matches(next.target.c_str())) {
-                        writer.RawFile(next.target.c_str())
-                            .Write(next.file.View(0, next.file.exact_size()));
+                using ExtractMap =
+                    std::unordered_map<const File*,
+                                       const std::filesystem::path>;
+                auto extract_file =
+                    [&writer,
+                     files = ExtractMap()](const char* path, const File* file) mutable {
+                        auto [it, first] = files.try_emplace(file, path);
+                        if (first) {
+                            writer.RawFile(path).Write(
+                                file->AsContents()->View());
+                        } else {
+                            writer.HardLink(it->second, path);
+                        }
+                    };
+                for (auto [it, fs] = Item::ReadBootFS(std::move(item));
+                     it; ++it) {
+                    if (name_matcher.Matches(it->name)) {
+                        extract_file(it->name, it.Open(&opener, fs.get()));
                     }
                 }
             }

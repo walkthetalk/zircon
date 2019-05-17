@@ -18,6 +18,7 @@ public:
     Assertion(const fbl::String& desc, const fbl::String& expected,
               const fbl::String& expected_eval, const fbl::String& actual,
               const fbl::String& actual_eval, const SourceLocation& location, bool is_fatal);
+    Assertion(const fbl::String& desc, const SourceLocation& location, bool is_fatal);
     Assertion(const Assertion&) = delete;
     Assertion(Assertion&&);
     ~Assertion();
@@ -41,7 +42,7 @@ public:
 
     // Returns the expected value of an equality. For example in ASSERT_EQ(actual, expected) returns
     // the text representation of expected as it is evaluated at runtime..
-    const fbl::String& expected_eval() const { return expected_eval_; };
+    const fbl::String& expected_eval() const { return expected_eval_; }
 
     // Returns the expected value of an equality. For example in ASSERT_EQ(actual, expected) returns
     // the text representation of actual, as it was captured on runtime.
@@ -50,6 +51,9 @@ public:
     // Returns true if this assertion is fatal, and test should stop execution. Essentially if the
     // asserting macro is ASSERT_* or EXPECT_*.
     bool is_fatal() const { return is_fatal_; }
+
+    // Returns true if this assertions is value based or manually generated.
+    bool has_values() const { return has_values_; }
 
 private:
     // Text indicating the nature of the assertion. Whether it was expected to be equal, not equal,
@@ -63,33 +67,45 @@ private:
     SourceLocation location_;
 
     bool is_fatal_;
+    bool has_values_;
 };
 
 // Helper functions used on assertion reporting contexts.
 namespace internal {
 // Returns a string with the Hex representation of the contents of the buffer pointed by
 // ptr. If |ptr| is nullptr, returns "<nullptr>". If |size| is 0 returns <empty>.
-fbl::String ToHex(void* ptr, size_t size);
+fbl::String ToHex(const void* ptr, size_t size);
 } // namespace internal
 
 // Specializations exist for primitive types, pointers and |fbl::String|.
-template <typename T> fbl::String PrintValue(T value) {
+template <typename T>
+fbl::String PrintValue(const T& value) {
     // TODO(gevalentino): By default generate a hex represetation of the memory contents of value.
     return internal::ToHex(&value, sizeof(value));
 }
 
 // Template Specialization for integers and char pointers.
-template <> fbl::String PrintValue(int32_t value);
-template <> fbl::String PrintValue(uint32_t value);
-template <> fbl::String PrintValue(int64_t value);
-template <> fbl::String PrintValue(uint64_t value);
-template <> fbl::String PrintValue(const char* value);
-template <> fbl::String PrintValue(const fbl::String& value);
+template <>
+fbl::String PrintValue(const int32_t& value);
+template <>
+fbl::String PrintValue(const uint32_t& value);
+template <>
+fbl::String PrintValue(const int64_t& value);
+template <>
+fbl::String PrintValue(const uint64_t& value);
+template <>
+fbl::String PrintValue(const fbl::String& value);
 
 // For pointers just print the address.
-template <typename T> fbl::String PrintValue(T* value) {
+template <typename T>
+fbl::String PrintValue(const T* value) {
+    if (value == nullptr) {
+        return "<nullptr>";
+    }
     return fbl::StringPrintf("%p", static_cast<const void*>(value));
 }
+template <>
+fbl::String PrintValue(const char* value);
 
 // Overloads for string compare.
 bool StrCmp(const char* actual, const char* expected);

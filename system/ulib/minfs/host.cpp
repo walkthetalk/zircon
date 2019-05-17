@@ -33,7 +33,7 @@ zx_status_t do_stat(fbl::RefPtr<fs::Vnode> vn, struct stat* s) {
     zx_status_t status = vn->Getattr(&a);
     if (status == ZX_OK) {
         memset(s, 0, sizeof(struct stat));
-        s->st_mode = a.mode;
+        s->st_mode = static_cast<mode_t>(a.mode);
         s->st_size = a.size;
         s->st_ino = a.inode;
         s->st_ctime = a.create_time;
@@ -128,7 +128,21 @@ int emu_mkfs(const char* path) {
     return Mkfs(std::move(bc));
 }
 
-int emu_mount(const char* path) {
+static const minfs::MountOptions kDefaultMountOptions = {
+    .readonly = false,
+    .metrics = false,
+    .verbose = false,
+};
+
+int emu_mount_bcache(fbl::unique_ptr<minfs::Bcache> bc) {
+    int r = minfs::Mount(std::move(bc), kDefaultMountOptions, &fakeFs.fake_root) == ZX_OK ? 0 : -1;
+    if (r == 0) {
+        fakeFs.fake_vfs.reset(fakeFs.fake_root->Vfs());
+    }
+    return r;
+}
+
+int emu_create_bcache(const char* path, fbl::unique_ptr<minfs::Bcache>* out_bc) {
     fbl::unique_fd fd(open(path, O_RDWR));
     if (!fd) {
         FS_TRACE_ERROR("error: could not open path %s\n", path);
@@ -144,24 +158,42 @@ int emu_mount(const char* path) {
     off_t size = s.st_size / minfs::kMinfsBlockSize;
 
     fbl::unique_ptr<minfs::Bcache> bc;
-    if (minfs::Bcache::Create(&bc, std::move(fd), (uint32_t) size) < 0) {
+    if (minfs::Bcache::Create(&bc, std::move(fd), (uint32_t) size) != ZX_OK) {
         FS_TRACE_ERROR("error: cannot create block cache\n");
         return -1;
     }
 
-    int r = minfs::Mount(std::move(bc), &fakeFs.fake_root);
-    if (r == 0) {
-        fakeFs.fake_vfs.reset(fakeFs.fake_root->fs_);
-    }
-    return r;
+    *out_bc = std::move(bc);
+    return 0;
 }
 
-int emu_mount_bcache(fbl::unique_ptr<minfs::Bcache> bc) {
-    int r = minfs::Mount(std::move(bc), &fakeFs.fake_root) == ZX_OK ? 0 : -1;
-    if (r == 0) {
-        fakeFs.fake_vfs.reset(fakeFs.fake_root->fs_);
+int emu_mount(const char* path) {
+    fbl::unique_ptr<minfs::Bcache> bc;
+    if (emu_create_bcache(path, &bc) != 0) {
+        return -1;
     }
-    return r;
+    return emu_mount_bcache(std::move(bc));
+}
+
+int emu_get_used_resources(const char* path, uint64_t* out_data_size, uint64_t* out_inodes,
+                           uint64_t* out_used_size) {
+    fbl::unique_ptr<minfs::Bcache> bc;
+    if (emu_create_bcache(path, &bc) != 0) {
+        return -1;
+    }
+    if (minfs::UsedDataSize(bc, out_data_size) != ZX_OK) {
+        return -1;
+    }
+
+    if (minfs::UsedInodes(bc, out_inodes) != ZX_OK) {
+        return -1;
+    }
+
+    if (minfs::UsedSize(bc, out_used_size) != ZX_OK) {
+        return -1;
+    }
+
+    return 0;
 }
 
 bool emu_is_mounted() {

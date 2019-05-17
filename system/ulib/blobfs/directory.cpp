@@ -13,11 +13,12 @@
 #include <digest/digest.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/string_piece.h>
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
+#include <lib/fdio/unsafe.h>
 #include <lib/fdio/vfs.h>
 #include <lib/fidl-utils/bind.h>
 #include <lib/sync/completion.h>
-#include <zircon/device/device.h>
 #include <zircon/device/vfs.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
@@ -41,7 +42,7 @@ zx_status_t Directory::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
 }
 
 zx_status_t Directory::ValidateFlags(uint32_t flags) {
-    if (flags & ZX_FS_RIGHT_WRITABLE) {
+    if (flags & ZX_FS_FLAG_NOT_DIRECTORY) {
         return ZX_ERR_NOT_FILE;
     }
     return ZX_OK;
@@ -144,11 +145,24 @@ zx_status_t Directory::QueryFilesystem(fuchsia_io_FilesystemInfo* info) {
 }
 
 zx_status_t Directory::GetDevicePath(size_t buffer_len, char* out_name, size_t* out_len) {
-    ssize_t len = ioctl_device_get_topo_path(blobfs_->Fd(), out_name, buffer_len);
-    if (len < 0) {
-        return static_cast<zx_status_t>(len);
+    auto device = blobfs_->BlockDevice();
+    if (buffer_len == 0) {
+        return ZX_ERR_BUFFER_TOO_SMALL;
     }
-    *out_len = len;
+    zx_status_t call_status;
+    zx_status_t status = fuchsia_device_ControllerGetTopologicalPath(device->get(), &call_status,
+                                                                     out_name, buffer_len - 1,
+                                                                     out_len);
+    if (status == ZX_OK) {
+        status = call_status;
+    }
+    if (status != ZX_OK) {
+        return status;
+    }
+    // Ensure null-terminated
+    out_name[*out_len] = 0;
+    // Account for the null byte in the length, since callers expect it.
+    (*out_len)++;
     return ZX_OK;
 }
 #endif
@@ -193,7 +207,7 @@ public:
     using DirectoryConnectionBinder = fidl::Binder<DirectoryConnection>;
 
     DirectoryConnection(fs::Vfs* vfs, fbl::RefPtr<fs::Vnode> vnode, zx::channel channel,
-                    uint32_t flags)
+                        uint32_t flags)
             : Connection(vfs, std::move(vnode), std::move(channel), flags) {}
 
 private:
@@ -220,7 +234,7 @@ private:
 
 #ifdef __Fuchsia__
 zx_status_t Directory::Serve(fs::Vfs* vfs, zx::channel channel, uint32_t flags) {
-    return vfs->ServeConnection(fbl::make_unique<DirectoryConnection>(
+    return vfs->ServeConnection(std::make_unique<DirectoryConnection>(
         vfs, fbl::WrapRefPtr(this), std::move(channel), flags));
 }
 #endif

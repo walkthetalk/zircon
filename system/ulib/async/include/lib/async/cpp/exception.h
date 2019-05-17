@@ -2,10 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_ASYNC_CPP_EXCEPTION_H_
+#define LIB_ASYNC_CPP_EXCEPTION_H_
 
-#include <fbl/function.h>
 #include <lib/async/exception.h>
+#include <lib/fit/function.h>
 
 namespace async {
 
@@ -81,7 +82,7 @@ public:
     //
     // The |status| is |ZX_OK| if the packet was successfully delivered and |data|
     // contains the information from the packet, otherwise |data| is null.
-    using Handler = fbl::Function<void(async_dispatcher_t* dispatcher,
+    using Handler = fit::function<void(async_dispatcher_t* dispatcher,
                                        async::Exception* exception,
                                        zx_status_t status,
                                        const zx_port_packet_t* report)>;
@@ -112,7 +113,7 @@ template <class Class,
 class ExceptionMethod final : public ExceptionBase {
 public:
     ExceptionMethod(Class* instance,
-                            zx_handle_t task, uint32_t options)
+                    zx_handle_t task, uint32_t options)
         : ExceptionBase(task, options, &ExceptionMethod::CallHandler),
           instance_(instance) {}
 
@@ -128,3 +129,5 @@ private:
 };
 
 } // namespace async
+
+#endif  // LIB_ASYNC_CPP_EXCEPTION_H_

@@ -16,6 +16,7 @@
 #include <kernel/init.h>
 #include <kernel/mutex.h>
 #include <kernel/thread.h>
+#include <kernel/percpu.h>
 #include <lib/heap.h>
 #include <lib/debuglog.h>
 #include <lk/init.h>

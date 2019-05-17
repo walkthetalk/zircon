@@ -9,7 +9,10 @@
 #include <lib/unittest/unittest.h>
 #include <object/state_observer.h>
 
-namespace {
+class TestDispatcher;
+template <> struct CanaryTag<TestDispatcher> {
+    static constexpr uint32_t magic = 0;
+};
 
 class TestDispatcher final : public SoloDispatcher<TestDispatcher, ZX_RIGHTS_BASIC> {
 public:
@@ -30,8 +33,6 @@ public:
         CancelByKey(/* handle= */ nullptr, /* port= */ nullptr, /* key= */ 2u);
     }
 };
-
-} // namespace
 
 // Tests for observer removal
 namespace removal {
@@ -75,7 +76,7 @@ bool on_initialize() {
 
     // Cause OnInitialize() to be called.
     TestDispatcher st;
-    st.AddObserver(&obs, nullptr);
+    ASSERT_EQ(ZX_OK, st.AddObserver(&obs), "");
 
     // Should have been removed.
     EXPECT_EQ(1, obs.removals(), "");
@@ -101,7 +102,7 @@ bool on_state_change_via_update_state() {
     EXPECT_EQ(0, obs.removals(), "");
 
     TestDispatcher st;
-    st.AddObserver(&obs, nullptr);
+    ASSERT_EQ(ZX_OK, st.AddObserver(&obs), "");
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
     // Cause OnStateChange() to be called.
@@ -131,7 +132,7 @@ bool on_cancel() {
     EXPECT_EQ(0, obs.removals(), "");
 
     TestDispatcher st;
-    st.AddObserver(&obs, nullptr);
+    ASSERT_EQ(ZX_OK, st.AddObserver(&obs), "");
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
     // Cause OnCancel() to be called.
@@ -162,7 +163,7 @@ bool on_cancel_by_key() {
     EXPECT_EQ(0, obs.removals(), "");
 
     TestDispatcher st;
-    st.AddObserver(&obs, nullptr);
+    ASSERT_EQ(ZX_OK, st.AddObserver(&obs), "");
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
     // Cause OnCancelByKey() to be called.

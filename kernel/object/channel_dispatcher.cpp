@@ -22,21 +22,25 @@
 
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
+
 #include <zircon/rights.h>
+#include <zircon/syscalls/object.h>
 #include <zircon/types.h>
 
 #define LOCAL_TRACE 0
 
-KCOUNTER(channel_packet_depth_1, "kernel.channel.depth.1");
-KCOUNTER(channel_packet_depth_4, "kernel.channel.depth.4");
-KCOUNTER(channel_packet_depth_16, "kernel.channel.depth.16");
-KCOUNTER(channel_packet_depth_64, "kernel.channel.depth.64");
-KCOUNTER(channel_packet_depth_256, "kernel.channel.depth.256");
-KCOUNTER(channel_packet_depth_unbounded, "kernel.channel.depth.unbounded");
+KCOUNTER(channel_packet_depth_1, "channel.depth.1")
+KCOUNTER(channel_packet_depth_4, "channel.depth.4")
+KCOUNTER(channel_packet_depth_16, "channel.depth.16")
+KCOUNTER(channel_packet_depth_64, "channel.depth.64")
+KCOUNTER(channel_packet_depth_256, "channel.depth.256")
+KCOUNTER(channel_packet_depth_unbounded, "channel.depth.unbounded")
+KCOUNTER(dispatcher_channel_create_count, "dispatcher.channel.create")
+KCOUNTER(dispatcher_channel_destroy_count, "dispatcher.channel.destroy")
 
 // static
-zx_status_t ChannelDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
-                                      fbl::RefPtr<Dispatcher>* dispatcher1,
+zx_status_t ChannelDispatcher::Create(KernelHandle<ChannelDispatcher>* handle0,
+                                      KernelHandle<ChannelDispatcher>* handle1,
                                       zx_rights_t* rights) {
     fbl::AllocChecker ac;
     auto holder0 = fbl::AdoptRef(new (&ac) PeerHolder<ChannelDispatcher>());
@@ -44,25 +48,27 @@ zx_status_t ChannelDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
         return ZX_ERR_NO_MEMORY;
     auto holder1 = holder0;
 
-    auto ch0 = fbl::AdoptRef(new (&ac) ChannelDispatcher(ktl::move(holder0)));
+    KernelHandle new_handle0(fbl::AdoptRef(new (&ac) ChannelDispatcher(ktl::move(holder0))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto ch1 = fbl::AdoptRef(new (&ac) ChannelDispatcher(ktl::move(holder1)));
+    KernelHandle new_handle1(fbl::AdoptRef(new (&ac) ChannelDispatcher(ktl::move(holder1))));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    ch0->Init(ch1);
-    ch1->Init(ch0);
+    new_handle0.dispatcher()->Init(new_handle1.dispatcher());
+    new_handle1.dispatcher()->Init(new_handle0.dispatcher());
 
     *rights = default_rights();
-    *dispatcher0 = ktl::move(ch0);
-    *dispatcher1 = ktl::move(ch1);
+    *handle0 = ktl::move(new_handle0);
+    *handle1 = ktl::move(new_handle1);
+
     return ZX_OK;
 }
 
 ChannelDispatcher::ChannelDispatcher(fbl::RefPtr<PeerHolder<ChannelDispatcher>> holder)
     : PeeredDispatcher(ktl::move(holder), ZX_CHANNEL_WRITABLE) {
+    kcounter_add(dispatcher_channel_create_count, 1);
 }
 
 // This is called before either ChannelDispatcher is accessible from threads other than the one
@@ -73,6 +79,8 @@ void ChannelDispatcher::Init(fbl::RefPtr<ChannelDispatcher> other) TA_NO_THREAD_
 }
 
 ChannelDispatcher::~ChannelDispatcher() {
+    kcounter_add(dispatcher_channel_destroy_count, 1);
+
     // At this point the other endpoint no longer holds
     // a reference to us, so we can be sure we're discarding
     // any remaining messages safely.
@@ -104,7 +112,7 @@ ChannelDispatcher::~ChannelDispatcher() {
     }
 }
 
-zx_status_t ChannelDispatcher::add_observer(StateObserver* observer) {
+zx_status_t ChannelDispatcher::AddObserver(StateObserver* observer) {
     canary_.Assert();
 
     Guard<fbl::Mutex> guard{get_lock()};
@@ -208,7 +216,7 @@ zx_status_t ChannelDispatcher::Write(zx_koid_t owner, MessagePacketPtr msg) {
     resched_disable.Disable();
     Guard<fbl::Mutex> guard{get_lock()};
 
-    // Faling this test is only possible if this process has two threads racing:
+    // Failing this test is only possible if this process has two threads racing:
     // one thread is issuing channel_write() and one thread is moving the handle
     // to another process.
     if (owner != owner_)
@@ -231,7 +239,7 @@ zx_status_t ChannelDispatcher::Call(zx_koid_t owner,
     if (unlikely(waiter->BeginWait(fbl::WrapRefPtr(this)) != ZX_OK)) {
         // If a thread tries BeginWait'ing twice, the VDSO contract around retrying
         // channel calls has been violated.  Shoot the misbehaving process.
-        ProcessDispatcher::GetCurrent()->Kill();
+        ProcessDispatcher::GetCurrent()->Kill(ZX_TASK_RETCODE_VDSO_KILL);
         return ZX_ERR_BAD_STATE;
     }
 

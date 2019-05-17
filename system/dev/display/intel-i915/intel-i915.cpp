@@ -10,20 +10,24 @@
 #include <ddk/protocol/intelgpucore.h>
 #include <ddk/protocol/pci.h>
 #include <ddk/protocol/pci-lib.h>
+#include <ddk/protocol/sysmem.h>
 #include <hw/inout.h>
 
 #include <assert.h>
 #include <fbl/unique_ptr.h>
+#include <fuchsia/sysmem/c/fidl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <zircon/syscalls.h>
-#include <zircon/types.h>
+#include <fbl/vector.h>
+#include <lib/image-format/image_format.h>
 #include <lib/zx/vmar.h>
 #include <lib/zx/vmo.h>
+#include <zircon/syscalls.h>
+#include <zircon/types.h>
 
 #include <utility>
 
@@ -388,6 +392,7 @@ bool Controller::BringUpDisplayEngine(bool resume) {
     constexpr uint16_t kSequencerData = 0x3c5;
     constexpr uint8_t kClockingModeIdx = 1;
     constexpr uint8_t kClockingModeScreenOff = (1 << 5);
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     zx_status_t status = zx_ioports_request(get_root_resource(), kSequencerIdx, 2);
     if (status != ZX_OK) {
         LOG_ERROR("Failed to map vga ports\n");
@@ -783,10 +788,10 @@ void Controller::CallOnDisplaysChanged(DisplayDevice** added, size_t added_count
 // DisplayControllerImpl methods
 
 void Controller::DisplayControllerImplSetDisplayControllerInterface(
-    const display_controller_interface_t* intf) {
+    const display_controller_interface_protocol_t* intf) {
 
     fbl::AutoLock lock(&display_lock_);
-    dc_intf_ = ddk::DisplayControllerInterfaceClient(intf);
+    dc_intf_ = ddk::DisplayControllerInterfaceProtocolClient(intf);
 
     if (ready_for_callback_ && display_devices_.size()) {
         DisplayDevice* added_displays[registers::kDdiCount];
@@ -845,6 +850,127 @@ zx_status_t Controller::DisplayControllerImplImportVmoImage(image_t* image, zx::
     }
 
     status = gtt_region->PopulateRegion(vmo.get(), offset / PAGE_SIZE, length);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    image->handle = gtt_region->base();
+    imported_images_.push_back(std::move(gtt_region));
+    return ZX_OK;
+}
+
+static bool ConvertPixelFormatToType(fuchsia_sysmem_PixelFormat format, uint32_t* type_out) {
+    if (format.type != fuchsia_sysmem_PixelFormatType_BGRA32) {
+        return false;
+    }
+
+    if (!format.has_format_modifier) {
+        *type_out = IMAGE_TYPE_SIMPLE;
+        return true;
+    }
+
+    switch (format.format_modifier.value) {
+    case fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_X_TILED:
+        *type_out = IMAGE_TYPE_X_TILED;
+        return true;
+
+    case fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_Y_TILED:
+        *type_out = IMAGE_TYPE_Y_LEGACY_TILED;
+        return true;
+
+    case fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_YF_TILED:
+        *type_out = IMAGE_TYPE_YF_TILED;
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+zx_status_t Controller::DisplayControllerImplImportImage(image_t* image, zx_unowned_handle_t handle,
+                                                         uint32_t index) {
+    if (!(image->type == IMAGE_TYPE_SIMPLE || image->type == IMAGE_TYPE_X_TILED ||
+          image->type == IMAGE_TYPE_Y_LEGACY_TILED || image->type == IMAGE_TYPE_YF_TILED)) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    zx_status_t status, status2;
+    fuchsia_sysmem_BufferCollectionInfo_2 collection_info;
+    status =
+        fuchsia_sysmem_BufferCollectionWaitForBuffersAllocated(handle, &status2, &collection_info);
+    if (status != ZX_OK) {
+        return status;
+    }
+    if (status2 != ZX_OK) {
+        return status2;
+    }
+
+    zx::vmo vmo;
+    if (index < collection_info.buffer_count) {
+        vmo = zx::vmo(collection_info.buffers[index].vmo);
+        collection_info.buffers[index].vmo = ZX_HANDLE_INVALID;
+    }
+    for (uint32_t i = 0; i < collection_info.buffer_count; ++i) {
+        zx_handle_close(collection_info.buffers[i].vmo);
+    }
+
+    if (!collection_info.settings.has_image_format_constraints || !vmo) {
+        LOG_ERROR("Invalid image format or index\n");
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+
+    uint64_t offset = collection_info.buffers[index].vmo_usable_start;
+    if (offset % PAGE_SIZE != 0) {
+        LOG_ERROR("Invalid offset\n");
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    uint32_t type;
+    if (!ConvertPixelFormatToType(collection_info.settings.image_format_constraints.pixel_format,
+                                  &type)) {
+        LOG_ERROR("Invalid pixel format modifier\n");
+        return ZX_ERR_INVALID_ARGS;
+    }
+    if (image->type != type) {
+        LOG_ERROR("Incompatible image type\n");
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    fbl::AutoLock lock(&gtt_lock_);
+    fbl::AllocChecker ac;
+    imported_images_.reserve(imported_images_.size() + 1, &ac);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    uint32_t length = width_in_tiles(image->type, image->width, image->pixel_format) *
+                      height_in_tiles(image->type, image->height, image->pixel_format) *
+                      get_tile_byte_size(image->type);
+
+    uint32_t align;
+    if (image->type == IMAGE_TYPE_SIMPLE) {
+        align = registers::PlaneSurface::kLinearAlignment;
+    } else if (image->type == IMAGE_TYPE_X_TILED) {
+        align = registers::PlaneSurface::kXTilingAlignment;
+    } else {
+        align = registers::PlaneSurface::kYTilingAlignment;
+    }
+    fbl::unique_ptr<GttRegion> gtt_region;
+    status = gtt_.AllocRegion(length, align, &gtt_region);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    // The vsync logic requires that images not have base == 0
+    if (gtt_region->base() == 0) {
+        fbl::unique_ptr<GttRegion> alt_gtt_region;
+        zx_status_t status = gtt_.AllocRegion(length, align, &alt_gtt_region);
+        if (status != ZX_OK) {
+            return status;
+        }
+        gtt_region = std::move(alt_gtt_region);
+    }
+
+    status = gtt_region->PopulateRegion(vmo.release(), offset / PAGE_SIZE, length);
     if (status != ZX_OK) {
         return status;
     }
@@ -1608,7 +1734,7 @@ void Controller::DisplayControllerImplApplyConfiguration(const display_config_t*
     }
 
     if (dc_intf_.is_valid()) {
-        zx_time_t now = fake_vsync_count ? zx_clock_get(ZX_CLOCK_MONOTONIC) : 0;
+        zx_time_t now = fake_vsync_count ? zx_clock_get_monotonic() : 0;
         for (unsigned i = 0; i < fake_vsync_count; i++) {
             dc_intf_.OnDisplayVsync(fake_vsyncs[i], now, nullptr, 0);
         }
@@ -1623,6 +1749,96 @@ uint32_t Controller::DisplayControllerImplComputeLinearStride(uint32_t width,
 
 zx_status_t Controller::DisplayControllerImplAllocateVmo(uint64_t size, zx::vmo* vmo_out) {
     return zx::vmo::create(size, 0, vmo_out);
+}
+
+zx_status_t Controller::DisplayControllerImplGetSysmemConnection(zx::channel connection) {
+    zx_status_t status = sysmem_connect(&sysmem_, connection.release());
+    if (status != ZX_OK) {
+        LOG_ERROR("Could not connect to sysmem\n");
+        return status;
+    }
+
+    return ZX_OK;
+}
+
+zx_status_t Controller::DisplayControllerImplSetBufferCollectionConstraints(
+    const image_t* config, zx_unowned_handle_t collection) {
+    fuchsia_sysmem_BufferCollectionConstraints constraints = {};
+    constraints.usage.display = fuchsia_sysmem_displayUsageLayer;
+    constraints.has_buffer_memory_constraints = true;
+    fuchsia_sysmem_BufferMemoryConstraints& buffer_constraints =
+        constraints.buffer_memory_constraints;
+    buffer_constraints.min_size_bytes = 0;
+    buffer_constraints.max_size_bytes = 0xffffffff;
+    buffer_constraints.physically_contiguous_required = false;
+    buffer_constraints.secure_required = false;
+    buffer_constraints.secure_permitted = false;
+    buffer_constraints.ram_domain_supported = true;
+    buffer_constraints.cpu_domain_supported = true;
+    constraints.image_format_constraints_count = 1;
+    fuchsia_sysmem_ImageFormatConstraints& image_constraints =
+        constraints.image_format_constraints[0];
+
+    image_constraints.pixel_format.type = fuchsia_sysmem_PixelFormatType_BGRA32;
+    switch (config->type) {
+    case IMAGE_TYPE_SIMPLE:
+        image_constraints.bytes_per_row_divisor = 64;
+        image_constraints.start_offset_divisor = 64;
+        break;
+
+    case IMAGE_TYPE_X_TILED:
+        image_constraints.pixel_format.has_format_modifier = true;
+        image_constraints.pixel_format.format_modifier.value =
+            fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_X_TILED;
+        image_constraints.start_offset_divisor = 4096;
+        image_constraints.bytes_per_row_divisor = 1; // Not meaningful
+        break;
+
+    case IMAGE_TYPE_Y_LEGACY_TILED:
+        image_constraints.pixel_format.has_format_modifier = true;
+        image_constraints.pixel_format.format_modifier.value =
+            fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_Y_TILED;
+        image_constraints.start_offset_divisor = 4096;
+        image_constraints.bytes_per_row_divisor = 1; // Not meaningful
+        break;
+
+    case IMAGE_TYPE_YF_TILED:
+        image_constraints.pixel_format.has_format_modifier = true;
+        image_constraints.pixel_format.format_modifier.value =
+            fuchsia_sysmem_FORMAT_MODIFIER_INTEL_I915_YF_TILED;
+        image_constraints.start_offset_divisor = 4096;
+        image_constraints.bytes_per_row_divisor = 1; // Not meaningful
+        break;
+
+    default:
+        LOG_ERROR("Invalid image type: %d\n", config->type);
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    image_constraints.color_spaces_count = 1;
+    image_constraints.color_space[0].type = fuchsia_sysmem_ColorSpaceType_SRGB;
+    image_constraints.min_coded_width = 0;
+    image_constraints.max_coded_width = 0xffffffff;
+    image_constraints.min_coded_height = 0;
+    image_constraints.max_coded_height = 0xffffffff;
+    image_constraints.min_bytes_per_row = 0;
+    image_constraints.max_bytes_per_row = 0xffffffff;
+    image_constraints.max_coded_width_times_coded_height = 0xffffffff;
+    image_constraints.layers = 1;
+    image_constraints.coded_width_divisor = 1;
+    image_constraints.coded_height_divisor = 1;
+    image_constraints.display_width_divisor = 1;
+    image_constraints.display_height_divisor = 1;
+
+    zx_status_t status = fuchsia_sysmem_BufferCollectionSetConstraints(collection, true,
+                                                                       &constraints);
+
+    if (status != ZX_OK) {
+        LOG_ERROR("Failed to set constraints");
+        return status;
+    }
+
+    return ZX_OK;
 }
 
 // Intel GPU core methods
@@ -1823,6 +2039,7 @@ zx_status_t Controller::DdkGetProtocol(uint32_t proto_id, void* out) {
 zx_status_t Controller::DdkSuspend(uint32_t hint) {
     if ((hint & DEVICE_SUSPEND_REASON_MASK) == DEVICE_SUSPEND_FLAG_MEXEC) {
         uint32_t format, width, height, stride;
+        // Please do not use get_root_resource() in new code. See ZX-1467.
         if (zx_framebuffer_get_info(get_root_resource(), &format, &width,
                                     &height, &stride) != ZX_OK) {
             return ZX_OK;
@@ -1942,6 +2159,12 @@ void Controller::FinishInit() {
 zx_status_t Controller::Bind(fbl::unique_ptr<i915::Controller>* controller_ptr) {
     LOG_TRACE("Binding to display controller\n");
 
+    zx_status_t status = device_get_protocol(parent(), ZX_PROTOCOL_SYSMEM, &sysmem_);
+    if (status != ZX_OK) {
+        LOG_ERROR("Could not get Display SYSMEM protocol\n");
+        return status;
+    }
+
     if (device_get_protocol(parent_, ZX_PROTOCOL_PCI, &pci_)) {
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -1953,7 +2176,7 @@ zx_status_t Controller::Bind(fbl::unique_ptr<i915::Controller>* controller_ptr) 
         flags_ |= FLAGS_BACKLIGHT;
     }
 
-    zx_status_t status = igd_opregion_.Init(&pci_);
+    status = igd_opregion_.Init(&pci_);
     if (status != ZX_OK) {
         LOG_ERROR("Failed to init VBT (%d)\n", status);
         return status;
@@ -2095,3 +2318,46 @@ zx_status_t intel_i915_bind(void* ctx, zx_device_t* parent) {
 
     return controller->Bind(&controller);
 }
+
+#define INTEL_I915_VID (0x8086)
+
+static zx_driver_ops_t intel_i915_driver_ops = {
+    .version = DRIVER_OPS_VERSION,
+    .init = nullptr,
+    .bind = intel_i915_bind,
+    .create = nullptr,
+    .release = nullptr,
+};
+
+// clang-format off
+ZIRCON_DRIVER_BEGIN(intel_i915, intel_i915_driver_ops, "zircon", "0.1", 27)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PCI),
+    BI_ABORT_IF(NE, BIND_PCI_VID, INTEL_I915_VID),
+    // Skylake DIDs
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x191b),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1912),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x191d),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1902),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1916),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x191e),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1906),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x190b),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1926),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1927),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1923),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x193b),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x192d),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x193d),
+    // Kaby lake DIDs
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5916),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x591e),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x591b),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5912),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5926),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5906),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5927),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x5902),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x591a),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x591d),
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x3ea5),
+ZIRCON_DRIVER_END(intel_i915)

@@ -16,7 +16,9 @@
 #include <zircon/boot/driver-config.h>
 
 // uncomment to dump device tree at boot
-// #define PRINT_DEVICE_TREE
+#ifndef PRINT_DEVICE_TREE
+#define PRINT_DEVICE_TREE 0
+#endif
 
 // Uncomment to list ZBI items.
 #ifndef PRINT_ZBI
@@ -67,7 +69,7 @@ typedef struct {
 } device_tree_context_t;
 
 static int node_callback(int depth, const char *name, void *cookie) {
-#ifdef PRINT_DEVICE_TREE
+#if PRINT_DEVICE_TREE
     uart_puts("node: ");
     uart_puts(name);
     uart_puts("\n");
@@ -77,12 +79,12 @@ static int node_callback(int depth, const char *name, void *cookie) {
 
     if (!strcmp(name, "chosen")) {
         ctx->node = NODE_CHOSEN;
-    } else if (!strcmp(name, "memory") || !strcmp(name, "memory@00000000")) {
+    } else if (!strcmp(name, "memory") || !strncmp(name, "memory@", 7)) {
         ctx->node = NODE_MEMORY;
     } else if (!strncmp(name, "cpu@", 4)) {
         ctx->node = NODE_CPU;
         ctx->cpu_count++;
-    } else if (!strcmp(name, "intc")) {
+    } else if (!strcmp(name, "intc") || !strncmp(name, "intc@", 5)) {
         ctx->node = NODE_INTC;
     } else {
         ctx->node = NODE_NONE;
@@ -92,7 +94,7 @@ static int node_callback(int depth, const char *name, void *cookie) {
 }
 
 static int prop_callback(const char *name, uint8_t *data, uint32_t size, void *cookie) {
-#ifdef PRINT_DEVICE_TREE
+#if PRINT_DEVICE_TREE
     uart_puts("    prop: ");
     uart_puts(name);
     uart_puts(" size: ");
@@ -137,7 +139,7 @@ static int prop_callback(const char *name, uint8_t *data, uint32_t size, void *c
             } else if (!strncmp((const char *)data, "arm,cortex-a15-gic", size)) {
                 ctx->gic_version = 2;
             }
-#ifdef PRINT_DEVICE_TREE
+#if PRINT_DEVICE_TREE
             uart_puts(" gic version ");
             uart_print_hex(ctx->gic_version);
 #endif
@@ -147,7 +149,7 @@ static int prop_callback(const char *name, uint8_t *data, uint32_t size, void *c
         ;
     }
 
-#ifdef PRINT_DEVICE_TREE
+#if PRINT_DEVICE_TREE
     uart_puts("\n");
 #endif
 
@@ -255,6 +257,23 @@ static void list_zbi(zbi_header_t* zbi) {
     uart_puts("\n");
 }
 
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+#define ARM64_READ_SYSREG(reg)                   \
+    ({                                           \
+        uint64_t _val;                           \
+        __asm__ volatile("mrs %0," TOSTRING(reg) \
+                         : "=r"(_val));          \
+        _val;                                    \
+    })
+
+#define dump_arm_reg(reg) \
+    ({ \
+        uart_puts(#reg " = "); \
+        uart_print_hex(ARM64_READ_SYSREG(reg)); \
+        uart_puts("\n"); \
+    })
+
 boot_shim_return_t boot_shim(void* device_tree) {
     uart_puts("boot_shim: hi there!\n");
 
@@ -342,9 +361,9 @@ boot_shim_return_t boot_shim(void* device_tree) {
             // Length of the ZBI container, including header, without kernel.
             uint32_t zbi_len = kernel->hdr_file.length - kernel_len;
 
-            uart_puts("Splitting kernel ");
+            uart_puts("Splitting kernel len ");
             uart_print_hex(kernel_len);
-            uart_puts(" from ZBI ");
+            uart_puts(" from ZBI len ");
             uart_print_hex(zbi_len);
 
             // First move the kernel up out of the way.
@@ -352,23 +371,38 @@ boot_shim_return_t boot_shim(void* device_tree) {
             if (zbi_end < (uintptr_t)zbi + zbi_len) {
                 zbi_end =  (uintptr_t)zbi + zbi_len;
             }
+#if RELOCATE_KERNEL
+            // relocate the kernel to a new hard coded spot
+            kernel = (void *)RELOCATE_KERNEL_ADDRESS;
+#else
             kernel = (void*)((zbi_end + KERNEL_ALIGN - 1) &
                              -(uintptr_t)KERNEL_ALIGN);
+#endif
+
             uart_puts("\nKernel to ");
             uart_print_hex((uintptr_t)kernel);
+
             memcpy(kernel, old, (2 * sizeof(*zbi)) + kernel_len);
             // Fix up the kernel's solo container size.
             kernel->hdr_file.length = sizeof(*zbi) + kernel_len;
 
             // Now move the ZBI into its aligned place and fix up the
             // container header to exclude the kernel.
-            uart_puts(" ZBI to ");
+            uart_puts("\nZBI to ");
             uart_print_hex((uintptr_t)zbi);
             zbi_header_t header = *old;
             header.length -= kernel->hdr_file.length;
             void* payload = (uint8_t*)(old + 1) + kernel->hdr_file.length;
+
             memmove(zbi + 1, payload, header.length);
             *zbi = header;
+
+#if RELOCATE_KERNEL
+            // move the final ZBI far away as well
+            void *target = (void *)RELOCATE_ZBI_ADDRESS;
+            memmove(target, zbi, zbi->length);
+            zbi = target;
+#endif
 
             uart_puts("\nKernel container length ");
             uart_print_hex(kernel->hdr_file.length);
@@ -391,13 +425,14 @@ boot_shim_return_t boot_shim(void* device_tree) {
     }
 
     boot_shim_return_t result = {
-        .entry = (uintptr_t)kernel + kernel->data_kernel.entry,
         .zbi = zbi,
+        .entry = (uintptr_t)kernel + kernel->data_kernel.entry,
     };
     uart_puts("Entering kernel at ");
     uart_print_hex(result.entry);
-    uart_puts(" with ZBI ");
+    uart_puts(" with ZBI at ");
     uart_print_hex((uintptr_t)result.zbi);
     uart_puts("\n");
+
     return result;
 }

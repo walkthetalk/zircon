@@ -2,19 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <launchpad/launchpad.h>
-#include <launchpad/vmo.h>
-
 #include <fbl/algorithm.h>
+#include <fbl/array.h>
+#include <fbl/vector.h>
+#include <lib/fdio/directory.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
 #include <lib/fdio/io.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/spawn.h>
+#include <lib/zircon-internal/paths.h>
+#include <lib/zx/channel.h>
 #include <lib/zx/debuglog.h>
 #include <lib/zx/job.h>
 #include <lib/zx/process.h>
 #include <lib/zx/resource.h>
 #include <lib/zx/vmo.h>
 
-#include <zircon/paths.h>
 #include <zircon/processargs.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
@@ -32,7 +35,6 @@
 
 namespace devmgr {
 
-#define MAX_ENVP 16
 #define CHILD_JOB_RIGHTS (ZX_RIGHTS_BASIC | ZX_RIGHT_MANAGE_JOB | ZX_RIGHT_MANAGE_PROCESS)
 
 // clang-format off
@@ -57,120 +59,148 @@ static struct {
 };
 
 // clang-format on
-
+//
 void devmgr_disable_appmgr_services() {
     FSTAB[1].flags = 0;
 }
 
-zx_status_t devmgr_launch(const zx::job& job, const char* name,
-                          zx_status_t (*load)(void*, launchpad_t*, const char*), void* ctx,
-                          int argc, const char* const* argv, const char** initial_envp, int stdiofd,
-                          const zx_handle_t* handles, const uint32_t* types, size_t hcount,
-                          zx::process* out_proc, uint32_t flags) {
-    zx_status_t status;
-    const char* envp[MAX_ENVP + 1];
-    unsigned envn = 0;
-
-    if (getenv(LDSO_TRACE_CMDLINE)) {
-        envp[envn++] = LDSO_TRACE_ENV;
-    }
-    envp[envn++] = ZX_SHELL_ENV_PATH;
-    while ((initial_envp && initial_envp[0]) && (envn < MAX_ENVP)) {
-        envp[envn++] = *initial_envp++;
-    }
-    envp[envn++] = nullptr;
-
+zx_status_t devmgr_launch_with_loader(const zx::job& job, const char* name, zx::vmo executable,
+                                      zx::channel loader, const char* const* argv,
+                                      const char** initial_envp, int stdiofd,
+                                      const zx_handle_t* handles, const uint32_t* types,
+                                      size_t hcount, zx::process* out_proc, uint32_t flags) {
     zx::job job_copy;
-    status = job.duplicate(CHILD_JOB_RIGHTS, &job_copy);
+    zx_status_t status = job.duplicate(CHILD_JOB_RIGHTS, &job_copy);
     if (status != ZX_OK) {
         printf("devmgr_launch failed %s\n", zx_status_get_string(status));
         return status;
     }
 
-    launchpad_t* lp;
-    launchpad_create(job_copy.get(), name, &lp);
-
-    status = (*load)(ctx, lp, argv[0]);
-    if (status != ZX_OK) {
-        launchpad_abort(lp, status, "cannot load file");
+    zx::debuglog debuglog;
+    if (stdiofd < 0) {
+        if ((status = zx::debuglog::create(zx::resource(), 0, &debuglog) != ZX_OK)) {
+            return status;
+        }
     }
-    launchpad_set_args(lp, argc, argv);
-    launchpad_set_environ(lp, envp);
+
+    uint32_t spawn_flags = FDIO_SPAWN_CLONE_JOB;
+
+    // Set up the environ for the new process
+    fbl::Vector<const char*> env;
+    if (getenv(LDSO_TRACE_CMDLINE)) {
+        env.push_back(LDSO_TRACE_ENV);
+    }
+    env.push_back(ZX_SHELL_ENV_PATH);
+    while (initial_envp && initial_envp[0]) {
+        env.push_back(*initial_envp++);
+    }
+    env.push_back(nullptr);
+
+    fbl::Vector<fdio_spawn_action_t> actions;
+    actions.reserve(3 + fbl::count_of(FSTAB) + hcount);
+
+    actions.push_back((fdio_spawn_action_t){
+        .action = FDIO_SPAWN_ACTION_SET_NAME,
+        .name = { .data = name },
+    });
+
+    if (loader.is_valid()) {
+        actions.push_back((fdio_spawn_action_t){
+            .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
+            .h = { .id = PA_HND(PA_LDSVC_LOADER, 0), .handle = loader.release() },
+        });
+    } else {
+        spawn_flags |= FDIO_SPAWN_DEFAULT_LDSVC;
+    }
 
     // create namespace based on FS_* flags
-    const char* nametable[fbl::count_of(FSTAB)] = {};
-    uint32_t count = 0;
-    zx_handle_t h;
     for (unsigned n = 0; n < fbl::count_of(FSTAB); n++) {
         if (!(FSTAB[n].flags & flags)) {
             continue;
         }
+        zx_handle_t h;
         if ((h = fs_clone(FSTAB[n].name).release()) != ZX_HANDLE_INVALID) {
-            nametable[count] = FSTAB[n].mount;
-            launchpad_add_handle(lp, h, PA_HND(PA_NS_DIR, count++));
+            actions.push_back((fdio_spawn_action_t){
+                .action = FDIO_SPAWN_ACTION_ADD_NS_ENTRY,
+                .ns = { .prefix = FSTAB[n].mount, .handle = h },
+            });
         }
     }
-    launchpad_set_nametable(lp, count, nametable);
 
-    if (stdiofd < 0) {
-        if ((status = zx_debuglog_create(ZX_HANDLE_INVALID, 0, &h) < 0)) {
-            launchpad_abort(lp, status, "devmgr: cannot create debuglog handle");
-        } else {
-            launchpad_add_handle(lp, h, PA_HND(PA_FDIO_LOGGER, FDIO_FLAG_USE_FOR_STDIO | 0));
-        }
+    if (debuglog.is_valid()) {
+        actions.push_back((fdio_spawn_action_t){
+            .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
+            .h = { .id = PA_HND(PA_FD, FDIO_FLAG_USE_FOR_STDIO | 0),
+                   .handle = debuglog.release() },
+        });
     } else {
-        launchpad_clone_fd(lp, stdiofd, FDIO_FLAG_USE_FOR_STDIO | 0);
-        close(stdiofd);
+        actions.push_back((fdio_spawn_action_t){
+            .action = FDIO_SPAWN_ACTION_TRANSFER_FD,
+            .fd = { .local_fd = stdiofd, .target_fd = FDIO_FLAG_USE_FOR_STDIO | 0 },
+        });
     }
 
-    launchpad_add_handles(lp, hcount, handles, types);
+    for (size_t i = 0; i < hcount; ++i) {
+        actions.push_back((fdio_spawn_action_t){
+            .action = FDIO_SPAWN_ACTION_ADD_HANDLE,
+            .h = { .id = types[i], .handle = handles[i] },
+        });
+    }
 
     zx::process proc;
-    const char* errmsg;
-    if ((status = launchpad_go(lp, proc.reset_and_get_address(), &errmsg)) < 0) {
-        printf("devmgr: launchpad %s (%s) failed: %s: %d\n", argv[0], name, errmsg, status);
+    char err_msg[FDIO_SPAWN_ERR_MSG_MAX_LENGTH];
+    if (executable.is_valid()) {
+        status = fdio_spawn_vmo(job_copy.get(), spawn_flags, executable.release(), argv,
+                                env.get(), actions.size(), actions.get(),
+                                proc.reset_and_get_address(), err_msg);
     } else {
-        if (out_proc != nullptr) {
-            *out_proc = std::move(proc);
-        }
-        printf("devmgr: launch %s (%s) OK\n", argv[0], name);
+        status = fdio_spawn_etc(job_copy.get(), spawn_flags, argv[0], argv,
+                                env.get(), actions.size(), actions.get(),
+                                proc.reset_and_get_address(), err_msg);
     }
-    return status;
+    if (status != ZX_OK) {
+        printf("devcoordinator: spawn %s (%s) failed: %s: %d\n", argv[0], name, err_msg, status);
+        return status;
+    }
+    printf("devcoordinator: launch %s (%s) OK\n", argv[0], name);
+    if (out_proc != nullptr) {
+        *out_proc = std::move(proc);
+    }
+    return ZX_OK;
 }
 
-zx_status_t devmgr_launch_cmdline(const char* me, const zx::job& job, const char* name,
-                                  zx_status_t (*load)(void* ctx, launchpad_t*, const char* file),
-                                  void* ctx, const char* cmdline, const zx_handle_t* handles,
-                                  const uint32_t* types, size_t hcount, zx::process* proc,
-                                  uint32_t flags) {
+zx_status_t devmgr_launch(const zx::job& job, const char* name,
+                          const char* const* argv, const char** initial_envp, int stdiofd,
+                          const zx_handle_t* handles, const uint32_t* types, size_t hcount,
+                          zx::process* out_proc, uint32_t flags) {
+    return devmgr_launch_with_loader(job, name, zx::vmo(), zx::channel(), argv, initial_envp,
+                                     stdiofd, handles, types, hcount, out_proc, flags);
+}
+
+ArgumentVector ArgumentVector::FromCmdline(const char* cmdline) {
+    ArgumentVector argv;
+    const size_t cmdline_len = strlen(cmdline) + 1;
+    argv.raw_bytes_.reset(new char[cmdline_len]);
+    memcpy(argv.raw_bytes_.get(), cmdline, cmdline_len);
 
     // Get the full commandline by splitting on '+'.
-    char* buf = strdup(cmdline);
-    if (buf == nullptr) {
-        printf("%s: Can't parse + command: %s\n", me, cmdline);
-        return ZX_ERR_UNAVAILABLE;
-    }
-    const int MAXARGS = 8;
-    char* argv[MAXARGS];
-    int argc = 0;
+    size_t argc = 0;
     char* token;
-    char* rest = buf;
-    while (argc < MAXARGS && (token = strtok_r(rest, "+", &rest))) {
-        argv[argc++] = token;
+    char* rest = argv.raw_bytes_.get();
+    while (argc < fbl::count_of(argv.argv_) && (token = strtok_r(rest, "+", &rest))) {
+        argv.argv_[argc++] = token;
     }
+    argv.argv_[argc] = nullptr;
+    return argv;
+}
 
-    printf("%s: starting", me);
-    for (int i = 0; i < argc; i++) {
-        printf(" '%s'", argv[i]);
+void ArgumentVector::Print(const char* prefix) const {
+    const char* const* argv = argv_;
+    printf("%s: starting", prefix);
+    for (const char* arg = *argv; arg != nullptr; ++argv, arg = *argv) {
+        printf(" '%s'", *argv);
     }
     printf("...\n");
-
-    zx_status_t status = devmgr_launch(job, name, load, ctx, argc, (const char* const*)argv,
-                                       nullptr, -1, handles, types, hcount, proc, flags);
-
-    free(buf);
-
-    return status;
 }
 
 } // namespace devmgr

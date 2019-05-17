@@ -2,17 +2,24 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <crypto/cipher.h>
 #include <crypto/secret.h>
+#include <fuchsia/hardware/block/c/fidl.h>
+#include <fuchsia/hardware/block/volume/c/fidl.h>
+#include <lib/fzl/fdio.h>
+#include <kms-stateless/kms-stateless.h>
 #include <unittest/unittest.h>
 #include <zircon/errors.h>
 #include <zircon/types.h>
+#include <zxcrypt/fdio-volume.h>
 #include <zxcrypt/volume.h>
 
+#include <memory>
 #include <utility>
 
 #include "test-device.h"
@@ -30,22 +37,31 @@ bool VolumeCreate(const fbl::unique_fd& fd, const crypto::Secret& key, bool fvm,
     BEGIN_HELPER;
 
     char err[128];
-    block_info_t bInfo;
-    ASSERT_GE(ioctl_block_get_info(fd.get(), &bInfo), 0);
+    fzl::UnownedFdioCaller caller(fd.get());
+    fuchsia_hardware_block_BlockInfo block_info;
+    zx_status_t status;
+    ASSERT_EQ(fuchsia_hardware_block_BlockGetInfo(caller.borrow_channel(), &status, &block_info),
+              ZX_OK);
+    ASSERT_EQ(status, ZX_OK);
+
     if (fvm) {
-        fvm_info_t fInfo;
-        ASSERT_GE(ioctl_block_fvm_query(fd.get(), &fInfo), 0);
+        fuchsia_hardware_block_volume_VolumeInfo fvm_info;
+        ASSERT_OK(fuchsia_hardware_block_volume_VolumeQuery(caller.borrow_channel(), &status,
+                                                            &fvm_info));
+        ASSERT_OK(status);
+
         snprintf(err, sizeof(err),
                  "details: block size=%" PRIu32 ", block count=%" PRIu64
                  ", slice size=%zu, slice count=%zu",
-                 bInfo.block_size, bInfo.block_count, fInfo.slice_size, fInfo.vslice_count);
+                 block_info.block_size, block_info.block_count, fvm_info.slice_size,
+                 fvm_info.vslice_count);
     } else {
         snprintf(err, sizeof(err), "details: block size=%" PRIu32 ", block count=%" PRIu64,
-                 bInfo.block_size, bInfo.block_count);
+                 block_info.block_size, block_info.block_count);
     }
 
     fbl::unique_fd new_fd(dup(fd.get()));
-    EXPECT_EQ(Volume::Create(std::move(new_fd), key), expected, err);
+    EXPECT_EQ(FdioVolume::Create(std::move(new_fd), key), expected, err);
 
     END_HELPER;
 }
@@ -58,19 +74,19 @@ bool TestInit(Volume::Version version, bool fvm) {
 
     // Invalid arguments
     fbl::unique_fd bad_fd;
-    fbl::unique_ptr<Volume> volume;
-    EXPECT_ZX(Volume::Init(std::move(bad_fd), &volume), ZX_ERR_INVALID_ARGS);
-    EXPECT_ZX(Volume::Init(device.parent(), nullptr), ZX_ERR_INVALID_ARGS);
+    fbl::unique_ptr<FdioVolume> volume;
+    EXPECT_ZX(FdioVolume::Init(std::move(bad_fd), &volume), ZX_ERR_INVALID_ARGS);
+    EXPECT_ZX(FdioVolume::Init(device.parent(), nullptr), ZX_ERR_INVALID_ARGS);
 
     // Valid
-    EXPECT_ZX(Volume::Init(device.parent(), &volume), ZX_OK);
+    EXPECT_ZX(FdioVolume::Init(device.parent(), &volume), ZX_OK);
     ASSERT_TRUE(!!volume);
-    EXPECT_EQ(volume->reserved_blocks(), fvm ? (FVM_BLOCK_SIZE / kBlockSize) : 2u);
+    EXPECT_EQ(volume->reserved_blocks(), fvm ? (fvm::kBlockSize / kBlockSize) : 2u);
     EXPECT_EQ(volume->reserved_slices(), fvm ? 1u : 0u);
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestInit);
+DEFINE_EACH_DEVICE(TestInit)
 
 bool TestCreate(Volume::Version version, bool fvm) {
     BEGIN_TEST;
@@ -80,7 +96,7 @@ bool TestCreate(Volume::Version version, bool fvm) {
 
     // Invalid file descriptor
     fbl::unique_fd bad_fd;
-    EXPECT_ZX(Volume::Create(std::move(bad_fd), device.key()), ZX_ERR_INVALID_ARGS);
+    EXPECT_ZX(FdioVolume::Create(std::move(bad_fd), device.key()), ZX_ERR_INVALID_ARGS);
 
     // Weak key
     crypto::Secret short_key;
@@ -92,7 +108,7 @@ bool TestCreate(Volume::Version version, bool fvm) {
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestCreate);
+DEFINE_EACH_DEVICE(TestCreate)
 
 bool TestUnlock(Volume::Version version, bool fvm) {
     BEGIN_TEST;
@@ -101,30 +117,30 @@ bool TestUnlock(Volume::Version version, bool fvm) {
     ASSERT_TRUE(device.Create(kDeviceSize, kBlockSize, fvm));
 
     // Invalid device
-    fbl::unique_ptr<Volume> volume;
-    EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), 0, &volume),
+    fbl::unique_ptr<FdioVolume> volume;
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume),
               ZX_ERR_ACCESS_DENIED);
 
     // Bad file descriptor
     fbl::unique_fd bad_fd;
-    EXPECT_ZX(Volume::Unlock(std::move(bad_fd), device.key(), 0, &volume), ZX_ERR_INVALID_ARGS);
+    EXPECT_ZX(FdioVolume::Unlock(std::move(bad_fd), device.key(), 0, &volume), ZX_ERR_INVALID_ARGS);
 
     // Bad key
     ASSERT_TRUE(VolumeCreate(device.parent(), device.key(), fvm, ZX_OK));
 
     crypto::Secret bad_key;
     ASSERT_OK(bad_key.Generate(device.key().len()));
-    EXPECT_ZX(Volume::Unlock(device.parent(), bad_key, 0, &volume),
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), bad_key, 0, &volume),
               ZX_ERR_ACCESS_DENIED);
 
     // Bad slot
-    EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), -1, &volume),
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), -1, &volume),
               ZX_ERR_ACCESS_DENIED);
-    EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), 1, &volume),
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), 1, &volume),
               ZX_ERR_ACCESS_DENIED);
 
     // Valid
-    EXPECT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+    EXPECT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
 
     // Corrupt the key in each block.
     fbl::unique_fd parent = device.parent();
@@ -143,10 +159,10 @@ bool TestUnlock(Volume::Version version, bool fvm) {
 
         if (i < num_blocks - 1) {
             // Volume should still be unlockable as long as one copy of the key exists
-            EXPECT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+            EXPECT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
         } else {
             // Key should fail when last copy is corrupted.
-            EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), 0, &volume),
+            EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume),
                       ZX_ERR_ACCESS_DENIED);
         }
 
@@ -159,15 +175,15 @@ bool TestUnlock(Volume::Version version, bool fvm) {
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestUnlock);
+DEFINE_EACH_DEVICE(TestUnlock)
 
 bool TestEnroll(Volume::Version version, bool fvm) {
     BEGIN_TEST;
     TestDevice device;
     ASSERT_TRUE(device.Bind(version, fvm));
 
-    fbl::unique_ptr<Volume> volume;
-    ASSERT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+    fbl::unique_ptr<FdioVolume> volume;
+    ASSERT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
 
     // Bad key
     crypto::Secret bad_key;
@@ -178,15 +194,15 @@ bool TestEnroll(Volume::Version version, bool fvm) {
 
     // Valid; new slot
     EXPECT_OK(volume->Enroll(device.key(), 1));
-    EXPECT_OK(Volume::Unlock(device.parent(), device.key(), 1, &volume));
+    EXPECT_OK(FdioVolume::Unlock(device.parent(), device.key(), 1, &volume));
 
     // Valid; existing slot
     EXPECT_OK(volume->Enroll(device.key(), 0));
-    EXPECT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+    EXPECT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestEnroll);
+DEFINE_EACH_DEVICE(TestEnroll)
 
 bool TestRevoke(Volume::Version version, bool fvm) {
     BEGIN_TEST;
@@ -194,8 +210,8 @@ bool TestRevoke(Volume::Version version, bool fvm) {
     TestDevice device;
     ASSERT_TRUE(device.Bind(version, fvm));
 
-    fbl::unique_ptr<Volume> volume;
-    ASSERT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+    fbl::unique_ptr<FdioVolume> volume;
+    ASSERT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
 
     // Bad slot
     EXPECT_ZX(volume->Revoke(volume->num_slots()), ZX_ERR_INVALID_ARGS);
@@ -205,12 +221,12 @@ bool TestRevoke(Volume::Version version, bool fvm) {
 
     // Valid, even if last slot
     EXPECT_OK(volume->Revoke(0));
-    EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), 0, &volume),
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume),
               ZX_ERR_ACCESS_DENIED);
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestRevoke);
+DEFINE_EACH_DEVICE(TestRevoke)
 
 bool TestShred(Volume::Version version, bool fvm) {
     BEGIN_TEST;
@@ -218,8 +234,8 @@ bool TestShred(Volume::Version version, bool fvm) {
     TestDevice device;
     ASSERT_TRUE(device.Bind(version, fvm));
 
-    fbl::unique_ptr<Volume> volume;
-    ASSERT_OK(Volume::Unlock(device.parent(), device.key(), 0, &volume));
+    fbl::unique_ptr<FdioVolume> volume;
+    ASSERT_OK(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume));
 
     // Valid
     EXPECT_OK(volume->Shred());
@@ -227,12 +243,12 @@ bool TestShred(Volume::Version version, bool fvm) {
     // No further methods work
     EXPECT_ZX(volume->Enroll(device.key(), 0), ZX_ERR_BAD_STATE);
     EXPECT_ZX(volume->Revoke(0), ZX_ERR_BAD_STATE);
-    EXPECT_ZX(Volume::Unlock(device.parent(), device.key(), 0, &volume),
+    EXPECT_ZX(FdioVolume::Unlock(device.parent(), device.key(), 0, &volume),
               ZX_ERR_ACCESS_DENIED);
 
     END_TEST;
 }
-DEFINE_EACH_DEVICE(TestShred);
+DEFINE_EACH_DEVICE(TestShred)
 
 BEGIN_TEST_CASE(VolumeTest)
 RUN_EACH_DEVICE(TestInit)
@@ -240,8 +256,61 @@ RUN_EACH_DEVICE(TestCreate)
 RUN_EACH_DEVICE(TestUnlock)
 RUN_EACH_DEVICE(TestEnroll)
 RUN_EACH_DEVICE(TestRevoke)
+
+// TODO(FLK-36): this was hitting use-after-free in the ASAN build, so disabling
+// it under ASAN for now
+#if !__has_feature(address_sanitizer)
 RUN_EACH_DEVICE(TestShred)
+#endif
+
 END_TEST_CASE(VolumeTest)
+
+bool CheckOneCreatePolicy(KeySourcePolicy policy, fbl::Vector<KeySource> expected) {
+    BEGIN_HELPER;
+    fbl::Vector<KeySource> actual = ComputeEffectiveCreatePolicy(policy);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < actual.size(); i++) {
+        ASSERT_EQ(actual[i], expected[i]);
+    }
+    END_HELPER;
+}
+
+bool TestCreatePolicy() {
+    BEGIN_TEST;
+
+    EXPECT_TRUE(CheckOneCreatePolicy(NullSource, {kNullSource}));
+    EXPECT_TRUE(CheckOneCreatePolicy(TeeRequiredSource, {kTeeSource}));
+    EXPECT_TRUE(CheckOneCreatePolicy(TeeTransitionalSource, {kTeeSource}));
+    EXPECT_TRUE(CheckOneCreatePolicy(TeeOpportunisticSource, {kTeeSource, kNullSource}));
+
+    END_TEST;
+}
+
+bool CheckOneUnsealPolicy(KeySourcePolicy policy, fbl::Vector<KeySource> expected) {
+    BEGIN_HELPER;
+    fbl::Vector<KeySource> actual = ComputeEffectiveUnsealPolicy(policy);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < actual.size(); i++) {
+        ASSERT_EQ(actual[i], expected[i]);
+    }
+    END_HELPER;
+}
+
+bool TestUnsealPolicy() {
+    BEGIN_TEST;
+
+    EXPECT_TRUE(CheckOneUnsealPolicy(NullSource, {kNullSource}));
+    EXPECT_TRUE(CheckOneUnsealPolicy(TeeRequiredSource, {kTeeSource}));
+    EXPECT_TRUE(CheckOneUnsealPolicy(TeeTransitionalSource, {kTeeSource, kNullSource}));
+    EXPECT_TRUE(CheckOneUnsealPolicy(TeeOpportunisticSource, {kTeeSource, kNullSource}));
+
+    END_TEST;
+}
+
+BEGIN_TEST_CASE(PolicyTest)
+RUN_TEST(TestCreatePolicy)
+RUN_TEST(TestUnsealPolicy)
+END_TEST_CASE(PolicyTest)
 
 } // namespace
 } // namespace testing

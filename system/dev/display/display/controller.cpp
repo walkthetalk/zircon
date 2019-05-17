@@ -2,7 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <ddk/binding.h>
 #include <ddk/debug.h>
+#include <ddk/driver.h>
 #include <ddk/trace/event.h>
 #include <fbl/auto_lock.h>
 #include <lib/async/cpp/task.h>
@@ -62,7 +64,7 @@ void Controller::PopulateDisplayTimings(const fbl::RefPtr<DisplayInfo>& info) {
     // Go through all the display mode timings and record whether or not
     // a basic layer configuration is acceptable.
     layer_t test_layer = {};
-    layer_t* test_layers[] = { &test_layer }; test_layer.cfg.primary.image.pixel_format = info->pixel_formats_[0]; 
+    layer_t* test_layers[] = { &test_layer }; test_layer.cfg.primary.image.pixel_format = info->pixel_formats_[0];
     display_config_t test_config;
     const display_config_t* test_configs[] = { &test_config };
     test_config.display_id = info->id;
@@ -417,6 +419,7 @@ void Controller::DisplayControllerInterfaceOnDisplayVsync(uint64_t display_id, z
     // Emit an event called "VSYNC", which is by convention the event
     // that Trace Viewer looks for in its "Highlight VSync" feature.
     TRACE_INSTANT("gfx", "VSYNC", TRACE_SCOPE_THREAD, "display_id", display_id);
+    TRACE_DURATION("gfx", "Display::Controller::OnDisplayVsync", "display_id", display_id);
     fbl::AutoLock lock(&mtx_);
     DisplayInfo* info = nullptr;
     for (auto& display_config : displays_) {
@@ -499,6 +502,9 @@ void Controller::DisplayControllerInterfaceOnDisplayVsync(uint64_t display_id, z
             if (!z_already_matched) {
                 list_delete(&cur->link);
                 cur->self->OnRetire();
+                // Older images may not be presented. Ending their flows here
+                // ensures the sanity of traces.
+                TRACE_FLOW_END("gfx", "present_image", cur->self->id);
                 cur->self.reset();
             }
         }
@@ -513,6 +519,8 @@ void Controller::DisplayControllerInterfaceOnDisplayVsync(uint64_t display_id, z
         list_for_every_entry(&info->images, cur, image_node_t, link) {
             for (unsigned i = 0; i < handle_count; i++) {
                 if (handles[i] == cur->self->info().handle) {
+                    // End of the flow for the image going to be presented.
+                    TRACE_FLOW_END("gfx", "present_image", cur->self->id);
                     images[i] = cur->self->id;
                     break;
                 }
@@ -720,7 +728,7 @@ bool Controller::FN_NAME(uint64_t display_id, fbl::Array<TYPE>* data_out) { \
 }
 
 GET_DISPLAY_INFO(GetCursorInfo,  cursor_infos_, cursor_info_t)
-GET_DISPLAY_INFO(GetSupportedPixelFormats, pixel_formats_, zx_pixel_format_t);
+GET_DISPLAY_INFO(GetSupportedPixelFormats, pixel_formats_, zx_pixel_format_t)
 
 bool Controller::GetDisplayIdentifiers(uint64_t display_id, const char** manufacturer_name,
                                        const char** monitor_name, const char** monitor_serial) {
@@ -744,10 +752,11 @@ bool Controller::GetDisplayIdentifiers(uint64_t display_id, const char** manufac
 }
 
 zx_status_t Controller::DdkOpen(zx_device_t** dev_out, uint32_t flags) {
-    return DdkOpenAt(dev_out, "", flags);
+    return ZX_OK;
 }
 
-zx_status_t Controller::DdkOpenAt(zx_device_t** dev_out, const char* path, uint32_t flags) {
+zx_status_t Controller::CreateClient(bool is_vc, zx::channel device_channel,
+                                     zx::channel client_channel) {
     fbl::AllocChecker ac;
     fbl::unique_ptr<async::Task> task = fbl::make_unique_checked<async::Task>(&ac);
     if (!ac.check()) {
@@ -757,7 +766,6 @@ zx_status_t Controller::DdkOpenAt(zx_device_t** dev_out, const char* path, uint3
 
     fbl::AutoLock lock(&mtx_);
 
-    bool is_vc = strcmp("virtcon", path) == 0;
     if ((is_vc && vc_client_) || (!is_vc && primary_client_)) {
         zxlogf(TRACE, "Already bound\n");
         return ZX_ERR_ALREADY_BOUND;
@@ -769,21 +777,27 @@ zx_status_t Controller::DdkOpenAt(zx_device_t** dev_out, const char* path, uint3
         return ZX_ERR_NO_MEMORY;
     }
 
-    zx_status_t status = client->Init();
+    zx_status_t status = client->Init(std::move(client_channel));
     if (status != ZX_OK) {
         zxlogf(TRACE, "Failed to init client %d\n", status);
         return status;
     }
 
-    if ((status = client->DdkAdd(is_vc ? "dc-vc" : "dc", DEVICE_ADD_INSTANCE)) != ZX_OK) {
+    status = client->DdkAdd(is_vc ? "dc-vc" : "dc",
+                            DEVICE_ADD_INSTANCE,
+                            nullptr /* props */,
+                            0 /* prop_count */,
+                            0 /* proto_id */,
+                            nullptr /* proxy_args */,
+                            device_channel.release());
+    if (status != ZX_OK) {
         zxlogf(TRACE, "Failed to add client %d\n", status);
         return status;
     }
 
     ClientProxy* client_ptr = client.release();
-    *dev_out = client_ptr->zxdev();
 
-    zxlogf(TRACE, "New client connected at \"%s\"\n", path);
+    zxlogf(TRACE, "New client connected.\n");
 
     if (is_vc) {
         vc_client_ = client_ptr;
@@ -823,6 +837,28 @@ zx_status_t Controller::DdkOpenAt(zx_device_t** dev_out, const char* path, uint3
     return task.release()->Post(loop_.dispatcher());
 }
 
+zx_status_t Controller::OpenVirtconController(zx_handle_t device, zx_handle_t controller,
+                                              fidl_txn_t* txn) {
+    zx::channel device_channel(device);
+    zx::channel controller_channel(controller);
+    zx_status_t status = CreateClient(true /* is_vc */, std::move(device_channel),
+                                      std::move(controller_channel));
+    return fuchsia_hardware_display_ProviderOpenVirtconController_reply(txn, status);
+}
+
+zx_status_t Controller::OpenController(zx_handle_t device, zx_handle_t controller,
+                                       fidl_txn_t* txn) {
+    zx::channel device_channel(device);
+    zx::channel controller_channel(controller);
+    zx_status_t status = CreateClient(false /* is_vc */, std::move(device_channel),
+                                      std::move(controller_channel));
+    return fuchsia_hardware_display_ProviderOpenController_reply(txn, status);
+}
+
+zx_status_t Controller::DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn) {
+    return fuchsia_hardware_display_Provider_dispatch(this, txn, msg, &fidl_ops_);
+}
+
 zx_status_t Controller::Bind(fbl::unique_ptr<display::Controller>* device_ptr) {
     zx_status_t status;
     dc_ = ddk::DisplayControllerImplProtocolClient(parent_);
@@ -845,7 +881,7 @@ zx_status_t Controller::Bind(fbl::unique_ptr<display::Controller>* device_ptr) {
     }
     __UNUSED auto ptr = device_ptr->release();
 
-    dc_.SetDisplayControllerInterface(this, &display_controller_interface_ops_);
+    dc_.SetDisplayControllerInterface(this, &display_controller_interface_protocol_ops_);
 
     return ZX_OK;
 }
@@ -885,3 +921,16 @@ zx_status_t display_controller_bind(void* ctx, zx_device_t* parent) {
 
     return core->Bind(&core);
 }
+
+static zx_driver_ops_t display_controller_ops = {
+    .version = DRIVER_OPS_VERSION,
+    .init = nullptr,
+    .bind = display_controller_bind,
+    .create = nullptr,
+    .release = nullptr,
+};
+
+// clang-format off
+ZIRCON_DRIVER_BEGIN(display_controller, display_controller_ops, "zircon", "0.1", 1)
+    BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_DISPLAY_CONTROLLER_IMPL),
+ZIRCON_DRIVER_END(display_controller)

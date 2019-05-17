@@ -152,6 +152,27 @@ bool TraceReader::ReadMetadataRecord(Chunk& record, RecordHeader header) {
         }
         break;
     }
+    case MetadataType::kTraceInfo: {
+        auto info_type = TraceInfoMetadataRecordFields::TraceInfoType::Get<TraceInfoType>(header);
+        switch (info_type) {
+        case TraceInfoType::kMagicNumber: {
+            auto record_magic = MagicNumberRecordFields::Magic::Get<uint32_t>(header);
+            record_consumer_(Record(
+                Record::Metadata{MetadataContent(
+                    MetadataContent::TraceInfo{TraceInfoContent(
+                        TraceInfoContent::MagicNumberInfo{record_magic})})}));
+            break;
+        }
+        default: {
+            // Ignore unknown trace info types for forward compatibility.
+            ReportError(fbl::StringPrintf(
+                "Skipping trace info record of unknown type %u",
+                static_cast<unsigned>(info_type)));
+            break;
+        }
+        }
+        break;
+    }
     default: {
         // Ignore unknown metadata types for forward compatibility.
         ReportError(fbl::StringPrintf(
@@ -459,6 +480,12 @@ bool TraceReader::ReadArguments(Chunk& record,
                                               ArgumentValue::MakeNull()});
             break;
         }
+        case ArgumentType::kBool: {
+            auto value = BoolArgumentFields::Value::Get<bool>(header);
+            out_arguments->push_back(Argument{std::move(name),
+                                              ArgumentValue::MakeBool(value)});
+            break;
+        }
         case ArgumentType::kInt32: {
             auto value = Int32ArgumentFields::Value::Get<int32_t>(header);
             out_arguments->push_back(Argument{std::move(name),
@@ -564,7 +591,7 @@ void TraceReader::SetCurrentProvider(ProviderId id) {
 }
 
 void TraceReader::RegisterProvider(ProviderId id, fbl::String name) {
-    auto provider = fbl::make_unique<ProviderInfo>();
+    auto provider = std::make_unique<ProviderInfo>();
     provider->id = id;
     provider->name = name;
     current_provider_ = provider.get();
@@ -576,7 +603,7 @@ void TraceReader::RegisterString(trace_string_index_t index, fbl::String string)
     ZX_DEBUG_ASSERT(index >= TRACE_ENCODED_STRING_REF_MIN_INDEX &&
                     index <= TRACE_ENCODED_STRING_REF_MAX_INDEX);
 
-    auto entry = fbl::make_unique<StringTableEntry>(index, string);
+    auto entry = std::make_unique<StringTableEntry>(index, string);
     current_provider_->string_table.insert_or_replace(std::move(entry));
 }
 
@@ -585,7 +612,7 @@ void TraceReader::RegisterThread(trace_thread_index_t index,
     ZX_DEBUG_ASSERT(index >= TRACE_ENCODED_THREAD_REF_MIN_INDEX &&
                     index <= TRACE_ENCODED_THREAD_REF_MAX_INDEX);
 
-    auto entry = fbl::make_unique<ThreadTableEntry>(index, process_thread);
+    auto entry = std::make_unique<ThreadTableEntry>(index, process_thread);
     current_provider_->thread_table.insert_or_replace(std::move(entry));
 }
 

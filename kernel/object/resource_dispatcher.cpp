@@ -20,13 +20,15 @@
 
 #define LOCAL_TRACE 0
 
-KCOUNTER(root_resource_created, "resource.root.created");
-KCOUNTER(hypervisor_resource_created, "resource.hypervisor.created");
-KCOUNTER(vmex_resource_created, "resource.vmex.created");
-KCOUNTER(mmio_resource_created, "resource.mmio.created");
-KCOUNTER(irq_resource_created, "resource.irq.created");
-KCOUNTER(ioport_resource_created, "resource.ioport.created");
-KCOUNTER(smc_resource_created, "resource.smc.created");
+KCOUNTER(root_resource_created, "resource.root.created")
+KCOUNTER(hypervisor_resource_created, "resource.hypervisor.created")
+KCOUNTER(vmex_resource_created, "resource.vmex.created")
+KCOUNTER(mmio_resource_created, "resource.mmio.created")
+KCOUNTER(irq_resource_created, "resource.irq.created")
+KCOUNTER(ioport_resource_created, "resource.ioport.created")
+KCOUNTER(smc_resource_created, "resource.smc.created")
+KCOUNTER(dispatcher_resource_create_count, "dispatcher.resource.create")
+KCOUNTER(dispatcher_resource_destroy_count, "dispatcher.resource.destroy")
 
 // Storage for static members of ResourceDispatcher
 RegionAllocator ResourceDispatcher::static_rallocs_[ZX_RSRC_KIND_COUNT];
@@ -34,7 +36,7 @@ ResourceDispatcher::ResourceList ResourceDispatcher::static_resource_list_;
 RegionAllocator::RegionPool::RefPtr ResourceDispatcher::region_pool_;
 const char* kLogTag = "Resources:";
 
-zx_status_t ResourceDispatcher::Create(fbl::RefPtr<ResourceDispatcher>* dispatcher,
+zx_status_t ResourceDispatcher::Create(KernelHandle<ResourceDispatcher>* handle,
                                        zx_rights_t* rights,
                                        uint32_t kind,
                                        uint64_t base,
@@ -43,7 +45,7 @@ zx_status_t ResourceDispatcher::Create(fbl::RefPtr<ResourceDispatcher>* dispatch
                                        const char name[ZX_MAX_NAME_LEN],
                                        RegionAllocator rallocs[ZX_RSRC_KIND_COUNT],
                                        ResourceList* resource_list) {
-    Guard<fbl::Mutex> guard{ResourcesLock::Get()};
+    Guard<Mutex> guard{ResourcesLock::Get()};
     if (kind >= ZX_RSRC_KIND_COUNT || (flags & ZX_RSRC_FLAGS_MASK) != flags) {
         return ZX_ERR_INVALID_ARGS;
     }
@@ -107,23 +109,23 @@ zx_status_t ResourceDispatcher::Create(fbl::RefPtr<ResourceDispatcher>* dispatch
         }
     }
 
-    // We've passd the first hurdle, so it's time to construct the dispatcher
-    // itself.  The constructor will handle adding itself to the shared list if
+    // We've passed the first hurdle, so it's time to construct the dispatcher
+    // itself. The constructor will handle adding itself to the shared list if
     // necessary.
     fbl::AllocChecker ac;
-    auto disp = fbl::AdoptRef(new (&ac) ResourceDispatcher(kind, base, size, flags,
-                                                           ktl::move(region_uptr),
-                                                           rallocs, resource_list));
+    KernelHandle new_handle(fbl::AdoptRef(new (&ac) ResourceDispatcher(kind, base, size, flags,
+                                                                       ktl::move(region_uptr),
+                                                                       rallocs, resource_list)));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
 
     if (name != nullptr) {
-        disp->set_name(name, ZX_MAX_NAME_LEN);
+        new_handle.dispatcher()->set_name(name, ZX_MAX_NAME_LEN);
     }
 
     *rights = default_rights();
-    *dispatcher = ktl::move(disp);
+    *handle = ktl::move(new_handle);
 
     LTRACEF("%s [%u, %#lx, %zu] resource created.\n", kLogTag, kind, base, size);
     return ZX_OK;
@@ -138,6 +140,9 @@ ResourceDispatcher::ResourceDispatcher(uint32_t kind,
                                        ResourceList* resource_list)
     : kind_(kind), base_(base), size_(size), flags_(flags),
       resource_list_(resource_list) {
+
+    kcounter_add(dispatcher_resource_create_count, 1);
+
     if (flags_ & ZX_RSRC_FLAG_EXCLUSIVE) {
         exclusive_region_ = ktl::move(region);
     }
@@ -169,9 +174,11 @@ ResourceDispatcher::ResourceDispatcher(uint32_t kind,
 }
 
 ResourceDispatcher::~ResourceDispatcher() {
+    kcounter_add(dispatcher_resource_destroy_count, 1);
+
     // exclusive allocations will be released when the uptr goes out of scope,
     // shared need to be removed from |all_shared_list_|
-    Guard<fbl::Mutex> guard{ResourcesLock::Get()};
+    Guard<Mutex> guard{ResourcesLock::Get()};
     char name[ZX_MAX_NAME_LEN];
     get_name(name);
     resource_list_->erase(*this);
@@ -184,7 +191,7 @@ zx_status_t ResourceDispatcher::InitializeAllocator(uint32_t kind,
     DEBUG_ASSERT(kind < ZX_RSRC_KIND_COUNT);
     DEBUG_ASSERT(size > 0);
 
-    Guard<fbl::Mutex> guard{ResourcesLock::Get()};
+    Guard<Mutex> guard{ResourcesLock::Get()};
     zx_status_t status;
 
     // This method should only be called for resource kinds with bookkeeping.
@@ -323,4 +330,4 @@ static int cmd_resources(int argc, const cmd_args* argv, uint32_t flags) {
 
 STATIC_COMMAND_START
 STATIC_COMMAND("resource", "Inspect physical address space resource allocations", &cmd_resources)
-STATIC_COMMAND_END(resources);
+STATIC_COMMAND_END(resources)

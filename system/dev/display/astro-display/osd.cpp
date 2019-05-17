@@ -8,6 +8,9 @@
 #include "rdma-regs.h"
 #include <ddk/debug.h>
 #include <ddktl/device.h>
+#include <fbl/auto_lock.h>
+#include <math.h>
+#include <float.h>
 
 namespace astro_display {
 
@@ -51,6 +54,7 @@ int Osd::RdmaThread() {
         // RDMA completed. Remove source for all finished DMA channels
         for (int i = 0; i < kMaxRdmaChannels; i++) {
             if (vpu_mmio_->Read32(VPU_RDMA_STATUS) & RDMA_STATUS_DONE(i)) {
+                fbl::AutoLock lock(&rdma_lock_);
                 uint32_t regVal = vpu_mmio_->Read32(VPU_RDMA_ACCESS_AUTO);
                 regVal &= ~RDMA_ACCESS_AUTO_INT_EN(i); // VSYNC interrupt source
                 vpu_mmio_->Write32(regVal, VPU_RDMA_ACCESS_AUTO);
@@ -89,7 +93,7 @@ zx_status_t Osd::Init(zx_device_t* parent) {
     }
 
     //Map RDMA Done Interrupt
-    status = pdev_map_interrupt(&pdev_, IRQ_RDMA, rdma_irq_.reset_and_get_address());
+    status = pdev_get_interrupt(&pdev_, IRQ_RDMA, 0, rdma_irq_.reset_and_get_address());
     if (status != ZX_OK) {
         DISP_ERROR("Could not map RDMA interrupt\n");
         return status;
@@ -141,17 +145,50 @@ zx_status_t Osd::Configure() {
     return ZX_OK;
 }
 
-void Osd::FlipOnVsync(uint8_t idx) {
+//TODO(payamm): Vendor spec does not indicate range. However (-1024 1024) seems
+// to be the correct range based on experimentation.
+uint32_t Osd::FloatToOffset(float f) {
+    uint32_t offset_val = 0;
+    if (f < 0) {
+        offset_val |= (1 << 11);
+        f *= -1;
+    }
+    ZX_DEBUG_ASSERT(0 <= f && f < 1.0f);
+
+    // convert [0 1) --> [0 1024)
+    f *= 1024;
+    offset_val |= static_cast<uint32_t>(f);
+    return offset_val;
+}
+
+//TODO(payamm): Improve performance and accuracy if needed
+uint32_t Osd::FloatToFixed3_10(float f) {
+    uint32_t fixed_num = 0;
+    if (f < 0) {
+        f *= -1;
+        fixed_num |= (1 << 12);
+    }
+    fixed_num |= static_cast<uint32_t>((round(f * (1 << 10))));
+    fixed_num &= 0x1fff;
+    return fixed_num;
+}
+
+void Osd::FlipOnVsync(const display_config_t* config) {
+
+    // extract index
+    uint8_t idx = (uint8_t) config->layer_list[0]->cfg.primary.image.handle;
 
     // Get the first available channel
     int rdma_channel = GetNextAvailableRdmaChannel();
     uint8_t retry_count = 0;
     while (rdma_channel == -1 && retry_count++ < kMaxRetries) {
-        zx_nanosleep(zx_deadline_after(ZX_MSEC(1)));
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(8)));
         rdma_channel = GetNextAvailableRdmaChannel();
     }
 
     if (rdma_channel < 0) {
+        DISP_ERROR("Could not find any available RDMA channels!\n");
+        Dump();
         ZX_DEBUG_ASSERT(false);
         return;
     }
@@ -166,6 +203,67 @@ void Osd::FlipOnVsync(uint8_t idx) {
     SetRdmaTableValue(rdma_channel, IDX_CFG_W0, cfg_w0);
     SetRdmaTableValue(rdma_channel, IDX_CTRL_STAT,
                       vpu_mmio_->Read32(VPU_VIU_OSD1_CTRL_STAT) | (1 << 0));
+
+    // Perform color correction if needed
+    if (config->cc_flags) {
+        // Set enable bit
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_EN_CTRL,
+                          vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_EN_CTRL) | (1 << 0));
+
+        // Load PreOffset values (or 0 if none entered)
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_PRE_OFFSET0_1,
+                          config->cc_flags & COLOR_CONVERSION_PREOFFSET ?
+                          (FloatToOffset(config->cc_preoffsets[0]) << 16 |
+                           FloatToOffset(config->cc_preoffsets[1]) << 0) :  0);
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_PRE_OFFSET2,
+                          config->cc_flags & COLOR_CONVERSION_PREOFFSET ?
+                          (FloatToOffset(config->cc_preoffsets[2]) << 0) : 0);
+
+        // Load PostOffset values (or 0 if none entered)
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_OFFSET0_1,
+                          config->cc_flags & COLOR_CONVERSION_POSTOFFSET ?
+                          (FloatToOffset(config->cc_postoffsets[0]) << 16 |
+                           FloatToOffset(config->cc_postoffsets[1]) << 0) :  0);
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_OFFSET2,
+                          config->cc_flags & COLOR_CONVERSION_POSTOFFSET ?
+                          (FloatToOffset(config->cc_postoffsets[2]) << 0) : 0);
+
+        float identity[3][3] = {
+            { 1, 0, 0, },
+            { 0, 1, 0, },
+            { 0, 0, 1, },
+        };
+
+        // This will include either the entered coefficient matrix or the identity matrix
+        float final[3][3] = {};
+
+        for (uint32_t i = 0; i < 3; i++) {
+            for (uint32_t j = 0; j < 3; j++) {
+                final[i][j] = config->cc_flags & COLOR_CONVERSION_COEFFICIENTS ?
+                config->cc_coefficients[i][j] : identity[i][j];
+            }
+        }
+
+        // Load up the coefficient matrix registers
+        SetRdmaTableValue(rdma_channel,IDX_MATRIX_COEF00_01,
+                          FloatToFixed3_10(final[0][0]) << 16 |
+                          FloatToFixed3_10(final[0][1]) << 0);
+        SetRdmaTableValue(rdma_channel,IDX_MATRIX_COEF02_10,
+                          FloatToFixed3_10(final[0][2]) << 16 |
+                          FloatToFixed3_10(final[1][0]) << 0);
+        SetRdmaTableValue(rdma_channel,IDX_MATRIX_COEF11_12,
+                          FloatToFixed3_10(final[1][1]) << 16 |
+                          FloatToFixed3_10(final[1][2]) << 0);
+        SetRdmaTableValue(rdma_channel,IDX_MATRIX_COEF20_21,
+                          FloatToFixed3_10(final[2][0]) << 16 |
+                          FloatToFixed3_10(final[2][1]) << 0);
+        SetRdmaTableValue(rdma_channel,IDX_MATRIX_COEF22,
+                          FloatToFixed3_10(final[2][2]) << 0);
+    } else {
+        // Disable color conversion engine
+        SetRdmaTableValue(rdma_channel, IDX_MATRIX_EN_CTRL,
+                          vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_EN_CTRL) & ~(1 << 0));
+    }
     FlushRdmaTable(rdma_channel);
 
     // Write the start and end address of the table. End address is the last address that the
@@ -177,6 +275,7 @@ void Osd::FlipOnVsync(uint8_t idx) {
                        VPU_RDMA_AHB_END_ADDR(rdma_channel));
 
     // Enable Auto mode: Non-Increment, VSync Interrupt Driven, Write
+    fbl::AutoLock lock(&rdma_lock_);
     uint32_t regVal = vpu_mmio_->Read32(VPU_RDMA_ACCESS_AUTO);
     regVal |= RDMA_ACCESS_AUTO_INT_EN(rdma_channel); // VSYNC interrupt source
     regVal |= RDMA_ACCESS_AUTO_WRITE(rdma_channel); // Write
@@ -344,6 +443,16 @@ void Osd::ResetRdmaTable() {
         RdmaTable* rdma_table = reinterpret_cast<RdmaTable*>(rdma_chnl_container_[i].virt_offset);
         rdma_table[IDX_CFG_W0].reg = (VPU_VIU_OSD1_BLK0_CFG_W0 >> 2);
         rdma_table[IDX_CTRL_STAT].reg = (VPU_VIU_OSD1_CTRL_STAT >> 2);
+        rdma_table[IDX_MATRIX_EN_CTRL].reg = (VPU_VPP_POST_MATRIX_EN_CTRL >> 2);
+        rdma_table[IDX_MATRIX_COEF00_01].reg = (VPU_VPP_POST_MATRIX_COEF00_01 >> 2);
+        rdma_table[IDX_MATRIX_COEF02_10].reg = (VPU_VPP_POST_MATRIX_COEF02_10 >> 2);
+        rdma_table[IDX_MATRIX_COEF11_12].reg = (VPU_VPP_POST_MATRIX_COEF11_12 >> 2);
+        rdma_table[IDX_MATRIX_COEF20_21].reg = (VPU_VPP_POST_MATRIX_COEF20_21 >> 2);
+        rdma_table[IDX_MATRIX_COEF22].reg = (VPU_VPP_POST_MATRIX_COEF22 >> 2);
+        rdma_table[IDX_MATRIX_OFFSET0_1].reg = (VPU_VPP_POST_MATRIX_OFFSET0_1 >> 2);
+        rdma_table[IDX_MATRIX_OFFSET2].reg = (VPU_VPP_POST_MATRIX_OFFSET2 >> 2);
+        rdma_table[IDX_MATRIX_PRE_OFFSET0_1].reg = (VPU_VPP_POST_MATRIX_PRE_OFFSET0_1 >> 2);
+        rdma_table[IDX_MATRIX_PRE_OFFSET2].reg = (VPU_VPP_POST_MATRIX_PRE_OFFSET2 >> 2);
     }
 
 }
@@ -357,7 +466,7 @@ void Osd::SetRdmaTableValue(uint32_t channel, uint32_t idx, uint32_t val) {
 
 void Osd::FlushRdmaTable(uint32_t channel) {
     zx_status_t status = zx_cache_flush(rdma_chnl_container_[channel].virt_offset,
-                                        sizeof(RdmaTable),
+                                        IDX_MAX * sizeof(RdmaTable),
                                         ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE);
     if (status != ZX_OK) {
         DISP_ERROR("Could not clean cache %d\n", status);
@@ -578,6 +687,79 @@ void Osd::Dump() {
             reg = VPU_VIU_OSD2_BLK0_CFG_W4;
         DISP_INFO("reg[0x%x]: 0x%08x\n\n", reg, READ32_REG(VPU, reg));
     }
+
+
+    DISP_INFO("Dumping all RDMA related Registers\n\n");
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_MAN = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_MAN));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_MAN = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_MAN));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_1 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_1));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_1 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_1));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_2));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_2));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_3 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_3));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_3 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_3));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_4 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_4));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_4 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_4));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_5 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_5));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_5 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_5));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_6 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_6));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_6 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_6));
+    DISP_INFO("VPU_RDMA_AHB_START_ADDR_7 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_START_ADDR_7));
+    DISP_INFO("VPU_RDMA_AHB_END_ADDR_7 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_AHB_END_ADDR_7));
+    DISP_INFO("VPU_RDMA_ACCESS_AUTO = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_ACCESS_AUTO));
+    DISP_INFO("VPU_RDMA_ACCESS_AUTO2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_ACCESS_AUTO2));
+    DISP_INFO("VPU_RDMA_ACCESS_AUTO3 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_ACCESS_AUTO3));
+    DISP_INFO("VPU_RDMA_ACCESS_MAN = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_ACCESS_MAN));
+    DISP_INFO("VPU_RDMA_CTRL = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_CTRL));
+    DISP_INFO("VPU_RDMA_STATUS = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_STATUS));
+    DISP_INFO("VPU_RDMA_STATUS2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_STATUS2));
+    DISP_INFO("VPU_RDMA_STATUS3 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_RDMA_STATUS3));
+
+    DISP_INFO("Dumping all Color Correction Matrix related Registers\n\n");
+    DISP_INFO("VPU_VPP_POST_MATRIX_COEF00_01 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_COEF00_01));
+    DISP_INFO("VPU_VPP_POST_MATRIX_COEF02_10 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_COEF02_10));
+    DISP_INFO("VPU_VPP_POST_MATRIX_COEF11_12 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_COEF11_12));
+    DISP_INFO("VPU_VPP_POST_MATRIX_COEF20_21 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_COEF20_21));
+    DISP_INFO("VPU_VPP_POST_MATRIX_COEF22 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_COEF22));
+    DISP_INFO("VPU_VPP_POST_MATRIX_OFFSET0_1 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_OFFSET0_1));
+    DISP_INFO("VPU_VPP_POST_MATRIX_OFFSET2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_OFFSET2));
+    DISP_INFO("VPU_VPP_POST_MATRIX_PRE_OFFSET0_1 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_PRE_OFFSET0_1));
+    DISP_INFO("VPU_VPP_POST_MATRIX_PRE_OFFSET2 = 0x%x\n",
+              vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_PRE_OFFSET2));
+    DISP_INFO("VPU_VPP_POST_MATRIX_EN_CTRL = 0x%x\n",
+          vpu_mmio_->Read32(VPU_VPP_POST_MATRIX_EN_CTRL));
 }
 
 void Osd::Release() {

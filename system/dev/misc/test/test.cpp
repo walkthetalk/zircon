@@ -4,9 +4,12 @@
 
 #include <ddk/binding.h>
 #include <ddk/driver.h>
+#include <ddk/platform-defs.h>
 #include <ddktl/device.h>
 #include <ddktl/protocol/test.h>
 #include <fbl/algorithm.h>
+#include <fbl/auto_lock.h>
+#include <fbl/mutex.h>
 #include <fbl/string_piece.h>
 #include <fbl/unique_ptr.h>
 #include <fuchsia/device/test/c/fidl.h>
@@ -15,11 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zircon/thread_annotations.h>
 
 namespace {
 
 class TestDevice;
-using TestDeviceType = ddk::Device<TestDevice, ddk::Messageable>;
+using TestDeviceType = ddk::Device<TestDevice, ddk::Messageable, ddk::Unbindable>;
 
 class TestDevice : public TestDeviceType,
                    public ddk::TestProtocol<TestDevice, ddk::base_protocol> {
@@ -29,6 +33,7 @@ public:
     // Methods required by the ddk mixins
     zx_status_t DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn);
     void DdkRelease();
+    void DdkUnbind();
 
     // Methods required by the TestProtocol mixin
     void TestSetOutputSocket(zx::socket socket);
@@ -40,13 +45,17 @@ public:
 
     void SetChannel(zx::channel c);
 private:
+    // Lock that synchronizes calls to DdkRemove()
+    fbl::Mutex remove_lock_;
+    bool has_been_removed_ TA_GUARDED(remove_lock_) = false;
+
     zx::socket output_;
     zx::channel channel_;
     test_func_t test_func_;
 };
 
 class TestRootDevice;
-using TestRootDeviceType = ddk::Device<TestRootDevice, ddk::Messageable>;
+using TestRootDeviceType = ddk::Device<TestRootDevice, ddk::Messageable, ddk::Unbindable>;
 
 class TestRootDevice : public TestRootDeviceType {
 public:
@@ -58,7 +67,8 @@ public:
 
     // Methods required by the ddk mixins
     zx_status_t DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn);
-    void DdkRelease() { ZX_ASSERT_MSG(false, "TestRootDevice::DdkRelease() not supported\n"); }
+    void DdkRelease() { delete this; }
+    void DdkUnbind() { DdkRemove(); }
 
     static zx_status_t FidlCreateDevice(void* ctx, const char* name_data, size_t name_len,
                                         fidl_txn_t* txn);
@@ -92,7 +102,11 @@ zx_status_t TestDevice::TestRunTests(test_report_t* report) {
 }
 
 void TestDevice::TestDestroy() {
-    DdkRemove();
+    fbl::AutoLock guard(&remove_lock_);
+    if (!has_been_removed_) {
+        DdkRemove();
+        has_been_removed_ = true;
+    }
 }
 
 static zx_status_t fidl_SetOutputSocket(void* ctx, zx_handle_t raw_socket) {
@@ -147,6 +161,10 @@ void TestDevice::DdkRelease() {
     delete this;
 }
 
+void TestDevice::DdkUnbind() {
+    TestDestroy();
+}
+
 zx_status_t TestRootDevice::CreateDevice(const fbl::StringPiece& name,
                                          char* path_out, size_t path_size, size_t* path_actual) {
     static_assert(fuchsia_device_test_MAX_DEVICE_NAME_LEN == ZX_DEVICE_NAME_MAX);
@@ -167,7 +185,7 @@ zx_status_t TestRootDevice::CreateDevice(const fbl::StringPiece& name,
         return ZX_ERR_BUFFER_TOO_SMALL;
     }
 
-    auto device = fbl::make_unique<TestDevice>(zxdev());
+    auto device = std::make_unique<TestDevice>(zxdev());
     zx_status_t status = device->DdkAdd(devname);
     if (status != ZX_OK) {
         return status;
@@ -199,7 +217,7 @@ zx_status_t TestRootDevice::DdkMessage(fidl_msg_t* msg, fidl_txn_t* txn) {
 }
 
 zx_status_t TestDriverBind(void* ctx, zx_device_t* dev) {
-    auto root = fbl::make_unique<TestRootDevice>(dev);
+    auto root = std::make_unique<TestRootDevice>(dev);
     zx_status_t status = root->Bind();
     if (status != ZX_OK) {
         return status;
@@ -218,6 +236,12 @@ const zx_driver_ops_t kTestDriverOps = []() {
 
 } // namespace
 
-ZIRCON_DRIVER_BEGIN(test, kTestDriverOps, "zircon", "0.1", 1)
+ZIRCON_DRIVER_BEGIN(test, kTestDriverOps, "zircon", "0.1", 4)
     BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_TEST_PARENT),
+
+    // This bind functionality is used for the libdriver integration tests to
+    // let us hook into composite devices after they are instantiated.
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_TEST),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_PID, PDEV_PID_LIBDRIVER_TEST),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_TEST_COMPOSITE),
 ZIRCON_DRIVER_END(test)

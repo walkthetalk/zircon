@@ -4,12 +4,12 @@
 
 #include "fidl/source_manager.h"
 
-#include <utility>
 #include <sys/stat.h>
+#include <utility>
 
 namespace fidl {
 
-bool SourceManager::CreateSource(StringView filename) {
+bool SourceManager::CreateSource(std::string_view filename) {
     struct stat s;
     if (stat(filename.data(), &s) != 0)
         return false;
@@ -25,13 +25,12 @@ bool SourceManager::CreateSource(StringView filename) {
     std::string data;
     fseek(file, 0, SEEK_END);
     auto filesize = ftell(file);
-    data.resize(filesize + 1);
+    data.resize(filesize);
     rewind(file);
     fread(&data[0], 1, filesize, file);
-    data[filesize] = 0;
     fclose(file);
 
-    AddSourceFile(std::make_unique<SourceFile>(filename, std::move(data)));
+    AddSourceFile(std::make_unique<SourceFile>(std::string(filename), std::move(data)));
     return true;
 }
 

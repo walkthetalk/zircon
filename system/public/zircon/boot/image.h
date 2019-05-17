@@ -2,7 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_BOOT_IMAGE_H_
+#define SYSROOT_ZIRCON_BOOT_IMAGE_H_
+
+// This file contains assembly code that cannot be clang formatted.
+// clang-format off
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>
@@ -125,6 +129,7 @@ typedef struct {
     macro(ZBI_TYPE_FRAMEBUFFER, "FRAMEBUFFER", ".bin") \
     macro(ZBI_TYPE_DRV_MAC_ADDRESS, "DRV_MAC_ADDRESS", ".bin") \
     macro(ZBI_TYPE_DRV_PARTITION_MAP, "DRV_PARTITION_MAP", ".bin") \
+    macro(ZBI_TYPE_DRV_BOARD_PRIVATE, "DRV_BOARD_PRIVATE", ".bin") \
     macro(ZBI_TYPE_BOOT_CONFIG, "BOOT_CONFIG", ".bin") \
     macro(ZBI_TYPE_BOOT_VERSION, "BOOT_VERSION", ".bin")
 
@@ -257,12 +262,29 @@ typedef struct {
 // The interpretation of the payload (after possible decompression) is
 // indicated by the specific zbi_header_t.type value.
 //
-// If ZBI_FLAG_STORAGE_COMPRESSED is set in zbi_header_t.flags, then the
-// payload is compressed with LZ4 and zbi_header_t.extra gives the exact
-// size of the decompressed payload.  If ZBI_FLAG_STORAGE_COMPRESSED is
-// not set, then zbi_header_t.extra matches zbi_header_t.length.
+// **Note:** The ZBI_TYPE_STORAGE_* types are not a long-term stable ABI.
+//  - Items of these types are always packed for a specific version of the
+//    kernel and userland boot services, often in the same build that compiles
+//    the kernel.
+//  - These item types are **not** expected to be synthesized or
+//    examined by boot loaders.
+//  - New versions of the `zbi` tool will usually retain the ability to
+//    read old formats and non-default switches to write old formats, for
+//    diagnostic use.
 //
-// TODO(mcgrathr): Document or point to the details of the LZ4 header format.
+// The zbi_header_t.extra field always gives the exact size of the
+// original, uncompressed payload.  That equals zbi_header_t.length when
+// the payload is not compressed.  If ZBI_FLAG_STORAGE_COMPRESSED is set in
+// zbi_header_t.flags, then the payload is compressed.
+//
+// **Note:** Magic-number and header bytes at the start of the compressed
+// payload indicate the compression algorithm and parameters.  The set of
+// compression formats is not a long-term stable ABI.
+//  - Zircon [userboot](../../../../docs/userboot.md) and core services
+//    do the decompression.  A given kernel build's `userboot` will usually
+//    only support one particular compression format.
+//  - The `zbi` tool will usually retain the ability to compress and
+//    decompress for old formats, and can be used to convert between formats.
 #define ZBI_FLAG_STORAGE_COMPRESSED     (0x00000001)
 
 // A virtual disk image.  This is meant to be treated as if it were a
@@ -270,71 +292,11 @@ typedef struct {
 // the storage device, in whatever format that might be.
 #define ZBI_TYPE_STORAGE_RAMDISK        (0x4b534452) // RDSK
 
-// The /boot filesystem in BOOTFS format, specified below.
+// The /boot filesystem in BOOTFS format, specified in <zircon/boot/bootfs.h>.
 // A complete ZBI must have exactly one ZBI_TYPE_STORAGE_BOOTFS item.
 // Zircon [userboot](../../../../docs/userboot.md) handles the contents
 // of this filesystem.
 #define ZBI_TYPE_STORAGE_BOOTFS         (0x42534642) // BFSB
-
-// The payload (after decompression) of an item in BOOTFS format consists
-// of separate "file" images that are each aligned to ZBI_BOOTFS_PAGE_SIZE
-// bytes from the beginning of the item payload.  The first "file" consists
-// of a zbi_bootfs_header_t followed by directory entries.
-#define ZBI_BOOTFS_PAGE_SIZE            (4096u)
-
-#define ZBI_BOOTFS_PAGE_ALIGN(size) \
-    (((size) + ZBI_BOOTFS_PAGE_SIZE - 1) & -ZBI_BOOTFS_PAGE_SIZE)
-
-#ifndef __ASSEMBLER__
-typedef struct {
-    // Must be ZBI_BOOTFS_MAGIC.
-    uint32_t magic;
-
-    // Size in bytes of all the directory entries.
-    // Does not include the size of the zbi_bootfs_header_t.
-    uint32_t dirsize;
-
-    // Reserved for future use.  Set to 0.
-    uint32_t reserved0;
-    uint32_t reserved1;
-} zbi_bootfs_header_t;
-#endif
-
-// LSW of sha256("bootfs")
-#define ZBI_BOOTFS_MAGIC                (0xa56d3ff9)
-
-// Each directory entry holds a pathname and gives the offset and size
-// of the contents of the file by that name.
-#ifndef __ASSEMBLER__
-typedef struct {
-    // Length of the name[] field at the end.  This length includes the
-    // NUL terminator, which must be present, but does not include any
-    // alignment padding required before the next directory entry.
-    uint32_t name_len;
-
-    // Length of the file in bytes.  This is an exact size that is not
-    // rounded, though the file is always padded with zeros up to a
-    // multiple of ZBI_BOOTFS_PAGE_SIZE.
-    uint32_t data_len;
-
-    // Offset from the beginning of the payload (zbi_bootfs_header_t) to
-    // the file's data.  This must be a multiple of ZBI_BOOTFS_PAGE_SIZE.
-    uint32_t data_off;
-
-    // Pathname of the file, a UTF-8 string.  This must include a NUL
-    // terminator at the end.  It must not begin with a '/', but it may
-    // contain '/' separators for subdirectories.
-    char name[];
-} zbi_bootfs_dirent_t;
-#endif
-
-// Each directory entry has a variable size of [16,268] bytes that
-// must be a multiple of 4 bytes.
-#define ZBI_BOOTFS_DIRENT_SIZE(name_len) \
-    ((sizeof(zbi_bootfs_dirent_t) + (name_len) + 3) & -(size_t)4)
-
-// zbi_bootfs_dirent_t.name_len must be > 1 and <= ZBI_BOOTFS_MAX_NAME_LEN.
-#define ZBI_BOOTFS_MAX_NAME_LEN         (256)
 
 
 // The remaining types are used to communicate information from the boot
@@ -447,7 +409,9 @@ typedef struct {
 }  zbi_topology_arm_info_t;
 
 typedef struct {
-    uint32_t apic_id;
+    // Indexes here correspond to the logical_ids index for the thread.
+    uint32_t apic_ids[ZBI_MAX_SMT];
+    uint32_t apic_id_count;
 }  zbi_topology_x86_info_t;
 
 typedef struct {
@@ -602,6 +566,10 @@ typedef struct {
 #define ZBI_TYPE_DRV_PARTITION_MAP      (0x5452506D) // mPRT
 #define ZBI_PARTITION_NAME_LEN          (32)
 #define ZBI_PARTITION_GUID_LEN          (16)
+
+// Private information for the board driver.
+#define ZBI_TYPE_DRV_BOARD_PRIVATE      (0x524F426D) // mBOR
+
 #ifndef __ASSEMBLER__
 typedef struct {
     // GUID specifying the format and use of data stored in the partition.
@@ -639,3 +607,5 @@ typedef struct {
     zbi_partition_t partitions[];
 } zbi_partition_map_t;
 #endif
+
+#endif  // SYSROOT_ZIRCON_BOOT_IMAGE_H_

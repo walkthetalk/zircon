@@ -32,13 +32,16 @@ const x86_microarch_config_t* x86_microarch_config;
 static struct x86_model_info model_info;
 
 bool g_x86_feature_fsgsbase;
+bool g_x86_feature_pcid_good;
+bool g_has_meltdown;
+bool g_has_l1tf;
 
 enum x86_hypervisor_list x86_hypervisor;
 
 static int initialized = 0;
 
 static enum x86_microarch_list get_microarch(struct x86_model_info* info);
-static void select_microarch_config(void);
+static const x86_microarch_config_t* select_microarch_config(enum x86_microarch_list info);
 
 static enum x86_hypervisor_list get_hypervisor();
 
@@ -124,11 +127,29 @@ void x86_feature_init(void) {
 
         x86_microarch = get_microarch(&model_info);
     }
-    select_microarch_config();
+    // Get microcode patch level
+    switch (x86_vendor) {
+    case X86_VENDOR_INTEL:
+        model_info.patch_level = x86_intel_get_patch_level();
+        break;
+    case X86_VENDOR_AMD:
+        model_info.patch_level = x86_amd_get_patch_level();
+        break;
+    default:
+        break;
+    }
+    x86_microarch_config = select_microarch_config(x86_microarch);
 
     g_x86_feature_fsgsbase = x86_feature_test(X86_FEATURE_FSGSBASE);
+    g_x86_feature_pcid_good = x86_feature_test(X86_FEATURE_PCID) &&
+        x86_feature_test(X86_FEATURE_INVPCID);
 
     x86_hypervisor = get_hypervisor();
+
+    if (x86_vendor == X86_VENDOR_INTEL) {
+        g_has_meltdown = x86_intel_cpu_has_meltdown();
+        g_has_l1tf = x86_intel_cpu_has_l1tf();
+    }
 }
 
 static enum x86_microarch_list get_microarch(struct x86_model_info* info) {
@@ -184,7 +205,7 @@ static enum x86_microarch_list get_microarch(struct x86_model_info* info) {
 
 static enum x86_hypervisor_list get_hypervisor() {
     if (!x86_feature_test(X86_FEATURE_HYPERVISOR)) {
-        return X86_HYPERVISOR_UNKNOWN;
+        return X86_HYPERVISOR_NONE;
     }
     uint32_t a, b, c, d;
     cpuid(X86_CPUID_HYP_VENDOR, &a, &b, &c, &d);
@@ -340,6 +361,7 @@ void x86_feature_debug(void) {
     printf("Microarch: %s\n", microarch_string);
     printf("F/M/S: %x/%x/%x\n", model_info.display_family, model_info.display_model,
            model_info.stepping);
+    printf("patch_level: %x\n", model_info.patch_level);
 
     char brand_string[50];
     memset(brand_string, 0, sizeof(brand_string));
@@ -369,6 +391,15 @@ void x86_feature_debug(void) {
     }
     if (col > 0)
         printf("\n");
+    // Print synthetic 'features'/properties
+    printf("Properties: ");
+    if (g_has_meltdown)
+        printf("meltdown ");
+    if (g_has_l1tf)
+        printf("l1tf ");
+    if (g_x86_feature_pcid_good)
+        printf("pcid_good ");
+    printf("\n");
 }
 
 static uint64_t default_apic_freq() {
@@ -578,58 +609,44 @@ static const x86_microarch_config_t unknown_vendor_config{
     .disable_c1e = false,
 };
 
-void select_microarch_config(void) {
-    switch (x86_microarch) {
+const x86_microarch_config_t* select_microarch_config(enum x86_microarch_list info) {
+    switch (info) {
     case X86_MICROARCH_INTEL_NEHALEM:
-        x86_microarch_config = &nehalem_config;
-        break;
+        return &nehalem_config;
     case X86_MICROARCH_INTEL_WESTMERE:
-        x86_microarch_config = &westmere_config;
-        break;
+        return &westmere_config;
     case X86_MICROARCH_INTEL_SANDY_BRIDGE:
-        x86_microarch_config = &snb_config;
-        break;
+        return &snb_config;
     case X86_MICROARCH_INTEL_IVY_BRIDGE:
-        x86_microarch_config = &ivb_config;
-        break;
+        return &ivb_config;
     case X86_MICROARCH_INTEL_BROADWELL:
-        x86_microarch_config = &bdw_config;
-        break;
+        return &bdw_config;
     case X86_MICROARCH_INTEL_HASWELL:
-        x86_microarch_config = &hsw_config;
-        break;
+        return &hsw_config;
     case X86_MICROARCH_INTEL_SKYLAKE:
-        x86_microarch_config = &skl_config;
-        break;
+        return &skl_config;
     case X86_MICROARCH_INTEL_KABYLAKE:
-        x86_microarch_config = &kbl_config;
-        break;
+        return &kbl_config;
     case X86_MICROARCH_INTEL_SILVERMONT:
-        x86_microarch_config = &smt_config;
-        break;
+        return &smt_config;
     case X86_MICROARCH_AMD_BULLDOZER:
-        x86_microarch_config = &bulldozer_config;
-        break;
+        return &bulldozer_config;
     case X86_MICROARCH_AMD_JAGUAR:
-        x86_microarch_config = &jaguar_config;
-        break;
+        return &jaguar_config;
     case X86_MICROARCH_AMD_ZEN:
-        x86_microarch_config = &zen_config;
-        break;
+        return &zen_config;
     case X86_MICROARCH_UNKNOWN: {
         printf("WARNING: Could not identify microarch.\n");
         printf("Please file a bug with your boot log and description of hardware.\n");
         switch (x86_vendor) {
         case X86_VENDOR_INTEL:
-            x86_microarch_config = &intel_default_config;
-            break;
+            return &intel_default_config;
         case X86_VENDOR_AMD:
-            x86_microarch_config = &amd_default_config;
-            break;
+            return &amd_default_config;
         case X86_VENDOR_UNKNOWN:
-            x86_microarch_config = &unknown_vendor_config;
-            break;
+            return &unknown_vendor_config;
         }
     }
     }
+    return &unknown_vendor_config;
 }

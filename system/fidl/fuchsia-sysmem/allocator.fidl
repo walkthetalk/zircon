@@ -1,97 +1,65 @@
-// Copyright 2018 The Chromium Authors. All rights reserved.
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 library fuchsia.sysmem;
 
-using zx;
-
 // Allocates system memory buffers.
 //
 // Needs Layout = "Simple" because used with "FIDL Simple C Bindings".
 [Discoverable, Layout = "Simple"]
-interface Allocator {
-    // Allocates a collection of buffers on behalf of a single client.
+protocol Allocator {
+    // Allocates a BufferCollection on behalf of a single client (aka initiator)
+    // who is also the only participant (from the point of view of sysmem).
     //
-    // |bufferCount| indicates how many buffers to allocate, between 1 and 64.
-    // |spec| describes constraints for allocating buffers of some
-    // desired form.
-    // |usage| describes how the client intends to access the buffers.
-    // |collection| provides access to the allocated buffers.
+    // This call exists mainly for temp/testing purposes.  This call skips the
+    // BufferCollectionToken stage, so there's no way to allow another
+    // participant to specify its constraints.
     //
-    // Returns |ZX_OK| if successful.
-    // Returns |ZX_ERR_NO_MEMORY| if the request is valid but cannot be
-    // fulfilled due to resource exhaustion.
-    // Returns |ZX_ERR_ACCESS_DENIED| if the caller is not permitted to
-    // obtain the buffers it requested.
-    // Returns |ZX_ERR_INVALID_ARGS| if the request is malformed.
-    // Returns |ZX_ERR_NOT_SUPPORTED| if request is valid but cannot be
-    // satisfied, perhaps due to hardware limitations.
-    1: AllocateCollection(uint32 buffer_count,
-                          BufferSpec spec,
-                          BufferUsage usage)
-           -> (zx.status status, BufferCollectionInfo collection);
+    // Real clients are encouraged to use AllocateSharedCollection() instead,
+    // and to let relevant participants directly convey their own constraints to
+    // sysmem.
+    //
+    // |constraints| indicates constraints on the buffer collection, such as how
+    // many buffers to allocate, buffer size constraints, etc.
+    //
+    // |collection| is the server end of the BufferCollection FIDL channel.  The
+    // client can call SetConstraints() and then WaitForBuffersAllocated() on
+    // the client end of this channel to specify constraints and then determine
+    // success/failure and get the BufferCollectionInfo_2 for the
+    // BufferCollection.  The client should also keep the client end of
+    // this channel open while using the BufferCollection, and should notice
+    // when this channel closes and stop using the BufferCollection ASAP.
+    AllocateNonSharedCollection(request<BufferCollection> collection);
 
-    // Allocates a collection of buffers which will be shared among one
-    // or more clients.  This operation occurs in two phases (which may
-    // happen concurrently).
+    // Creates a logical BufferCollectionToken which can be shared among
+    // participants (using BufferCollectionToken.Duplicate()), and then
+    // converted into a BufferCollection using BindSharedCollection().
     //
-    // |bufferCount| indicates how many buffers to allocate, between 1 and 64.
-    // |spec| describes constraints for allocating buffers of some
-    // desired form.
-    // |token_peer| is one endpoint of an eventpair which forms an association
-    // between this request and calls to |BindSharedCollection()|.
-    //
-    // In the first phase, one client acts as a coordinator.  The coordinator
-    // creates an event pair and designates one endpoint as the *token* and
-    // the other endpoint as the *token peer*. The coordinator then calls
-    // |AllocateSharedCollection()|, passing the buffer request and the token
-    // peer’s handle.  It also sends a token to each client which requires
-    // access to the buffer, duplicating the token’s handle if necessary.
-    //
-    // In the second phase, each client which received a token calls
-    // |BindSharedCollection()|, passing their usages and the token.
-    // As the buffer manager handles each request, it retrieves the token’s
-    // kernel object id (KOID) and adds it to a list to be matched up with
-    // token peers from prior or subsequent calls to
-    // |AllocateSharedCollection()|.  Once matched, the token is closed
-    // and the client’s corresponding usages are associated with the
-    // token peer.
-    //
-    // This method returns once all tokens corresponding to the |token_peer|
-    // are closed and the allocation completes successfully, or an error
-    // occurs.
-    //
-    // Returns |ZX_OK| once all of the collection’s tokens have been
-    // closed and buffer allocation has completed successfully.
-    // Returns |ZX_ERR_ACCESS_DENIED| if the caller is not permitted to
-    // obtain the buffers it requested.
-    // Returns |ZX_ERR_INVALID_ARGS| if the request is malformed.
-    // Returns |ZX_ERR_NOT_SUPPORTED| if request is valid but cannot be
-    // satisfied, perhaps due to hardware limitations.
-    2: AllocateSharedCollection(uint32 buffer_count,
-                                BufferSpec spec,
-                                handle<eventpair> token_peer)
-           -> (zx.status status);
+    // Success/failure to populate the BufferCollection with buffers is
+    // determined via the BufferCollection interface.
+    AllocateSharedCollection(request<BufferCollectionToken> token_request);
 
-    // Enlists a client into a shared collection of buffers, taking into
-    // account how the client intends to use the buffers.
+    // Convert a BufferCollectionToken into a connection to the logical
+    // BufferCollection.  The BufferCollection hasn't yet been populated with
+    // buffers - the participant must first also send SetConstraints() via the
+    // client end of buffer_collection.
     //
-    // |usage| describes how the client intends to access the buffers.
-    // |token| is the other endpoint of an eventpair passed to
-    // |AllocateSharedCollection()|.
-    // |collection| provides access to the allocated buffers.
+    // All BufferCollectionToken(s) duplicated from a logical
+    // BufferCollectionToken created via AllocateSharedCollection() must be
+    // turned in via BindSharedCollection() before the logical BufferCollection
+    // will be populated with buffers.
     //
-    // This method returns once all other tokens for the collection are
-    // closed and the allocation completes successfully, or an error occurs.
+    // |token| the client endpoint of a channel whose server end was sent to
+    // sysmem using AllocateSharedCollection or whose server end was sent to
+    // sysmem using BufferCollectionToken.Duplicate().  The token is being
+    // "exchanged" for a channel to the logical BufferCollection.
     //
-    // Returns |ZX_OK| once all of the collection’s tokens have been closed
-    // and buffer allocation has completed successfully.
-    // Returns |ZX_ERR_ACCESS_DENIED| if the caller is not permitted to
-    // obtain the buffers it requested.
-    // Returns |ZX_ERR_INVALID_ARGS| if the request is malformed.
-    // Returns |ZX_ERR_NOT_SUPPORTED| if request is valid but cannot be
-    // satisfied, perhaps due to hardware limitations.
-    3: BindSharedCollection(BufferUsage usage, handle<eventpair> token)
-           -> (zx.status status, BufferCollectionInfo collection);
+    // |buffer_collection| the server end of a BufferCollection channel.  The
+    // sender retains the client end as usual.  The BufferCollection channel
+    // is a single participant's connection to the logical BufferCollection.
+    // There typically will be other participants with their own
+    // BufferCollection channel to the logical BufferCollection.
+    BindSharedCollection(BufferCollectionToken token,
+                         request<BufferCollection> buffer_collection_request);
 };

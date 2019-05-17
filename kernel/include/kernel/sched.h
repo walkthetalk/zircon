@@ -13,10 +13,6 @@
 
 __BEGIN_CDECLS
 
-// scheduler interface, used internally by thread.c
-// not intended to be used by regular kernel code
-void sched_init_early(void);
-
 void sched_init_thread(thread_t* t, int priority);
 void sched_block(void) TA_REQ(thread_lock);
 void sched_yield(void) TA_REQ(thread_lock);
@@ -26,9 +22,18 @@ void sched_resched_internal(void) TA_REQ(thread_lock);
 void sched_unblock_idle(thread_t* t) TA_REQ(thread_lock);
 void sched_migrate(thread_t* t) TA_REQ(thread_lock);
 
-// set the inherited priority of a thread and return if the caller should locally reschedule.
-// pri should be <= MAX_PRIORITY, negative values disable priority inheritance.
-void sched_inherit_priority(thread_t* t, int pri, bool* local_resched) TA_REQ(thread_lock);
+// Set the inherited priority of a thread.
+//
+// Update a mask of affected CPUs along with a flag indicating whether or not a
+// local reschedule is needed.  After the caller has finished any batch update
+// operations, it is their responsibility to trigger reschedule operations on
+// the local CPU (if needed) as well as any other CPUs.  This allows callers to
+// bacth update the state of several threads in a priority inheritance chain
+// before finally rescheduling.
+void sched_inherit_priority(thread_t* t,
+                            int pri,
+                            bool* local_resched,
+                            cpu_mask_t* accum_cpu_mask) TA_REQ(thread_lock);
 
 // set the priority of a thread and reset the boost value. This function might reschedule.
 // pri should be 0 <= to <= MAX_PRIORITY.
@@ -45,5 +50,10 @@ void sched_transition_off_cpu(cpu_num_t old_cpu) TA_REQ(thread_lock);
 //
 // This function is logically private and should only be called by timer.cpp.
 void sched_preempt_timer_tick(zx_time_t now);
+
+// Ensure this define has a value when not defined globally by the build system.
+#ifndef WITH_DETAILED_SCHEDULER_TRACING
+#define WITH_DETAILED_SCHEDULER_TRACING 0
+#endif
 
 __END_CDECLS

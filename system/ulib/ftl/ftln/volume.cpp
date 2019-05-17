@@ -5,6 +5,7 @@
 #include <lib/ftl/volume.h>
 #include <zircon/assert.h>
 
+#include <ftl_private.h>
 #include "kprivate/ndm.h"
 #include "posix.h"
 
@@ -96,9 +97,9 @@ zx_status_t VolumeImpl::GetStats(Stats* stats) {
     if (report_(vol_, FS_VSTAT, &buffer) != 0) {
         return ZX_ERR_BAD_STATE;
     }
-    stats->ram_used = buffer.fat.drvr_stats.ftl.ndm.ram_used;
-    stats->wear_count = buffer.fat.drvr_stats.ftl.ndm.wear_count;
-    stats->garbage_level = buffer.fat.garbage_level;
+    stats->ram_used = buffer.xfs.drvr_stats.ftl.ndm.ram_used;
+    stats->wear_count = buffer.xfs.drvr_stats.ftl.ndm.wear_count;
+    stats->garbage_level = buffer.xfs.garbage_level;
     return ZX_OK;
 }
 
@@ -144,7 +145,3 @@ int XfsAddVol(XfsVol* ftl) {
     return 0;
 }
 
-// Callback from the FTL.
-int XfsDelVol(const char* name) {
-    return 0;
-}

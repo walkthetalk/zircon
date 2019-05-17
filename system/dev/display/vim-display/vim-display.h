@@ -10,7 +10,9 @@
 #include <ddk/protocol/amlogiccanvas.h>
 #include <ddk/protocol/display/controller.h>
 #include <ddk/protocol/gpio.h>
-#include <ddktl/mmio.h>
+#include <ddk/protocol/sysmem.h>
+#include <lib/mmio/mmio.h>
+#include <lib/zx/channel.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +78,7 @@ typedef struct vim2_display {
 
     gpio_protocol_t                     gpio;
     amlogic_canvas_protocol_t           canvas;
+    sysmem_protocol_t                   sysmem;
 
     thrd_t                              main_thread;
     thrd_t                              vsync_thread;
@@ -122,7 +125,7 @@ typedef struct vim2_display {
     struct hdmi_param*                  p;
     display_mode_t                      cur_display_mode;
 
-    display_controller_interface_t      dc_intf;
+    display_controller_interface_protocol_t      dc_intf;
     list_node_t                         imported_images;
 
     // A reference to the object which controls the VIM2 DAIs used to feed audio

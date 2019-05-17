@@ -35,8 +35,7 @@
 #include <inttypes.h>
 
 #include <ldmsg/ldmsg.h>
-#include <runtime/message.h>
-#include <runtime/processargs.h>
+#include <lib/processargs/processargs.h>
 #include <runtime/thread.h>
 
 
@@ -1017,8 +1016,8 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
                 }
             } else {
                 // Get a writable (lazy) copy of the portion of the file VMO.
-                status = _zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE,
-                                       off_start, data_size, &map_vmo);
+                status = _zx_vmo_create_child(vmo, ZX_VMO_CHILD_COPY_ON_WRITE,
+                                              off_start, data_size, &map_vmo);
                 if (status == ZX_OK && map_size > data_size) {
                     // Extend the writable VMO to cover the .bss pages too.
                     // These pages will be zero-filled, not copied from the
@@ -1697,8 +1696,7 @@ __NO_SAFESTACK static void update_tls_size(void) {
 static dl_start_return_t __dls3(void* start_arg);
 
 __NO_SAFESTACK NO_ASAN __attribute__((__visibility__("hidden")))
-dl_start_return_t __dls2(
-    void* start_arg, void* vdso_map) {
+dl_start_return_t __dls2(void* start_arg, void* vdso_map) {
     ldso.l_map.l_addr = (uintptr_t)__ehdr_start;
 
     Ehdr* ehdr = (void*)ldso.l_map.l_addr;
@@ -1969,21 +1967,21 @@ __NO_SAFESTACK NO_ASAN static dl_start_return_t __dls3(void* start_arg) {
     zx_handle_t bootstrap = (uintptr_t)start_arg;
 
     uint32_t nbytes, nhandles;
-    zx_status_t status = zxr_message_size(bootstrap, &nbytes, &nhandles);
+    zx_status_t status = processargs_message_size(bootstrap, &nbytes, &nhandles);
     if (status != ZX_OK) {
-        error("zxr_message_size bootstrap handle %#x failed: %d (%s)",
+        error("processargs_message_size bootstrap handle %#x failed: %d (%s)",
               bootstrap, status, _zx_status_get_string(status));
         nbytes = nhandles = 0;
     }
 
-    ZXR_PROCESSARGS_BUFFER(buffer, nbytes);
+    PROCESSARGS_BUFFER(buffer, nbytes);
     zx_handle_t handles[nhandles];
     zx_proc_args_t* procargs;
     uint32_t* handle_info;
     if (status == ZX_OK)
-        status = zxr_processargs_read(bootstrap, buffer, nbytes,
-                                      handles, nhandles,
-                                      &procargs, &handle_info);
+        status = processargs_read(bootstrap, buffer, nbytes,
+                                  handles, nhandles,
+                                  &procargs, &handle_info);
     if (status != ZX_OK) {
         error("bad message of %u bytes, %u handles"
               " from bootstrap handle %#x: %d (%s)",
@@ -2011,10 +2009,10 @@ __NO_SAFESTACK NO_ASAN static dl_start_return_t __dls3(void* start_arg) {
             }
             exec_vmo = handles[i];
             break;
-        case PA_FDIO_LOGGER:
+        case PA_FD:
             if (logger != ZX_HANDLE_INVALID ||
                 handles[i] == ZX_HANDLE_INVALID) {
-                error("bootstrap message bad FDIO_LOGGER %#x vs %#x",
+                error("bootstrap message bad FD %#x vs %#x",
                       handles[i], logger);
             }
             logger = handles[i];
@@ -2091,6 +2089,11 @@ __NO_SAFESTACK NO_ASAN static dl_start_return_t __dls3(void* start_arg) {
 __NO_SAFESTACK NO_ASAN static void early_init(void) {
 #if __has_feature(address_sanitizer)
     __asan_early_init();
+#endif
+#ifdef DYNLINK_LDSVC_CONFIG
+    // Inform the loader service to look for libraries of the right variant.
+    loader_svc_config(DYNLINK_LDSVC_CONFIG);
+#elif __has_feature(address_sanitizer)
     // Inform the loader service that we prefer ASan-supporting libraries.
     loader_svc_config("asan");
 #endif
@@ -2535,7 +2538,7 @@ __NO_SAFESTACK zx_status_t dl_clone_loader_service(zx_handle_t* out) {
                                    &call, &reply_size, &handle_count)) != ZX_OK) {
         // Do nothing.
     } else if ((reply_size != ldmsg_rsp_get_size(&rsp)) ||
-               (rsp.header.ordinal != LDMSG_OP_CLONE)) {
+               (rsp.header.ordinal != LDMSG_OP_CLONE && rsp.header.ordinal != LDMSG_OP_CLONE_OLD)) {
         status = ZX_ERR_INVALID_ARGS;
     } else if (rsp.rv != ZX_OK) {
         status = rsp.rv;
@@ -2698,26 +2701,39 @@ zx_status_t __sanitizer_change_code_protection(uintptr_t addr, size_t len,
 // directly to our definition.  The trampoline checks the 'runtime' flag to
 // distinguish calls before final relocation is complete, and only calls
 // into the sanitizer runtime once it's actually up.  Because of the
-// .weakref chicanery, _dynlink_sancov_trace_pc_guard must be in a separate
+// .weakref chicanery, the _dynlink_sancov_* symbols must be in a separate
 // assembly file.
-__asm__(".weakref __sanitizer_cov_trace_pc_guard, _dynlink_sancov_trampoline");
-__asm__(".hidden _dynlink_sancov_trace_pc_guard");
-__asm__(".pushsection .text._dynlink_sancov_trampoline,\"ax\",%progbits\n"
-        ".local _dynlink_sancov_trampoline\n"
-        ".type _dynlink_sancov_trampoline,%function\n"
-        "_dynlink_sancov_trampoline:\n"
+
+# include "sancov-stubs.h"
+
+# define SANCOV_STUB(name) SANCOV_STUB_ASM(#name)
+# define SANCOV_STUB_ASM(name) \
+    __asm__( \
+    ".weakref __sanitizer_cov_" name ", _dynlink_sancov_trampoline_" name "\n" \
+    ".hidden _dynlink_sancov_" name "\n" \
+    ".pushsection .text._dynlink_sancov_trampoline_" name ",\"ax\",%progbits\n"\
+    ".local _dynlink_sancov_trampoline_" name "\n" \
+    ".type _dynlink_sancov_trampoline_" name ",%function\n" \
+    "_dynlink_sancov_trampoline_" name ":\n" \
+     SANCOV_STUB_ASM_BODY(name) \
+    ".size _dynlink_sancov_trampoline_" name ", . - _dynlink_sancov_trampoline_" name "\n" \
+    ".popsection");
+
 # ifdef __x86_64__
-        "cmpl $0, _dynlink_runtime(%rip)\n"
-        "jne _dynlink_sancov_trace_pc_guard\n"
+#  define SANCOV_STUB_ASM_BODY(name) \
+        "cmpl $0, _dynlink_runtime(%rip)\n" \
+        "jne _dynlink_sancov_" name "\n" \
         "ret\n"
 # elif defined(__aarch64__)
-        "adrp x16, _dynlink_runtime\n"
-        "ldr w16, [x16, #:lo12:_dynlink_runtime]\n"
-        "cbnz w16, _dynlink_sancov_trace_pc_guard\n"
+#  define SANCOV_STUB_ASM_BODY(name) \
+        "adrp x16, _dynlink_runtime\n" \
+        "ldr w16, [x16, #:lo12:_dynlink_runtime]\n" \
+        "cbnz w16, _dynlink_sancov_" name "\n" \
         "ret\n"
 # else
 #  error unsupported architecture
 # endif
-        ".size _dynlink_sancov_trampoline, . - _dynlink_sancov_trampoline\n"
-        ".popsection");
+
+SANCOV_STUBS
+
 #endif

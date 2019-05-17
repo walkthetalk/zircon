@@ -20,8 +20,10 @@
 #include <string.h>
 #include <trace.h>
 
+#include <vm/physmap.h>
 #include <vm/vm.h>
 #include <vm/vm_address_region.h>
+#include <vm/vm_object_paged.h>
 
 #include <zircon/types.h>
 
@@ -29,47 +31,30 @@
 
 VmObject::GlobalList VmObject::all_vmos_ = {};
 
-VmObject::VmObject(fbl::RefPtr<VmObject> parent)
-    : lock_(parent ? parent->lock_ref() : local_lock_),
-      parent_(ktl::move(parent)) {
+VmObject::VmObject(fbl::RefPtr<vm_lock_t> lock_ptr)
+    : lock_(lock_ptr->lock), lock_ptr_(ktl::move(lock_ptr)) {
     LTRACEF("%p\n", this);
-
-    // Add ourself to the global VMO list, newer VMOs at the end.
-    {
-        Guard<fbl::Mutex> guard{AllVmosLock::Get()};
-        all_vmos_.push_back(this);
-    }
 }
 
 VmObject::~VmObject() {
     canary_.Assert();
     LTRACEF("%p\n", this);
 
-    // remove ourself from our parent (if present)
-    if (parent_) {
-        LTRACEF("removing ourself from our parent %p\n", parent_.get());
-
-        // conditionally grab our shared lock with the parent, but only if it's
-        // not held. There are some destruction paths that may try to tear
-        // down the object with the parent locks held.
-        const bool need_lock = !lock_.lock().IsHeld();
-        if (need_lock) {
-            Guard<fbl::Mutex> guard{&lock_};
-            parent_->RemoveChildLocked(this);
-        } else {
-            parent_->RemoveChildLocked(this);
-        }
-    }
+    DEBUG_ASSERT(global_list_state_.InContainer() == false);
 
     DEBUG_ASSERT(mapping_list_.is_empty());
     DEBUG_ASSERT(children_list_.is_empty());
+}
 
-    // Remove ourself from the global VMO list.
-    {
-        Guard<fbl::Mutex> guard{AllVmosLock::Get()};
-        DEBUG_ASSERT(global_list_state_.InContainer() == true);
-        all_vmos_.erase(*this);
-    }
+void VmObject::AddToGlobalList() {
+    Guard<Mutex> guard{AllVmosLock::Get()};
+    all_vmos_.push_back(this);
+}
+
+void VmObject::RemoveFromGlobalList() {
+    Guard<Mutex> guard{AllVmosLock::Get()};
+    DEBUG_ASSERT(global_list_state_.InContainer() == true);
+    all_vmos_.erase(*this);
 }
 
 void VmObject::get_name(char* out_name, size_t len) const {
@@ -95,25 +80,8 @@ uint64_t VmObject::user_id() const {
     return user_id_;
 }
 
-uint64_t VmObject::parent_user_id() const {
-    canary_.Assert();
-    // Don't hold both our lock and our parent's lock at the same time, because
-    // it's probably the same lock.
-    fbl::RefPtr<VmObject> parent;
-    {
-        Guard<fbl::Mutex> guard{&lock_};
-        if (parent_ == nullptr) {
-            return 0u;
-        }
-        parent = parent_;
-    }
-    return parent->user_id();
-}
-
-bool VmObject::is_cow_clone() const {
-    canary_.Assert();
-    Guard<fbl::Mutex> guard{&lock_};
-    return parent_ != nullptr;
+uint64_t VmObject::user_id_locked() const {
+    return user_id_;
 }
 
 void VmObject::AddMappingLocked(VmMapping* r) {
@@ -195,31 +163,79 @@ uint32_t VmObject::share_count() const {
 }
 
 void VmObject::SetChildObserver(VmObjectChildObserver* child_observer) {
-    Guard<fbl::Mutex> guard{&lock_};
+    Guard<fbl::Mutex> guard{&child_observer_lock_};
     child_observer_ = child_observer;
 }
 
-void VmObject::AddChildLocked(VmObject* o) {
+bool VmObject::AddChildLocked(VmObjectPaged* o) {
     canary_.Assert();
     DEBUG_ASSERT(lock_.lock().IsHeld());
     children_list_.push_front(o);
     children_list_len_++;
 
+    return OnChildAddedLocked();
+}
+
+bool VmObject::OnChildAddedLocked() {
+    ++user_child_count_;
+    return user_child_count_ == 1;
+}
+
+void VmObject::NotifyOneChild() {
+    canary_.Assert();
+
+    // Make sure we're not holding the shared lock while notifying the observer in case it calls
+    // back into this object.
+    DEBUG_ASSERT(!lock_.lock().IsHeld());
+
+    Guard<fbl::Mutex> observer_guard{&child_observer_lock_};
+
     // Signal the dispatcher that there are child VMOS
-    if ((child_observer_ != nullptr) && (children_list_len_ == 1)) {
+    if (child_observer_ != nullptr) {
         child_observer_->OnOneChild();
     }
 }
 
-void VmObject::RemoveChildLocked(VmObject* o) {
+void VmObject::ReplaceChildLocked(VmObjectPaged* old, VmObjectPaged* new_child) {
     canary_.Assert();
-    DEBUG_ASSERT(lock_.lock().IsHeld());
-    children_list_.erase(*o);
+    children_list_.replace(*old, new_child);
+}
+
+void VmObject::DropChildLocked(VmObjectPaged* c) {
+    canary_.Assert();
     DEBUG_ASSERT(children_list_len_ > 0);
-    children_list_len_--;
+    children_list_.erase(*c);
+    --children_list_len_;
+}
+
+void VmObject::RemoveChild(VmObjectPaged* o, Guard<Mutex>&& adopt) {
+    canary_.Assert();
+    DEBUG_ASSERT(adopt.wraps_lock(lock_ptr_->lock.lock()));
+    Guard<fbl::Mutex> guard{AdoptLock, ktl::move(adopt)};
+
+    DropChildLocked(o);
+
+    OnChildRemoved(guard.take());
+}
+
+void VmObject::OnChildRemoved(Guard<fbl::Mutex>&& adopt) {
+    DEBUG_ASSERT(adopt.wraps_lock(lock_ptr_->lock.lock()));
+    Guard<fbl::Mutex> guard{AdoptLock, ktl::move(adopt)};
+
+    DEBUG_ASSERT(user_child_count_ > 0);
+    --user_child_count_;
+    if (user_child_count_ != 0) {
+        return;
+    }
+
+    Guard<fbl::Mutex> observer_guard{&child_observer_lock_};
+
+    // Drop shared lock before calling out to the observer to reduce the risk of self-deadlock in
+    // case it calls back into this object.
+    guard.Release();
 
     // Signal the dispatcher that there are no more child VMOS
-    if ((child_observer_ != nullptr) && (children_list_len_ == 0)) {
+    if (child_observer_ != nullptr) {
         child_observer_->OnZeroChild();
     }
 }
@@ -228,6 +244,12 @@ uint32_t VmObject::num_children() const {
     canary_.Assert();
     Guard<fbl::Mutex> guard{&lock_};
     return children_list_len_;
+}
+
+uint32_t VmObject::num_user_children() const {
+    canary_.Assert();
+    Guard<fbl::Mutex> guard{&lock_};
+    return user_child_count_;
 }
 
 void VmObject::RangeChangeUpdateLocked(uint64_t offset, uint64_t len) {
@@ -247,6 +269,94 @@ void VmObject::RangeChangeUpdateLocked(uint64_t offset, uint64_t len) {
     for (auto& child : children_list_) {
         child.RangeChangeUpdateFromParentLocked(offset, len);
     }
+}
+
+zx_status_t VmObject::InvalidateCache(const uint64_t offset, const uint64_t len) {
+    return CacheOp(offset, len, CacheOpType::Invalidate);
+}
+
+zx_status_t VmObject::CleanCache(const uint64_t offset, const uint64_t len) {
+    return CacheOp(offset, len, CacheOpType::Clean);
+}
+
+zx_status_t VmObject::CleanInvalidateCache(const uint64_t offset, const uint64_t len) {
+    return CacheOp(offset, len, CacheOpType::CleanInvalidate);
+}
+
+zx_status_t VmObject::SyncCache(const uint64_t offset, const uint64_t len) {
+    return CacheOp(offset, len, CacheOpType::Sync);
+}
+
+zx_status_t VmObject::CacheOp(const uint64_t start_offset, const uint64_t len,
+                              const CacheOpType type) {
+    canary_.Assert();
+
+    if (unlikely(len == 0)) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    Guard<fbl::Mutex> guard{&lock_};
+
+    if (unlikely(!InRange(start_offset, len, size()))) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+
+    const size_t end_offset = static_cast<size_t>(start_offset + len);
+    size_t op_start_offset = static_cast<size_t>(start_offset);
+
+    while (op_start_offset != end_offset) {
+        // Offset at the end of the current page.
+        const size_t page_end_offset = ROUNDUP(op_start_offset + 1, PAGE_SIZE);
+
+        // This cache op will either terminate at the end of the current page or
+        // at the end of the whole op range -- whichever comes first.
+        const size_t op_end_offset = MIN(page_end_offset, end_offset);
+
+        const size_t cache_op_len = op_end_offset - op_start_offset;
+
+        const size_t page_offset = op_start_offset % PAGE_SIZE;
+
+        // lookup the physical address of the page, careful not to fault in a new one
+        paddr_t pa;
+        auto status = GetPageLocked(op_start_offset, 0, nullptr, nullptr, nullptr, &pa);
+
+        if (likely(status == ZX_OK)) {
+            // This check is here for the benefit of VmObjectPhysical VMOs,
+            // which can potentially have pa(s) outside physmap, in contrast to
+            // VmObjectPaged whose pa(s) are always in physmap.
+            if (unlikely(!is_physmap_phys_addr(pa))) {
+                // TODO(ZX-4071): Consider whether to keep or remove op_range
+                // for cache ops for phsyical VMOs. If we keep, possibly we'd
+                // want to obtain a mapping somehow here instead of failing.
+                return ZX_ERR_NOT_SUPPORTED;
+            }
+            // Convert the page address to a Kernel virtual address.
+            const void* ptr = paddr_to_physmap(pa);
+            const addr_t cache_op_addr = reinterpret_cast<addr_t>(ptr) + page_offset;
+
+            LTRACEF("ptr %p op %d\n", ptr, (int)type);
+
+            // Perform the necessary cache op against this page.
+            switch (type) {
+            case CacheOpType::Invalidate:
+                arch_invalidate_cache_range(cache_op_addr, cache_op_len);
+                break;
+            case CacheOpType::Clean:
+                arch_clean_cache_range(cache_op_addr, cache_op_len);
+                break;
+            case CacheOpType::CleanInvalidate:
+                arch_clean_invalidate_cache_range(cache_op_addr, cache_op_len);
+                break;
+            case CacheOpType::Sync:
+                arch_sync_cache_range(cache_op_addr, cache_op_len);
+                break;
+            }
+        }
+
+        op_start_offset += cache_op_len;
+    }
+
+    return ZX_OK;
 }
 
 static int cmd_vm_object(int argc, const cmd_args* argv, uint32_t flags) {
@@ -288,4 +398,4 @@ STATIC_COMMAND_START
 #if LK_DEBUGLEVEL > 0
 STATIC_COMMAND("vm_object", "vm object debug commands", &cmd_vm_object)
 #endif
-STATIC_COMMAND_END(vm_object);
+STATIC_COMMAND_END(vm_object)

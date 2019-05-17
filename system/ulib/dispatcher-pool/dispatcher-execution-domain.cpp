@@ -12,7 +12,7 @@
 namespace dispatcher {
 
 // static
-fbl::RefPtr<ExecutionDomain> ExecutionDomain::Create(uint32_t priority) {
+fbl::RefPtr<ExecutionDomain> ExecutionDomain::Create(zx::profile profile) {
     zx::event evt;
     if (zx::event::create(0, &evt) != ZX_OK)
         return nullptr;
@@ -21,7 +21,7 @@ fbl::RefPtr<ExecutionDomain> ExecutionDomain::Create(uint32_t priority) {
         return nullptr;
 
     fbl::RefPtr<ThreadPool> thread_pool;
-    zx_status_t res = ThreadPool::Get(&thread_pool, priority);
+    zx_status_t res = ThreadPool::Get(&thread_pool, std::move(profile));
     if (res != ZX_OK)
         return nullptr;
     ZX_DEBUG_ASSERT(thread_pool != nullptr);
@@ -222,11 +222,19 @@ void ExecutionDomain::DispatchPendingWork() {
             fbl::AutoLock sources_lock(&sources_lock_);
             ZX_DEBUG_ASSERT(dispatch_in_progress_);
             if (deactivated() || pending_work_.is_empty()) {
-                // Clear the pending work queue and the dispatch in progress
-                // flag.  If someone is attempting to synchronize with dispatch
-                // operations in flight, set the event indicating that we are
-                // now idle.
-                pending_work_.clear();
+                // Clear the dispatch in progress flag.  If someone is
+                // attempting to synchronize with dispatch operations in flight,
+                // set the event indicating that we are now idle.
+                //
+                // Do _not_ clear the pending_work_ queue at this point.  Either
+                // the queue is already empty, or we are in the process of
+                // deactivating.  If there are items in the pending work queue,
+                // then they will be removed by Deactivate as we shut down.
+                //
+                // If we clear the queue here instead, we will violate the
+                // invariant that an EventSource's state is DispatchPending
+                // if-and-only-if it is also in its domain's pending_work_queue_
+                // (which can cause ASSERTs in other places to fire).
                 dispatch_in_progress_ = false;
                 if (dispatch_sync_in_progress_) {
                     __UNUSED zx_status_t res;

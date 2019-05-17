@@ -11,6 +11,7 @@
 #include <fbl/intrusive_single_list.h>
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
+#include <lib/mmio/mmio.h>
 #include <stdio.h>
 #include <zircon/hw/pci.h>
 #include <zircon/types.h>
@@ -32,7 +33,7 @@ private:
 class PciReg16 {
 public:
     constexpr explicit PciReg16(uint16_t offset)
-        : offset_(offset){};
+        : offset_(offset) {}
     constexpr PciReg16()
         : offset_(0u) {}
     constexpr uint16_t offset() const { return offset_; }
@@ -44,7 +45,7 @@ private:
 class PciReg32 {
 public:
     constexpr explicit PciReg32(uint16_t offset)
-        : offset_(offset){};
+        : offset_(offset) {}
     constexpr PciReg32()
         : offset_(0u) {}
     constexpr uint16_t offset() const { return offset_; }
@@ -124,7 +125,7 @@ public:
     // @return a pointer to a new Config instance on success, nullptr on failure.
     //
     inline const pci_bdf_t& bdf() const { return bdf_; }
-    inline const char* addr(void) const { return addr_; };
+    inline const char* addr(void) const { return addr_; }
     virtual const char* type(void) const = 0;
 
     // Virtuals
@@ -135,10 +136,11 @@ public:
     virtual void Write(const PciReg8 addr, uint8_t val) const = 0;
     virtual void Write(const PciReg16 addr, uint16_t val) const = 0;
     virtual void Write(const PciReg32 addr, uint32_t val) const = 0;
-    virtual ~Config(){};
+    virtual ~Config() {}
 
 protected:
-    Config(pci_bdf_t bdf) : bdf_(bdf) {
+    Config(pci_bdf_t bdf)
+        : bdf_(bdf) {
         snprintf(addr_, sizeof(addr_), "%02x:%02x.%01x", bdf_.bus_id, bdf_.device_id,
                  bdf_.function_id);
     }
@@ -152,7 +154,7 @@ protected:
 class MmioConfig final : public Config {
 public:
     static zx_status_t Create(pci_bdf_t bdf,
-                              mmio_buffer_t* ecam_,
+                              ddk::MmioBuffer* ecam_,
                               uint8_t start_bus,
                               uint8_t end_bus,
                               fbl::RefPtr<Config>* config);

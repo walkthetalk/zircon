@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_FUNCTION_H_
+#define FBL_FUNCTION_H_
 
 #include <new>
 #include <stddef.h>
@@ -12,7 +13,6 @@
 #include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/macros.h>
-#include <fbl/type_support.h>
 #include <fbl/unique_ptr.h>
 
 namespace fbl {
@@ -88,7 +88,7 @@ public:
     explicit InlineFunctionTarget(Callable target)
         : target_(std::move(target)) {}
     InlineFunctionTarget(Callable target, AllocChecker* ac)
-        : target_(std::move(target)) { ac->arm(0u, true); }
+        : target_(std::move(target)) { ac->arm(0U, true); }
     InlineFunctionTarget(InlineFunctionTarget&& other)
         : target_(std::move(other.target_)) {}
     ~InlineFunctionTarget() final = default;
@@ -113,7 +113,7 @@ template <typename Callable, typename Result, typename... Args>
 class HeapFunctionTarget final : public FunctionTarget<Result, Args...> {
 public:
     explicit HeapFunctionTarget(Callable target)
-        : target_ptr_(fbl::make_unique<Callable>(std::move(target))) {}
+        : target_ptr_(std::make_unique<Callable>(std::move(target))) {}
     HeapFunctionTarget(Callable target, AllocChecker* ac)
         : target_ptr_(fbl::make_unique_checked<Callable>(ac, std::move(target))) {}
     HeapFunctionTarget(HeapFunctionTarget&& other)
@@ -157,7 +157,7 @@ struct FunctionTargetHolder final {
         using InlineFunctionTarget = fbl::internal::InlineFunctionTarget<Callable, Result, Args...>;
         using HeapFunctionTarget = fbl::internal::HeapFunctionTarget<Callable, Result, Args...>;
         static constexpr bool can_inline = (sizeof(InlineFunctionTarget) <= target_size);
-        using Type = typename fbl::conditional<can_inline, InlineFunctionTarget, HeapFunctionTarget>::type;
+        using Type = std::conditional_t<can_inline, InlineFunctionTarget, HeapFunctionTarget>;
         static_assert(sizeof(Type) <= target_size, "Target should fit in FunctionTargetHolder.");
     };
 
@@ -233,7 +233,7 @@ public:
 
     explicit operator bool() const {
         return !holder_.target().is_null();
-    };
+    }
 
     Result operator()(Args... args) const {
         return holder_.target()(std::forward<Args>(args)...);
@@ -487,3 +487,5 @@ auto BindMember(T* instance, R (T::*fn)(Args...)) {
 }
 
 } // namespace fbl
+
+#endif  // FBL_FUNCTION_H_

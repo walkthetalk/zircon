@@ -226,7 +226,7 @@ bool IgdOpRegion::Swsci(pci_protocol_t* pci,
         return false;
     }
 
-    sci_interface_t* sci_interface = reinterpret_cast<sci_interface_t*>(igd_opregion_->mailbox2);
+    sci_interface_protocol_t* sci_interface = reinterpret_cast<sci_interface_protocol_t*>(igd_opregion_->mailbox2);
 
     auto sci_entry_param = SciEntryParam::Get().FromValue(0);
     sci_entry_param.set_function(function);
@@ -348,6 +348,7 @@ zx_status_t IgdOpRegion::Init(pci_protocol_t* pci) {
     // actual API (probably in ACPI) to do this.
     zx_handle_t vmo;
     uint32_t igd_opregion_pages_len_ = kIgdOpRegionLen + (igd_addr & PAGE_SIZE);
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     status = zx_vmo_create_physical(get_root_resource(),
                                     igd_addr & ~(PAGE_SIZE - 1),
                                     igd_opregion_pages_len_, &vmo);

@@ -74,6 +74,8 @@ class ArgumentValue final {
 public:
     static ArgumentValue MakeNull() { return ArgumentValue(); }
 
+    static ArgumentValue MakeBool(bool value) { return ArgumentValue(value); }
+
     static ArgumentValue MakeInt32(int32_t value) { return ArgumentValue(value); }
 
     static ArgumentValue MakeUint32(uint32_t value) {
@@ -111,6 +113,11 @@ public:
     }
 
     ArgumentType type() const { return type_; }
+
+    uint32_t GetBool() const {
+        ZX_DEBUG_ASSERT(type_ == ArgumentType::kBool);
+        return bool_;
+    }
 
     int32_t GetInt32() const {
         ZX_DEBUG_ASSERT(type_ == ArgumentType::kInt32);
@@ -161,6 +168,9 @@ private:
     ArgumentValue()
         : type_(ArgumentType::kNull) {}
 
+    explicit ArgumentValue(bool b)
+        : type_(ArgumentType::kBool), bool_(b) {}
+
     explicit ArgumentValue(int32_t int32)
         : type_(ArgumentType::kInt32), int32_(int32) {}
 
@@ -192,6 +202,7 @@ private:
 
     ArgumentType type_;
     union {
+        bool bool_;
         int32_t int32_;
         uint32_t uint32_;
         int64_t int64_;
@@ -232,6 +243,49 @@ private:
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(Argument);
 };
 
+// Trace Info type specific data
+class TraceInfoContent final {
+public:
+    // Magic number record data
+    struct MagicNumberInfo {
+        uint32_t magic_value;
+    };
+
+    explicit TraceInfoContent(MagicNumberInfo magic_number_info)
+        : type_(TraceInfoType::kMagicNumber), magic_number_info_(std::move(magic_number_info)) {}
+
+    const MagicNumberInfo& GetMagicNumberInfo() const {
+        ZX_DEBUG_ASSERT(type_ == TraceInfoType::kMagicNumber);
+        return magic_number_info_;
+    }
+
+    TraceInfoContent(TraceInfoContent&& other)
+        : type_(other.type_) { MoveFrom(std::move(other)); }
+
+    ~TraceInfoContent() { Destroy(); }
+
+    TraceInfoContent& operator=(TraceInfoContent&& other) {
+        Destroy();
+        MoveFrom(std::move(other));
+        return *this;
+    }
+
+    TraceInfoType type() const { return type_; }
+
+    fbl::String ToString() const;
+
+private:
+    void Destroy();
+    void MoveFrom(TraceInfoContent&& other);
+
+    TraceInfoType type_;
+    union {
+        MagicNumberInfo magic_number_info_;
+    };
+
+    DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(TraceInfoContent);
+};
+
 // Metadata type specific data.
 class MetadataContent final {
 public:
@@ -252,6 +306,12 @@ public:
         ProviderEventType event;
     };
 
+    // Trace info record data
+    struct TraceInfo {
+        TraceInfoType type() const { return content.type(); }
+        TraceInfoContent content;
+    };
+
     explicit MetadataContent(ProviderInfo provider_info)
         : type_(MetadataType::kProviderInfo), provider_info_(std::move(provider_info)) {}
 
@@ -263,10 +323,14 @@ public:
         : type_(MetadataType::kProviderEvent),
           provider_event_(std::move(provider_event)) {}
 
+    explicit MetadataContent(TraceInfo trace_info)
+        : type_(MetadataType::kTraceInfo),
+          trace_info_(std::move(trace_info)) {}
+
     const ProviderInfo& GetProviderInfo() const {
         ZX_DEBUG_ASSERT(type_ == MetadataType::kProviderInfo);
         return provider_info_;
-    };
+    }
 
     const ProviderSection& GetProviderSection() const {
         ZX_DEBUG_ASSERT(type_ == MetadataType::kProviderSection);
@@ -302,6 +366,7 @@ private:
         ProviderInfo provider_info_;
         ProviderSection provider_section_;
         ProviderEvent provider_event_;
+        TraceInfo trace_info_;
     };
 
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(MetadataContent);
@@ -430,7 +495,7 @@ public:
     const AsyncBegin& GetAsyncBegin() const {
         ZX_DEBUG_ASSERT(type_ == EventType::kAsyncBegin);
         return async_begin_;
-    };
+    }
 
     const AsyncInstant& GetAsyncInstant() const {
         ZX_DEBUG_ASSERT(type_ == EventType::kAsyncInstant);
@@ -626,7 +691,7 @@ public:
     const Thread& GetThread() const {
         ZX_DEBUG_ASSERT(type_ == RecordType::kThread);
         return thread_;
-    };
+    }
 
     const Event& GetEvent() const {
         ZX_DEBUG_ASSERT(type_ == RecordType::kEvent);

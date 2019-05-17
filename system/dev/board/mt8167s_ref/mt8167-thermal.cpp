@@ -3,10 +3,11 @@
 // found in the LICENSE file.
 
 #include <ddk/debug.h>
+#include <ddk/metadata.h>
 #include <ddk/platform-defs.h>
+#include <fuchsia/hardware/thermal/c/fidl.h>
 #include <soc/mt8167/mt8167-clk.h>
 #include <soc/mt8167/mt8167-hw.h>
-#include <zircon/device/thermal.h>
 
 #include "mt8167.h"
 
@@ -28,21 +29,25 @@ constexpr pbus_mmio_t thermal_mmios[] = {
     {
         .base = MT8167_PMIC_WRAP_BASE,
         .length = MT8167_PMIC_WRAP_SIZE
+    },
+    {
+        .base = MT8167_INFRACFG_BASE,
+        .length = MT8167_INFRACFG_SIZE
     }
 };
 
 constexpr pbus_clk_t thermal_clks[] = {
     {
-        .clk = board_mt8167::kClkThermal
+        .clk = board_mt8167::kClkThem
     },
     {
         .clk = board_mt8167::kClkAuxAdc
     },
     {
-        .clk = board_mt8167::kClkPmicWrapAp
+        .clk = board_mt8167::kClkPmicwrapAp
     },
     {
-        .clk = board_mt8167::kClkPmicWrap26M
+        .clk = board_mt8167::kClkPmicwrap26m
     }
 };
 
@@ -58,7 +63,7 @@ constexpr uint32_t CToKTenths(uint32_t temp_c) {
     return (temp_c * 10) + kKelvinOffset;
 }
 
-constexpr thermal_temperature_info_t TripPoint(uint32_t temp_c, int32_t opp) {
+constexpr fuchsia_hardware_thermal_ThermalTemperatureInfo TripPoint(uint32_t temp_c, int32_t opp) {
     constexpr uint32_t kHysteresis = 2;
 
     return {
@@ -71,7 +76,7 @@ constexpr thermal_temperature_info_t TripPoint(uint32_t temp_c, int32_t opp) {
     };
 }
 
-constexpr thermal_device_info_t thermal_dev_info = {
+constexpr fuchsia_hardware_thermal_ThermalDeviceInfo thermal_dev_info = {
     .active_cooling = false,
     .passive_cooling = true,
     .gpu_throttling = true,
@@ -86,7 +91,7 @@ constexpr thermal_device_info_t thermal_dev_info = {
         TripPoint(95, 0),
     },
     .opps = {
-        [BIG_CLUSTER_POWER_DOMAIN] = {
+        [fuchsia_hardware_thermal_PowerDomain_BIG_CLUSTER_POWER_DOMAIN] = {
             // See section 3.6 (MTCMOS Domains) of the functional specification document.
             .opp = {
                 [0] = {
@@ -113,7 +118,7 @@ constexpr thermal_device_info_t thermal_dev_info = {
             .latency = 0,
             .count = 5
         },
-        [LITTLE_CLUSTER_POWER_DOMAIN] = {
+        [fuchsia_hardware_thermal_PowerDomain_LITTLE_CLUSTER_POWER_DOMAIN] = {
             .opp = {},
             .latency = 0,
             .count = 0
@@ -123,7 +128,7 @@ constexpr thermal_device_info_t thermal_dev_info = {
 
 constexpr pbus_metadata_t thermal_metadata[] = {
     {
-        .type = THERMAL_CONFIG_METADATA,
+        .type = DEVICE_METADATA_THERMAL_CONFIG,
         .data_buffer = &thermal_dev_info,
         .data_size = sizeof(thermal_dev_info)
     },

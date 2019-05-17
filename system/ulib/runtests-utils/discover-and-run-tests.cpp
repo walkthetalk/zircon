@@ -59,70 +59,55 @@ int Usage(const char* name, const fbl::Vector<fbl::String>& default_test_dirs) {
     fprintf(stderr,
             "\noptions:                                            \n"
             "   -h: See this message                               \n"
-            "   -v: Verbose output                                 \n"
+            "   -d: Dry run, just print test file names and exit   \n"
+            "   -v: Verbose output [1]                             \n"
             "   -q: Quiet output                                   \n"
-            "   -S: Turn ON  Small tests         (on by default)   \n"
-            "   -s: Turn OFF Small tests                           \n"
-            "   -M: Turn ON  Medium tests        (on by default)   \n"
-            "   -m: Turn OFF Medium tests                          \n"
-            "   -L: Turn ON  Large tests         (off by default)  \n"
-            "   -l: Turn OFF Large tests                           \n"
-            "   -P: Turn ON Performance tests    (off by default)  \n"
-            "   -p: Turn OFF Performance tests                     \n"
+            "   -S: Turn ON  Small tests      (on by default)  [2] \n"
+            "   -s: Turn OFF Small tests                       [2] \n"
+            "   -M: Turn ON  Medium tests     (on by default)  [2] \n"
+            "   -m: Turn OFF Medium tests                      [2] \n"
+            "   -L: Turn ON  Large tests      (off by default) [2] \n"
+            "   -l: Turn OFF Large tests                       [2] \n"
+            "   -P: Turn ON Performance tests (off by default) [2] \n"
+            "   -p: Turn OFF Performance tests                 [2] \n"
             "   -a: Turn on All tests                              \n"
             "   -t: Filter tests by name                           \n"
             "       (accepts a comma-separated list)               \n"
-            "   -f: Run tests specified in this file               \n"
-            "   -o: Write test output to a directory               \n"
-            "   -w: Watchdog timeout                               \n"
+            "   -f: Run tests specified in this file [3]           \n"
+            "   -r: Repeat the test suite this many times          \n"
+            "   -o: Write test output to a directory [4]           \n"
+            "   -w: Watchdog timeout [5]                           \n"
             "       (accepts the timeout value in seconds)         \n"
             "       The default is up to each test.                \n"
             "\n"
-            "If -o is enabled, then a JSON summary of the test     \n"
-            "results will be written to a file named 'summary.json'\n"
-            "under the desired directory, in addition to each      \n"
-            "test's standard output and error.                     \n"
-            "The summary contains a listing of the tests executed  \n"
-            "by full path (e.g., /boot/test/core/futex_test), as   \n"
-            "well as whether the test passed or failed. For        \n"
-            "details, see                                          \n"
-            "//system/ulib/runtests-utils/summary-schema.json      \n"
+            "[1] -v will pass \"v=1\" argument to the test binary. \n"
+            "    Not all test frameworks will honor this argument, \n"
+            "    and some, like Rust, may interpret it as a filter.\n"
+            "    Use \"-- --nocapture\" for a similar behaviour    \n"
+            "    when running Rust tests.                          \n"
             "\n"
-            "The test selection options -[sSmMlLpP] only work for  \n"
-            "tests that support the RUNTESTS_TEST_CLASS environment\n"
-            "variable.                                             \n"
-            "The watchdog timeout option -w only works for tests   \n"
-            "that support the RUNTESTS_WATCHDOG_TIMEOUT environment\n"
-            "variable.                                             \n"
-            "-f and [directory globs ...] are mutually exclusive.  \n");
+            "[2] The test selection options -[sSmMlLpP] only work  \n"
+            "    for tests that support the RUNTESTS_TEST_CLASS    \n"
+            "    environment variable.                             \n"
+            "\n"
+            "[3] -f and [directory globs ...] are mutually         \n"
+            "    exclusive.                                        \n"
+            "\n"
+            "[4] If -o is enabled, then a JSON summary of the test \n"
+            "    results will be written to a file named           \n"
+            "    \"summary.json\" under the desired directory, in  \n"
+            "    addition to each test's standard output and error.\n"
+            "    The summary contains a listing of the tests       \n"
+            "    executed by full path (e.g.,                      \n"
+            "    /boot/test/core/futex_test), as well as whether   \n"
+            "    the test passed or failed. For details, see       \n"
+            "    //system/ulib/runtests-utils/summary-schema.json  \n"
+            "\n"
+            "[5] The watchdog timeout option -w only works for     \n"
+            "    tests that support the RUNTESTS_WATCHDOG_TIMEOUT  \n"
+            "    environment variable.                             \n");
     return EXIT_FAILURE;
 }
-
-// Trying to accomplish the same thing as syncfs() but using only POSIX.
-// A single call to fsync() only has to do with the data for that file, but that file may be missing
-// from the directories above it.
-void SyncPathAndAncestors(const char* path) {
-    // dirname mutates its argument.
-    char mutable_path[PATH_MAX];
-    strncpy(mutable_path, path, PATH_MAX - 1);
-    mutable_path[PATH_MAX - 1] = '\0';
-    for (char* p = mutable_path;; p = dirname(p)) {
-        int fd = open(p, O_RDONLY);
-        if (fd < 0) {
-            fprintf(stderr, "Warning: Could not open %s for syncing: %s", p, strerror(errno));
-            return;
-        } else if (fsync(fd)) {
-            fprintf(stderr, "Warning: Could not sync %s: %s", p, strerror(errno));
-            return;
-        } else if (close(fd)) {
-            fprintf(stderr, "Warning: Could not close %s: %s", p, strerror(errno));
-            return;
-        }
-        if (!strcmp(p, "/")) {
-            break;
-        }
-    }
-};
 } // namespace
 
 int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* argv,
@@ -136,14 +121,34 @@ int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* a
     signed char verbosity = -1;
     int watchdog_timeout_seconds = -1;
     const char* test_list_path = nullptr;
+    int repeat = 1;
+    bool dry_run = false;
 
-    int c;
-    // getopt uses global state, reset it.
-    optind = 1;
-    // Starting with + means don't modify |argv|.
-    static const char* kOptString = "+qvsmlpSMLPaht:o:f:w:";
-    while ((c = getopt(argc, const_cast<char* const*>(argv), kOptString)) != -1) {
-        switch (c) {
+    int optind = 1;
+    while (optind < argc) {
+        // Implementing our own opt parsing here is less effort that fixing up
+        // the behavior across three different getopt implementations on macos,
+        // linux and zircon, even with this comment. The breaking requirement is
+        // to parse globs at any position in argv.
+        fbl::String arg(argv[optind++]);
+
+        if (arg.length() == 0) {
+            continue;
+        }
+
+        if (arg == "--") {
+            for (; optind < argc; ++optind) {
+                test_args.push_back(argv[optind]);
+            }
+            break;
+        }
+
+        if (arg.length() < 2 || arg.data()[0] != '-') {
+            test_dir_globs.push_back(std::move(arg));
+            continue;
+        }
+
+        switch (arg.data()[1]) {
         case 'q':
             verbosity = 0;
             break;
@@ -181,16 +186,47 @@ int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* a
         case 'h':
             return Usage(argv[0], default_test_dirs);
         case 't':
-            ParseTestNames(optarg, &basename_whitelist);
+            if (optind > argc) {
+                fprintf(stderr, "Missing argument for -t\n");
+                return EXIT_FAILURE;
+            }
+            ParseTestNames(argv[optind++], &basename_whitelist);
             break;
         case 'o':
-            output_dir = optarg;
+            if (optind > argc) {
+                fprintf(stderr, "Missing argument for -o\n");
+                return EXIT_FAILURE;
+            }
+            output_dir = argv[optind++];
             break;
         case 'f':
-            test_list_path = optarg;
+            if (optind > argc) {
+                fprintf(stderr, "Missing argument for -f\n");
+                return EXIT_FAILURE;
+            }
+            test_list_path = argv[optind++];
             break;
+        case 'r': {
+            if (optind > argc) {
+                fprintf(stderr, "Missing argument for -r\n");
+                return EXIT_FAILURE;
+            }
+            const char* repeat_str = argv[optind++];
+            char* end;
+            long repeatl = strtol(repeat_str, &end, 0);
+            if (*repeat_str == '\0' || *end != '\0' || repeatl < 0 || repeatl > INT_MAX) {
+                fprintf(stderr, "Error: bad repeat\n");
+                return EXIT_FAILURE;
+            }
+            repeat = static_cast<int>(repeatl);
+            break;
+        }
         case 'w': {
-            const char* timeout_str = optarg;
+            if (optind > argc) {
+                fprintf(stderr, "Missing argument for -w\n");
+                return EXIT_FAILURE;
+            }
+            const char* timeout_str = argv[optind++];
             char* end;
             long timeout = strtol(timeout_str, &end, 0);
             if (*timeout_str == '\0' || *end != '\0' || timeout < 0 || timeout > INT_MAX) {
@@ -200,24 +236,13 @@ int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* a
             watchdog_timeout_seconds = static_cast<int>(timeout);
             break;
         }
+        case 'd': {
+            dry_run = true;
+            break;
+        }
         default:
             return Usage(argv[0], default_test_dirs);
         }
-    }
-    // Treat the rest of the argv array as a list of directory globs,
-    // until a `--` arg is encountered, after which point all arguments should
-    // be forwarded on to the binaries under test.
-    int i = optind;
-    for (; i < argc; ++i) {
-        fbl::String arg(argv[i]);
-        if (arg == "--") {
-            break;
-        }
-        test_dir_globs.push_back(std::move(arg));
-    }
-    i++; // Skip "--" itself
-    for (; i < argc; ++i) {
-        test_args.push_back(argv[i]);
     }
 
     if (test_list_path && !test_dir_globs.is_empty()) {
@@ -287,11 +312,19 @@ int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* a
         return EXIT_FAILURE;
     }
 
+    if (dry_run) {
+        printf("Would run the following tests:\n");
+        for (const auto& test_path : test_paths) {
+            printf("\t%s\n", test_path.c_str());
+        }
+        return EXIT_SUCCESS;
+    }
+
     // TODO(mknyszek): Sort test_paths for deterministic behavior. Should be easy after ZX-1751.
     stopwatch->Start();
     int failed_count = 0;
     fbl::Vector<std::unique_ptr<Result>> results;
-    if (!RunTests(RunTest, test_paths, test_args, output_dir, kOutputFileName, verbosity,
+    if (!RunTests(RunTest, test_paths, test_args, repeat, output_dir, kOutputFileName, verbosity,
                   &failed_count, &results)) {
         return EXIT_FAILURE;
     }
@@ -318,8 +351,6 @@ int DiscoverAndRunTests(const RunTestFn& RunTest, int argc, const char* const* a
             fprintf(stderr, "Error: Could not close JSON summary.\n");
             return EXIT_FAILURE;
         }
-
-        SyncPathAndAncestors(output_dir);
     }
 
     // Display any failed tests, and free the test results.

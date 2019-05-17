@@ -63,8 +63,13 @@ zx_status_t sys_vmo_create_contiguous(zx_handle_t bti, size_t size, uint32_t ali
     }
 
     auto up = ProcessDispatcher::GetCurrent();
+    zx_status_t status = up->EnforceBasicPolicy(ZX_POL_NEW_VMO);
+    if (status != ZX_OK) {
+        return status;
+    }
+
     fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
-    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
+    status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
     if (status != ZX_OK) {
         return status;
     }
@@ -95,10 +100,15 @@ zx_status_t sys_vmo_create_physical(zx_handle_t hrsrc, zx_paddr_t paddr, size_t 
                                     user_out_handle* out) {
     LTRACEF("size 0x%zu\n", size);
 
+    auto up = ProcessDispatcher::GetCurrent();
+    zx_status_t status = up->EnforceBasicPolicy(ZX_POL_NEW_VMO);
+    if (status != ZX_OK) {
+        return status;
+    }
+
     // Memory should be subtracted from the PhysicalAspace allocators, so it's
     // safe to assume that if the caller has access to a resource for this specified
     // region of MMIO space then it is safe to allow the vmo to be created.
-    zx_status_t status;
     if ((status = validate_resource_mmio(hrsrc, paddr, size)) != ZX_OK) {
         return status;
     }
@@ -201,7 +211,7 @@ zx_status_t sys_iommu_create(zx_handle_t resource, uint32_t type,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<IommuDispatcher> handle;
     zx_rights_t rights;
 
     {
@@ -217,13 +227,13 @@ zx_status_t sys_iommu_create(zx_handle_t resource, uint32_t type,
         }
         status = IommuDispatcher::Create(type,
                                          ktl::unique_ptr<const uint8_t[]>(copied_desc.release()),
-                                         desc_size, &dispatcher, &rights);
+                                         desc_size, &handle, &rights);
         if (status != ZX_OK) {
             return status;
         }
     }
 
-    return out->make(ktl::move(dispatcher), rights);
+    return out->make(ktl::move(handle), rights);
 }
 
 #if ARCH_X86
@@ -286,17 +296,17 @@ zx_status_t sys_bti_create(zx_handle_t iommu, uint32_t options, uint64_t bti_id,
         return status;
     }
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<BusTransactionInitiatorDispatcher> handle;
     zx_rights_t rights;
     // TODO(teisenbe): Migrate BusTransactionInitiatorDispatcher::Create to
     // taking the iommu_dispatcher
     status = BusTransactionInitiatorDispatcher::Create(iommu_dispatcher->iommu(), bti_id,
-                                                       &dispatcher, &rights);
+                                                       &handle, &rights);
     if (status != ZX_OK) {
         return status;
     }
 
-    return out->make(ktl::move(dispatcher), rights);
+    return out->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_bti_pin
@@ -374,16 +384,16 @@ zx_status_t sys_bti_pin(zx_handle_t handle, uint32_t options, zx_handle_t vmo, u
         return ZX_ERR_NO_MEMORY;
     }
 
-    fbl::RefPtr<Dispatcher> new_pmt;
+    KernelHandle<PinnedMemoryTokenDispatcher> new_pmt_handle;
     zx_rights_t new_pmt_rights;
-    status = bti_dispatcher->Pin(vmo_dispatcher->vmo(), offset, size, iommu_perms, &new_pmt,
+    status = bti_dispatcher->Pin(vmo_dispatcher->vmo(), offset, size, iommu_perms, &new_pmt_handle,
                                  &new_pmt_rights);
     if (status != ZX_OK) {
         return status;
     }
 
-    status = static_cast<PinnedMemoryTokenDispatcher*>(new_pmt.get())
-                 ->EncodeAddrs(compress_results, contiguous, mapped_addrs.get(), addrs_count);
+    status = new_pmt_handle.dispatcher()->EncodeAddrs(compress_results, contiguous,
+                                                      mapped_addrs.get(), addrs_count);
     if (status != ZX_OK) {
         return status;
     }
@@ -393,7 +403,7 @@ zx_status_t sys_bti_pin(zx_handle_t handle, uint32_t options, zx_handle_t vmo, u
         return status;
     }
 
-    return pmt->make(ktl::move(new_pmt), new_pmt_rights);
+    return pmt->make(ktl::move(new_pmt_handle), new_pmt_rights);
 }
 
 // zx_status_t zx_bti_release_quarantine
@@ -446,18 +456,18 @@ zx_status_t sys_interrupt_create(zx_handle_t src_obj, uint32_t src_num,
         }
     }
 
-    fbl::RefPtr<Dispatcher> dispatcher;
+    KernelHandle<InterruptDispatcher> handle;
     zx_rights_t rights;
     zx_status_t result;
     if (options & ZX_INTERRUPT_VIRTUAL) {
-        result = VirtualInterruptDispatcher::Create(&dispatcher, &rights, options);
+        result = VirtualInterruptDispatcher::Create(&handle, &rights, options);
     } else {
-        result = InterruptEventDispatcher::Create(&dispatcher, &rights, src_num, options);
+        result = InterruptEventDispatcher::Create(&handle, &rights, src_num, options);
     }
     if (result != ZX_OK)
         return result;
 
-    return out_handle->make(ktl::move(dispatcher), rights);
+    return out_handle->make(ktl::move(handle), rights);
 }
 
 // zx_status_t zx_interrupt_bind

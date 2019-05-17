@@ -12,6 +12,7 @@
 #include <utility>
 
 #include <zircon/assert.h>
+#include <zxtest/base/environment.h>
 #include <zxtest/base/reporter.h>
 #include <zxtest/base/runner.h>
 #include <zxtest/base/test-driver.h>
@@ -144,6 +145,119 @@ void RunnerRunAllTests() {
     // Check that both tests were executed once.
     ZX_ASSERT_MSG(test_counter == 1, "test was not executed.\n");
     ZX_ASSERT_MSG(test_2_counter == 1, "test_2 was not executed.\n");
+}
+
+// This test Will increase |counter_| each time is executed, until |*counter_| equals |fail_at|.
+// When this happens, an assertion will be dispatched to |runner_|. This allows testing for
+// infinite iterations and breaking on failure.
+template <int fail_at>
+class FakeRepeatingTest : public zxtest::Test {
+public:
+    static fbl::Function<std::unique_ptr<Test>(TestDriver*)> MakeFactory(Runner* runner,
+                                                                         int* counter) {
+        return [counter, runner](TestDriver* driver) {
+            std::unique_ptr<FakeRepeatingTest> test =
+                zxtest::Test::Create<FakeRepeatingTest>(driver);
+            test->counter_ = counter;
+            test->runner_ = runner;
+            return test;
+        };
+    }
+
+private:
+    void TestBody() final {
+        ++*counter_;
+        if (*counter_ >= fail_at) {
+            Assertion assertion("eq", "a", "1", "b", "2",
+                                {.filename = __FILE__, .line_number = __LINE__},
+                                /*is_fatal=*/true);
+            runner_->NotifyAssertion(assertion);
+        }
+    }
+
+    int* counter_;
+    Runner* runner_;
+};
+
+void RunnerRunAllTestsUntilFailure() {
+    Runner runner(Reporter(/*stream*/ nullptr));
+    int test_counter = 0;
+    constexpr int kAttemptsUntilFailure = 10;
+
+    runner.RegisterTest<Test, FakeRepeatingTest<kAttemptsUntilFailure>>(
+        kTestCaseName, kTestName, kFileName, kLineNumber,
+        FakeRepeatingTest<kAttemptsUntilFailure>::MakeFactory(&runner, &test_counter));
+
+    // Verify that the runner actually claims to hold two tests from one test case.
+    ZX_ASSERT_MSG(runner.summary().registered_test_count == 1,
+                  "Test failed to register correctly.\n");
+    ZX_ASSERT_MSG(runner.summary().registered_test_case_count == 1,
+                  "TestCase failed to register correctly.\n");
+
+    Runner::Options options = Runner::kDefaultOptions;
+    options.break_on_failure = true;
+    options.repeat = -1;
+    ZX_ASSERT_MSG(runner.Run(options) != 0, "Test Execution Should Fail.\n");
+
+    // Check that the active count reflects a filter matching all.
+    ZX_ASSERT_MSG(runner.summary().active_test_count == 1, "Failed to register test.\n");
+    ZX_ASSERT_MSG(runner.summary().active_test_case_count == 1, "Failed to register test.\n");
+
+    // Check that both tests were executed 10 times before they failed.
+    ZX_ASSERT_MSG(test_counter == kAttemptsUntilFailure, "test was not executed enough.\n");
+}
+
+class FakeEnv : public zxtest::Environment {
+public:
+    FakeEnv(int* curr_setup, int* curr_tear_down) {
+        this->curr_setup_ = curr_setup;
+        this->curr_tear_down_ = curr_tear_down;
+    }
+    ~FakeEnv() final {}
+
+    void SetUp() final {
+        set_up_order_ = *curr_setup_;
+        ++(*curr_setup_);
+    }
+
+    void TearDown() final {
+        tear_down_order_ = *curr_tear_down_;
+        ++(*curr_tear_down_);
+    }
+
+    int set_up_order() const { return set_up_order_; }
+    int tear_down_order() const { return tear_down_order_; }
+
+private:
+    int set_up_order_ = 0;
+    int tear_down_order_ = 0;
+    int* curr_setup_ = nullptr;
+    int* curr_tear_down_ = nullptr;
+};
+
+void RunnerSetUpAndTearDownEnvironmentsTests() {
+    Runner runner(Reporter(/*stream*/ nullptr));
+    int test_counter = 0;
+    int tear_down_counter = 1;
+    int set_up_counter = 1;
+    std::unique_ptr<FakeEnv> first = std::make_unique<FakeEnv>(&set_up_counter, &tear_down_counter);
+    std::unique_ptr<FakeEnv> second =
+        std::make_unique<FakeEnv>(&set_up_counter, &tear_down_counter);
+    FakeEnv* first_ptr = first.get();
+    FakeEnv* second_ptr = second.get();
+
+    [[maybe_unused]] TestRef ref = runner.RegisterTest<Test, FakeTest>(
+        kTestCaseName, kTestName, kFileName, kLineNumber, FakeTest::MakeFactory(&test_counter));
+
+    runner.AddGlobalTestEnvironment(std::move(first));
+    runner.AddGlobalTestEnvironment(std::move(second));
+
+    ZX_ASSERT_MSG(runner.Run(Runner::kDefaultOptions) == 0, "Runner::Run encountered test errors.");
+
+    ZX_ASSERT_MSG(first_ptr->set_up_order() < second_ptr->set_up_order(),
+                  "Environment::SetUp is not following registration order.");
+    ZX_ASSERT_MSG(first_ptr->tear_down_order() > second_ptr->tear_down_order(),
+                  "Enironment::TearDown is not following reverse registration order.");
 }
 
 void RunnerRunOnlyFilteredTests() {
@@ -330,7 +444,7 @@ void TestDriverImplResetOnTestCompletion() {
 }
 
 void RunnerOptionsParseFromCmdLineShort() {
-    const char* kArgs[12] = {};
+    const char* kArgs[13] = {};
     kArgs[0] = "mybin";
     kArgs[1] = "-f";
     kArgs[2] = "+*:-ZxTest";
@@ -341,8 +455,9 @@ void RunnerOptionsParseFromCmdLineShort() {
     kArgs[7] = "10";
     kArgs[8] = "-l";
     kArgs[9] = "false";
-    kArgs[10] = "-h";
-    kArgs[11] = "true";
+    kArgs[10] = "-b";
+    kArgs[11] = "-h";
+    kArgs[12] = "true";
 
     fbl::Vector<fbl::String> errors;
     Runner::Options options =
@@ -360,10 +475,12 @@ void RunnerOptionsParseFromCmdLineShort() {
     ZX_ASSERT_MSG(options.shuffle, "Runner::Options::shuffle not parsed correctly.\n");
     ZX_ASSERT_MSG(options.list, "Runner::Options::list not parsed correctly.\n");
     ZX_ASSERT_MSG(!options.help, "Runner::Options::help not parsed correctly.\n");
+    ZX_ASSERT_MSG(options.break_on_failure,
+                  "Runner::Options::break_on_failure not parsed correctly.\n");
 }
 
 void RunnerOptionsParseFromCmdLineLong() {
-    const char* kArgs[12] = {};
+    const char* kArgs[13] = {};
     kArgs[0] = "mybin";
     kArgs[1] = "--gtest_filter";
     kArgs[2] = "+*:-ZxTest";
@@ -374,8 +491,9 @@ void RunnerOptionsParseFromCmdLineLong() {
     kArgs[7] = "10";
     kArgs[8] = "--gtest_list_tests";
     kArgs[9] = "false";
-    kArgs[10] = "--help";
-    kArgs[11] = "true";
+    kArgs[10] = "--gtest_break_on_failure";
+    kArgs[11] = "--help";
+    kArgs[12] = "true";
 
     fbl::Vector<fbl::String> errors;
     Runner::Options options =
@@ -393,13 +511,15 @@ void RunnerOptionsParseFromCmdLineLong() {
     ZX_ASSERT_MSG(options.shuffle, "Runner::Options::shuffle not parsed correctly\n.");
     ZX_ASSERT_MSG(options.list, "Runner::Options::list not parsed correctly\n.");
     ZX_ASSERT_MSG(!options.help, "Runner::Options::help not parsed correctly\n.");
+    ZX_ASSERT_MSG(options.break_on_failure,
+                  "Runner::Options::break_on_failure not parsed correctly.\n");
 }
 
 void RunnerOptionsParseFromCmdLineErrors() {
     const char* kArgs[3] = {};
     kArgs[0] = "mybin";
     kArgs[1] = "--gtest_repeat";
-    kArgs[2] = "-1";
+    kArgs[2] = "-2";
 
     fbl::Vector<fbl::String> errors;
     Runner::Options options =

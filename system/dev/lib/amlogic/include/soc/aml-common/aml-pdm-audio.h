@@ -5,7 +5,7 @@
 #pragma once
 
 #include <assert.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <fbl/unique_ptr.h>
 #include <soc/aml-common/aml-audio-regs.h>
 
@@ -58,12 +58,12 @@ public:
     */
     void Shutdown();
 
-    uint32_t fifo_depth() const { return fifo_depth_; };
+    uint32_t fifo_depth() const { return fifo_depth_; }
 
     void ConfigPdmIn(uint8_t mask);
 
 private:
-    friend class fbl::unique_ptr<AmlPdmDevice>;
+    friend class std::default_delete<AmlPdmDevice>;
 
     AmlPdmDevice(ddk::MmioBuffer pdm_mmio, ddk::MmioBuffer audio_mmio,
                  ee_audio_mclk_src_t clk_src, uint32_t sysclk_div, uint32_t dclk_div,
@@ -75,7 +75,7 @@ private:
           dclk_div_(dclk_div),
           toddr_base_(GetToddrBase(toddr)),
           pdm_mmio_(std::move(pdm_mmio)),
-          audio_mmio_(std::move(audio_mmio)){};
+          audio_mmio_(std::move(audio_mmio)){}
 
     ~AmlPdmDevice() = default;
 

@@ -5,7 +5,7 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/platform-defs.h>
-#include <ddktl/mmio.h>
+#include <lib/mmio/mmio.h>
 #include <hw/reg.h>
 #include <lib/zx/handle.h>
 #include <soc/aml-common/aml-usb-phy-v2.h>
@@ -68,6 +68,7 @@ zx_status_t PerformUsbTuning(bool host, bool default_val) {
     std::optional<ddk::MmioBuffer> buf;
     zx_status_t status;
 
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     zx::unowned_resource resource(get_root_resource());
     status = ddk::MmioBuffer::Create(T931_USBPHY21_BASE, T931_USBPHY21_LENGTH, *resource,
                                      ZX_CACHE_POLICY_UNCACHED_DEVICE, &buf);

@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-clock_get_monotonic - Acquire the current monotonic time.
+Acquire the current monotonic time.
 
 ## SYNOPSIS
 
@@ -20,7 +20,8 @@ zx_time_t zx_clock_get_monotonic(void);
 
 `zx_clock_get_monotonic()` returns the current time in the system
 monotonic clock. This is the number of nanoseconds since the system was
-powered on.
+powered on. It does not always reset on reboot and does not adjust during
+sleep, and thus should not be used as a reliable source of uptime.
 
 ## RIGHTS
 

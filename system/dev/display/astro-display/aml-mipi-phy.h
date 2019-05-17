@@ -7,14 +7,14 @@
 #include <ddk/protocol/platform-device-lib.h>
 #include <ddk/protocol/platform/device.h>
 #include <ddktl/device.h>
-#include <ddktl/mmio.h>
+#include <ddktl/protocol/dsiimpl.h>
+#include <lib/mmio/mmio.h>
 #include <unistd.h>
 #include <zircon/compiler.h>
 
 #include <optional>
 
 #include "aml-dsi.h"
-#include "dw-mipi-dsi-reg.h"
 #include "common.h"
 
 namespace astro_display {
@@ -23,7 +23,7 @@ class AmlMipiPhy {
 public:
     AmlMipiPhy() {}
     // This function initializes internal state of the object
-    zx_status_t Init(zx_device_t* parent, uint32_t lane_num);
+    zx_status_t Init(zx_device_t* pdev_dev, zx_device_t* dsi_dev, uint32_t lane_num);
     // This function enables and starts up the Mipi Phy
     zx_status_t Startup();
     // This function stops Mipi Phy
@@ -56,16 +56,15 @@ private:
     };
 
     void PhyInit();
-    zx_status_t WaitforPhyReady();
 
-    std::optional<ddk::MmioBuffer>              mipi_dsi_mmio_;
-    std::optional<ddk::MmioBuffer>              dsi_phy_mmio_;
-    pdev_protocol_t                  pdev_ = {nullptr, nullptr};
-    uint32_t                                    num_of_lanes_;
-    DsiPhyConfig                                dsi_phy_cfg_;
+    std::optional<ddk::MmioBuffer> dsi_phy_mmio_;
+    pdev_protocol_t pdev_ = {nullptr, nullptr};
+    uint32_t num_of_lanes_;
+    DsiPhyConfig dsi_phy_cfg_;
+    ddk::DsiImplProtocolClient dsiimpl_;
 
-    bool                                        initialized_ = false;
-    bool                                        phy_enabled_ = false;
+    bool initialized_ = false;
+    bool phy_enabled_ = false;
 };
 
 } // namespace astro_display

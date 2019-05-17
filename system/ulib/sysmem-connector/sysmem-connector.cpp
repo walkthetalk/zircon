@@ -12,7 +12,9 @@
 #include <lib/async/cpp/task.h>
 #include <lib/async-loop/cpp/loop.h>
 #include <lib/fdio/watcher.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/fzl/fdio.h>
 #include <lib/zx/channel.h>
 
@@ -44,7 +46,7 @@ class SysmemConnector : public sysmem_connector {
   public:
     SysmemConnector(const char* sysmem_device_path);
     zx_status_t Start();
-    void QueueRequest(zx::channel allocator2_request);
+    void QueueRequest(zx::channel allocator_request);
     void Stop();
   private:
     void Post(fbl::Closure to_run);
@@ -86,17 +88,6 @@ SysmemConnector::SysmemConnector(const char* sysmem_device_path)
 }
 
 zx_status_t SysmemConnector::Start() {
-    ZX_DEBUG_ASSERT(!sysmem_dir_fd_);
-    {
-        int fd = open(sysmem_device_path_, O_DIRECTORY | O_RDONLY);
-        if (fd < 0) {
-            printf("sysmem-connector: Failed to open %s: %d\n", sysmem_device_path_, errno);
-            return ZX_ERR_INTERNAL;
-        }
-        sysmem_dir_fd_.reset(fd);
-    }
-    ZX_DEBUG_ASSERT(sysmem_dir_fd_);
-
     // The process_queue_thrd_ is filled out before any code that checks it runs on the thread, because the current
     // thread is the only thread that triggers anything to happen on the thread being created here, and that is only
     // done after process_queue_thrd_ is filled out by the current thread.
@@ -110,13 +101,13 @@ zx_status_t SysmemConnector::Start() {
     return ZX_OK;
 }
 
-void SysmemConnector::QueueRequest(zx::channel allocator2_request) {
+void SysmemConnector::QueueRequest(zx::channel allocator_request) {
     ZX_DEBUG_ASSERT(thrd_current() != process_queue_thrd_);
     bool trigger_needed;
     {  // scope lock
         fbl::AutoLock lock(&lock_);
         trigger_needed = connection_requests_.empty();
-        connection_requests_.emplace(std::move(allocator2_request));
+        connection_requests_.emplace(std::move(allocator_request));
     }  // ~lock
     if (trigger_needed) {
         Post([this]{ProcessQueue();});
@@ -189,6 +180,18 @@ zx_status_t SysmemConnector::DeviceAdded(int dirfd, int event, const char* filen
 zx_status_t SysmemConnector::ConnectToSysmemDriver() {
     ZX_DEBUG_ASSERT(thrd_current() == process_queue_thrd_);
     ZX_DEBUG_ASSERT(!driver_connector_client_);
+
+    ZX_DEBUG_ASSERT(!sysmem_dir_fd_);
+    {
+        int fd = open(sysmem_device_path_, O_DIRECTORY | O_RDONLY);
+        if (fd < 0) {
+            printf("sysmem-connector: Failed to open %s: %d\n", sysmem_device_path_, errno);
+            return ZX_ERR_INTERNAL;
+        }
+        sysmem_dir_fd_.reset(fd);
+    }
+    ZX_DEBUG_ASSERT(sysmem_dir_fd_);
+
     // Returns ZX_ERR_STOP as soon as one of the 000, 001 device instances is
     // found.  We rely on those to go away if the corresponding sysmem instance
     // is no longer operational, so that we don't find them when we call
@@ -212,16 +215,16 @@ zx_status_t SysmemConnector::ConnectToSysmemDriver() {
 void SysmemConnector::ProcessQueue() {
     ZX_DEBUG_ASSERT(thrd_current() == process_queue_thrd_);
     while (true) {
-        zx::channel allocator2_request;
+        zx::channel allocator_request;
         {  // scope lock
             fbl::AutoLock lock(&lock_);
             if (connection_requests_.empty()) {
                 return;
             }
-            allocator2_request = std::move(connection_requests_.front());
+            allocator_request = std::move(connection_requests_.front());
             connection_requests_.pop();
         }  // ~lock
-        ZX_DEBUG_ASSERT(allocator2_request);
+        ZX_DEBUG_ASSERT(allocator_request);
 
         // Poll for PEER_CLOSED just before we need the channel to be usable, to
         // avoid routing a request to a stale no-longer-usable sysmem device
@@ -254,7 +257,7 @@ void SysmemConnector::ProcessQueue() {
         if (!driver_connector_client_) {
             zx_status_t connect_status = ConnectToSysmemDriver();
             if (connect_status != ZX_OK) {
-                // ~allocator2_request - we'll try again to connect to a sysmem
+                // ~allocator_request - we'll try again to connect to a sysmem
                 // instance next time a request comes in, but any given request
                 // gets a max of one attempt to connect to a sysmem device
                 // instance, in case attempts to find a sysmem device instance
@@ -265,7 +268,7 @@ void SysmemConnector::ProcessQueue() {
         ZX_DEBUG_ASSERT(driver_connector_client_);
 
         zx_status_t send_connect_status = fuchsia_sysmem_DriverConnectorConnect(
-            driver_connector_client_.get(), allocator2_request.release());
+            driver_connector_client_.get(), allocator_request.release());
         if (send_connect_status != ZX_OK) {
             // The most likely failing send_connect_status is
             // ZX_ERR_PEER_CLOSED, which can happen if the channel closed since
@@ -302,12 +305,12 @@ zx_status_t sysmem_connector_init(const char* sysmem_device_path, sysmem_connect
 
 void sysmem_connector_queue_connection_request(
     sysmem_connector_t* connector_param,
-    zx_handle_t allocator2_request_param) {
-    zx::channel allocator2_request(allocator2_request_param);
+    zx_handle_t allocator_request_param) {
+    zx::channel allocator_request(allocator_request_param);
     ZX_DEBUG_ASSERT(connector_param);
-    ZX_DEBUG_ASSERT(allocator2_request);
+    ZX_DEBUG_ASSERT(allocator_request);
     SysmemConnector* connector = static_cast<SysmemConnector*>(connector_param);
-    connector->QueueRequest(std::move(allocator2_request));
+    connector->QueueRequest(std::move(allocator_request));
 }
 
 void sysmem_connector_release(sysmem_connector_t* connector_param) {

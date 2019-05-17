@@ -2,16 +2,78 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <ddk/binding.h>
 #include <ddk/debug.h>
 #include <ddk/metadata.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/usb/modeswitch.h>
+#include <ddk/usb-peripheral-config.h>
+#include <fuchsia/hardware/usb/peripheral/c/fidl.h>
+#include <hw/reg.h>
 #include <soc/hi3660/hi3660-hw.h>
+#include <soc/hi3660/hi3660-regs.h>
+#include <zircon/device/usb-peripheral.h>
+#include <zircon/hw/usb.h>
+#include <zircon/hw/usb/cdc.h>
 
 #include <stdio.h>
+#include <string.h>
 
 #include "hikey960.h"
 #include "hikey960-hw.h"
+
+static const char* kManufacturer = "Zircon";
+static const char* kProduct = "CDC-Ethernet";
+static const char* kSerial = "0123456789ABCDEF";
+
+typedef fuchsia_hardware_usb_peripheral_FunctionDescriptor FunctionDescriptor;
+
+zx_status_t hikey960_usb_phy_init(hikey960_t* hikey) {
+    volatile void* usb3otg_bc = hikey->usb3otg_bc.vaddr;
+    volatile void* peri_crg = hikey->peri_crg.vaddr;
+    volatile void* pctrl = hikey->pctrl.vaddr;
+    uint32_t temp;
+
+    writel(PERI_CRG_ISODIS_REFCLK_ISO_EN, peri_crg + PERI_CRG_ISODIS);
+    writel(PCTRL_CTRL3_USB_TCXO_EN | (PCTRL_CTRL3_USB_TCXO_EN << PCTRL_CTRL3_MSK_START),
+           pctrl + PCTRL_CTRL3);
+
+    temp = readl(pctrl + PCTRL_CTRL24);
+    temp &= ~PCTRL_CTRL24_SC_CLK_USB3PHY_3MUX1_SEL;
+    writel(temp, pctrl + PCTRL_CTRL24);
+
+    writel(PERI_CRG_GT_CLK_USB3OTG_REF | PERI_CRG_GT_ACLK_USB3OTG, peri_crg + PERI_CRG_CLK_EN4);
+    writel(PERI_CRG_IP_RST_USB3OTG_MUX | PERI_CRG_IP_RST_USB3OTG_AHBIF
+           | PERI_CRG_IP_RST_USB3OTG_32K,  peri_crg + PERI_CRG_RSTDIS4);
+
+    writel(PERI_CRG_IP_RST_USB3OTGPHY_POR | PERI_CRG_IP_RST_USB3OTG, peri_crg + PERI_CRG_RSTEN4);
+
+    // enable PHY REF CLK
+    temp = readl(usb3otg_bc + USB3OTG_CTRL0);
+    temp |= USB3OTG_CTRL0_ABB_GT_EN;
+    writel(temp, usb3otg_bc + USB3OTG_CTRL0);
+
+    temp = readl(usb3otg_bc + USB3OTG_CTRL7);
+    temp |= USB3OTG_CTRL7_REF_SSP_EN;
+    writel(temp, usb3otg_bc + USB3OTG_CTRL7);
+
+    // exit from IDDQ mode
+    temp = readl(usb3otg_bc + USB3OTG_CTRL2);
+    temp &= ~(USB3OTG_CTRL2_POWERDOWN_HSP | USB3OTG_CTRL2_POWERDOWN_SSP);
+    writel(temp, usb3otg_bc + USB3OTG_CTRL2);
+    zx_nanosleep(zx_deadline_after(ZX_USEC(100)));
+
+    writel(PERI_CRG_IP_RST_USB3OTGPHY_POR, peri_crg + PERI_CRG_RSTDIS4);
+    writel(PERI_CRG_IP_RST_USB3OTG, peri_crg + PERI_CRG_RSTDIS4);
+    zx_nanosleep(zx_deadline_after(ZX_MSEC(20)));
+
+    temp = readl(usb3otg_bc + USB3OTG_CTRL3);
+    temp |= (USB3OTG_CTRL3_VBUSVLDEXT | USB3OTG_CTRL3_VBUSVLDEXTSEL);
+    writel(temp, usb3otg_bc + USB3OTG_CTRL3);
+    zx_nanosleep(zx_deadline_after(ZX_USEC(100)));
+
+    return ZX_OK;
+}
 
 static const pbus_mmio_t dwc3_mmios[] = {
     {
@@ -36,29 +98,31 @@ static const pbus_bti_t dwc3_btis[] = {
 
 static usb_mode_t dwc3_mode = USB_MODE_HOST;
 
-static const pbus_metadata_t dwc2_metadata[] = {
+static pbus_metadata_t dwc3_metadata[] = {
     {
-        .type        = DEVICE_METADATA_USB_MODE,
+        .type = DEVICE_METADATA_USB_CONFIG,
+        // data_buffer and data_size filled in below
+    },
+    {
+        .type = DEVICE_METADATA_USB_MODE,
         .data_buffer = &dwc3_mode,
-        .data_size   = sizeof(dwc3_mode),
-    }
+        .data_size = sizeof(dwc3_mode),
+    },
 };
 
-static const pbus_dev_t hikey_usb_children[] = {
-    {
-        .name = "dwc3",
-        .vid = PDEV_VID_GENERIC,
-        .pid = PDEV_PID_GENERIC,
-        .did = PDEV_DID_USB_DWC3,
-        .mmio_list = dwc3_mmios,
-        .mmio_count = countof(dwc3_mmios),
-        .irq_list = dwc3_irqs,
-        .irq_count = countof(dwc3_irqs),
-        .bti_list = dwc3_btis,
-        .bti_count = countof(dwc3_btis),
-        .metadata_list = dwc2_metadata,
-        .metadata_count = countof(dwc2_metadata),
-    },
+static const pbus_dev_t dwc3_dev = {
+    .name = "dwc3",
+    .vid = PDEV_VID_GENERIC,
+    .pid = PDEV_PID_GENERIC,
+    .did = PDEV_DID_USB_DWC3,
+    .mmio_list = dwc3_mmios,
+    .mmio_count = countof(dwc3_mmios),
+    .irq_list = dwc3_irqs,
+    .irq_count = countof(dwc3_irqs),
+    .bti_list = dwc3_btis,
+    .bti_count = countof(dwc3_btis),
+    .metadata_list = dwc3_metadata,
+    .metadata_count = countof(dwc3_metadata),
 };
 
 static const pbus_gpio_t hikey_usb_gpios[] = {
@@ -80,15 +144,54 @@ const pbus_dev_t hikey_usb_dev = {
     .did = PDEV_DID_HIKEY960_USB,
     .gpio_list = hikey_usb_gpios,
     .gpio_count = countof(hikey_usb_gpios),
-    .child_list = hikey_usb_children,
-    .child_count = countof(hikey_usb_children),
+};
+
+// Composite binding rules for USB driver.
+static const zx_bind_inst_t root_match[] = {
+    BI_MATCH(),
+};
+static const zx_bind_inst_t ums_match[] = {
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_USB_MODE_SWITCH),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_GENERIC),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_GENERIC),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_USB_DWC3),
+};
+static const device_component_part_t ums_component[] = {
+    { countof(root_match), root_match },
+    { countof(ums_match), ums_match },
+};
+static const device_component_t components[] = {
+    { countof(ums_component), ums_component },
 };
 
 zx_status_t hikey960_usb_init(hikey960_t* hikey) {
-    zx_status_t status;
+    zx_status_t status = hikey960_usb_phy_init(hikey);
+    if (status != ZX_OK) {
+        return status;
+    }
 
     if ((status = pbus_device_add(&hikey->pbus, &hikey_usb_dev)) != ZX_OK) {
         zxlogf(ERROR, "hikey960_add_devices could not add hikey_usb_dev: %d\n", status);
+        return status;
+    }
+
+    // construct USB config metadata
+    uint8_t buffer[sizeof(struct UsbConfig) + sizeof(FunctionDescriptor)];
+    struct UsbConfig* config = (struct UsbConfig*)buffer;
+    config->vid = GOOGLE_USB_VID;
+    config->pid = GOOGLE_USB_CDC_PID;
+    strcpy(config->manufacturer, kManufacturer);
+    strcpy(config->serial, kSerial);
+    strcpy(config->product, kProduct);
+    config->functions[0].interface_class = USB_CLASS_COMM;
+    config->functions[0].interface_protocol = 0;
+    config->functions[0].interface_subclass = USB_CDC_SUBCLASS_ETHERNET;
+    dwc3_metadata[0].data_size = sizeof(struct UsbConfig) + sizeof(FunctionDescriptor);
+    dwc3_metadata[0].data_buffer = config;
+
+    status = pbus_composite_device_add(&hikey->pbus, &dwc3_dev, components, countof(components), 1);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s: pbus_composite_device_add failed: %d\n", __FUNCTION__, status);
         return status;
     }
 

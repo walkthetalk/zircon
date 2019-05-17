@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-vmo_read - read bytes from the VMO
+Read bytes from the VMO.
 
 ## SYNOPSIS
 
@@ -51,14 +51,14 @@ bytes written to *buffer* is undefined.
 
 **ZX_ERR_INVALID_ARGS**  *buffer* is an invalid pointer or NULL.
 
-**ZX_ERR_OUT_OF_RANGE**  *offset* starts at or beyond the end of the VMO,
-                         or VMO is shorter than *buffer_size*.
+**ZX_ERR_OUT_OF_RANGE**  *offset* + *buffer_size* is greater than the size of
+                         the VMO.
 
 **ZX_ERR_BAD_STATE**  VMO has been marked uncached and is not directly readable.
 
 ## SEE ALSO
 
- - [`zx_vmo_clone()`]
+ - [`zx_vmo_create_child()`]
  - [`zx_vmo_create()`]
  - [`zx_vmo_get_size()`]
  - [`zx_vmo_op_range()`]
@@ -68,7 +68,7 @@ bytes written to *buffer* is undefined.
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 
-[`zx_vmo_clone()`]: vmo_clone.md
+[`zx_vmo_create_child()`]: vmo_create_child.md
 [`zx_vmo_create()`]: vmo_create.md
 [`zx_vmo_get_size()`]: vmo_get_size.md
 [`zx_vmo_op_range()`]: vmo_op_range.md

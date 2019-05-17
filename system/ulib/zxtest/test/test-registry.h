@@ -19,7 +19,7 @@ namespace test {
 // Stub used for testing;
 class TestDriverStub : public internal::TestDriver {
 public:
-    ~TestDriverStub() final{};
+    ~TestDriverStub() final {}
 
     void Skip() final {}
 
@@ -61,6 +61,7 @@ void TestCaseRegisterDuplicatedTestFails();
 
 // Verify that |Testcase::Run| executes TestCase set up and tear down in the correct order.
 void TestCaseRun();
+void TestCaseRunUntilFailure();
 
 // Verify that |TestCase::Filter| works as expected.
 void TestCaseFilter();
@@ -76,6 +77,10 @@ void TestCaseShuffle();
 
 // Verify that |TestCase::UnShuffle| restores original order.
 void TestCaseUnShuffle();
+
+// Verify that |Assertion::Assertion(...)| generate the right values.
+void AssertionHasValues();
+void AssertionHasNoValues();
 
 // Verify that the broadcasting is working for all LifecycleObserver
 // events.
@@ -97,7 +102,9 @@ void EventBroadcasterOnProgramEnd();
 void RunnerRegisterTest();
 void RunnerRegisterTestWithCustomFactory();
 void RunnerRunAllTests();
+void RunnerRunAllTestsUntilFailure();
 void RunnerRunAllTestsSameTestCase();
+void RunnerSetUpAndTearDownEnvironmentsTests();
 void RunnerRunOnlyFilteredTests();
 void RunnerRepeatTests();
 void RunnerListTests();
@@ -112,6 +119,7 @@ void TestDriverImplReset();
 // Verify that we parse options correctly.
 void RunnerOptionsParseFromCmdLineShort();
 void RunnerOptionsParseFromCmdLineLong();
+void RunnerOptionsParseFromCmdLineErrors();
 
 // Verify that the current Filter implementation matches gTest expectations.
 void FilterOpFilterEmptyMatchesAll();
@@ -141,6 +149,7 @@ static constexpr RegisteredTest kRegisteredTests[] = {
     RUN_TEST(TestCaseRegisterTest),
     RUN_TEST(TestCaseRegisterDuplicatedTestFails),
     RUN_TEST(TestCaseRun),
+    RUN_TEST(TestCaseRunUntilFailure),
     RUN_TEST(TestCaseFilter),
     RUN_TEST(TestCaseFilterNoMatches),
     RUN_TEST(TestCaseFilterAllMatching),
@@ -148,6 +157,8 @@ static constexpr RegisteredTest kRegisteredTests[] = {
     RUN_TEST(TestCaseFilterDoNotAccumulate),
     RUN_TEST(TestCaseShuffle),
     RUN_TEST(TestCaseUnShuffle),
+    RUN_TEST(AssertionHasValues),
+    RUN_TEST(AssertionHasNoValues),
     RUN_TEST(EventBroadcasterOnProgramStart),
     RUN_TEST(EventBroadcasterOnIterationStart),
     RUN_TEST(EventBroadcasterOnEnvironmentSetUp),
@@ -164,7 +175,9 @@ static constexpr RegisteredTest kRegisteredTests[] = {
     RUN_TEST(RunnerRegisterTest),
     RUN_TEST(RunnerRegisterTestWithCustomFactory),
     RUN_TEST(RunnerRunAllTests),
+    RUN_TEST(RunnerRunAllTestsUntilFailure),
     RUN_TEST(RunnerRunAllTestsSameTestCase),
+    RUN_TEST(RunnerSetUpAndTearDownEnvironmentsTests),
     RUN_TEST(RunnerRunOnlyFilteredTests),
     RUN_TEST(RunnerListTests),
     RUN_TEST(TestDriverImplFatalFailureEndsTest),
@@ -172,6 +185,8 @@ static constexpr RegisteredTest kRegisteredTests[] = {
     RUN_TEST(TestDriverImplReset),
     RUN_TEST(TestDriverImplResetOnTestCompletion),
     RUN_TEST(RunnerOptionsParseFromCmdLineShort),
+    RUN_TEST(RunnerOptionsParseFromCmdLineLong),
+    RUN_TEST(RunnerOptionsParseFromCmdLineErrors),
     RUN_TEST(FilterOpFilterEmptyMatchesAll),
     RUN_TEST(FilterOpFilterFullMatch),
     RUN_TEST(FilterOpFilterFullNegativeMatch),

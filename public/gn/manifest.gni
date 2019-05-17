@@ -1,0 +1,224 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Generate a manifest file as used by `zbi`, `minfs`, etc.
+#
+# This produces a manifest file in the `TARGET=SOURCE` format where
+# `SOURCE` is a host file path relative to $root_build_dir and `TARGET`
+# is a path relative to some filesystem image or directory subtree being
+# populated.  The manifest is populated from optional fixed entries given
+# in $manifest (see below) and from the dependency graph of this target.
+#
+# resource() targets as well as executable() et al and any targets with
+# an `install_path` parameter contribute metadata to populate manifest
+# files that depend on those targets.  manifest_file() targets and other
+# packaging steps act as dependency barriers to the manifest metadata
+# collection, so if this target depends (directly or indirectly) on
+# another manifest_file(), the dependencies of _that_ manifest_file()
+# won't contribute entries to _this_ manifest (unless they are reached
+# separately as dependencies of _this_ target by a dependency path not
+# passing thruogh _that_ target).
+#
+# Parameters
+#
+#   data_deps
+#     Optional: Has no effect on this target, but dependents will depend
+#     on these targets.
+#     Type: list(label)
+#
+#   deps
+#     Optional: Dependencies examined for metadata.  Transitive dependencies
+#     from here defining `metadata.manifest_lines` contribute to the manifest,
+#     pruned at targets that set `metadata.manifest_barrier`.  Likewise,
+#     `metadata.manifest_files` contributes manifests (like $sources).
+#     Each manifest_file() target itself contributes that way, so another
+#     manifest_file() in the deps will be folded into this one.
+#     Type: list(label)
+#
+#   output_dir
+#     Optional: Directory where the manifest file is written.
+#     Type: dir
+#     Default: target_gen_dir
+#
+#   output_extension
+#     Optional: Extension added to $output_name.
+#     Type: string
+#     Default: "manifest"
+#
+#   output_name
+#     Optional: Name of the manifest file written out.
+#     Type: string
+#     Default: target_name
+#
+#   manifest
+#     Optional: Fixed entries for the manifest file.  These augment the
+#     entries collected from `manifest_lines` metadata.  Each entry is
+#     either a string that's a literal manifest entry line, or a scope
+#     with $sources and $outputs like a resource() target.
+#     Type: list(string or scope)
+#
+#   sources
+#     Optional: Additional manifest files to be concatenated onto this one.
+#     Type: list(file)
+#
+template("manifest_file") {
+  forward_variables_from(invoker,
+                         [
+                           "output_dir",
+                           "output_extension",
+                           "output_name",
+                         ])
+  if (!defined(output_dir)) {
+    output_dir = target_gen_dir
+  }
+  if (!defined(output_extension)) {
+    output_extension = "manifest"
+  }
+  if (!defined(output_name)) {
+    output_name = target_name
+  }
+
+  manifest_file = "$output_dir/$output_name"
+  if (output_extension != "") {
+    manifest_file += ".$output_extension"
+  }
+
+  manifest_target = target_name
+  list_file = "$target_gen_dir/$target_name.list"
+  raw_file = "$target_gen_dir/$target_name.raw.manifest"
+  list_file_target = "_manifest_file.$target_name.list"
+  raw_file_target = "_manifest_file.$target_name.raw"
+
+  # An embedded manifest contributes to metadata.manifest_lines directly.
+  manifest_entries = []
+  manifest_inputs = []
+  if (defined(invoker.manifest)) {
+    foreach(entry, invoker.manifest) {
+      if (entry == "$entry") {
+        # It's a literal manifest entry string.
+        # Note this doesn't express any dependency on its source file!
+        manifest_entries += [ entry ]
+      } else {
+        # It's a manifest entry in the style of a copy() target.
+        foreach(source, entry.sources) {
+          manifest_inputs += [ source ]
+          source_path = rebase_path(source, root_build_dir)
+          foreach(target, process_file_template([ source ], entry.outputs)) {
+            manifest_entries += [ "${target}=${source_path}" ]
+          }
+        }
+      }
+    }
+  }
+
+  # This target produces the raw manifest file from metadata and fixed entries.
+  generated_file(raw_file_target) {
+    visibility = [ ":$list_file_target" ]
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                           ])
+    outputs = [
+      raw_file,
+    ]
+    output_conversion = "list lines"
+    data_keys = [ "manifest_lines" ]
+    walk_keys = [ "manifest_barrier" ]
+    metadata = {
+      # This will be picked up by raw_file_target, below.
+      manifest_files = rebase_path(outputs, root_build_dir)
+      if (defined(invoker.sources)) {
+        manifest_files += rebase_path(invoker.sources, root_build_dir)
+      }
+
+      # This will be picked up by this target's own collection.
+      manifest_lines = manifest_entries
+    }
+  }
+
+  # This target produces the list of manifest files to combine.
+  # It always includes the raw file just produced and $sources,
+  # but can also pick up more files from metadata.
+  generated_file(list_file_target) {
+    visibility = [ ":$manifest_target" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    outputs = [
+      list_file,
+    ]
+    output_conversion = "list lines"
+    data_keys = [ "manifest_files" ]
+    walk_keys = [ "manifest_barrier" ]
+    deps = [
+      ":$raw_file_target",
+    ]
+  }
+
+  # This target produces the final manifest by combining all those files.
+  # The metadata from the invoker and for other manifest_file() targets
+  # goes here.  It shouldn't be seen by the generated_file() targets above.
+  action(manifest_target) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    script = "$zx/public/gn/manifest-cat.sh"
+    sources = [
+      list_file,
+    ]
+    outputs = [
+      manifest_file,
+    ]
+    deps = [
+      ":$list_file_target",
+    ]
+    inputs = manifest_inputs
+    if (defined(invoker.sources)) {
+      # These are listed in $list_file and will appear in the depfile.
+      # Make sure they're built before the first run if necessary and let
+      # GN enforce that they come from the deps.  This is the only reason
+      # to include deps and not just data_deps in this action() target.
+      # The deps are reached by $raw_file_target already.
+      inputs += invoker.sources
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+    }
+    depfile = "$manifest_file.d"
+    args = rebase_path(sources + outputs + [ depfile ], root_build_dir)
+
+    metadata = {
+      images = []
+      manifest_barrier = []
+      manifest_files = []
+
+      if (defined(invoker.metadata)) {
+        # This lets the invoker add to `images` and `manifest_barrier`,
+        # though our implicit contributions will always be there too.
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      # For the //:images build_api_module().
+      images += [
+        {
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = output_name
+          path = rebase_path(manifest_file, root_build_dir)
+          type = "manifest"
+          cpu = current_cpu
+          os = current_os
+        },
+      ]
+
+      # Another manifest_file() depending on this one will fold it in,
+      # just as this one folded in any `manifest_files` from its deps.
+      # The `manifest_barrier` set here (above) prevents any dependents
+      # from reaching dependencies we've already folded in.
+      manifest_files += [ rebase_path(manifest_file, root_build_dir) ]
+    }
+  }
+}

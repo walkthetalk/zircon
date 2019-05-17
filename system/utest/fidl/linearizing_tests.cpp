@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <cstddef>
 #include <limits.h>
 #include <memory>
-#include <stddef.h>
 
 #include <lib/fidl/coding.h>
 #include <lib/fidl/cpp/string_view.h>
@@ -214,11 +214,11 @@ bool linearize_vector_of_string() {
     std::unique_ptr<uint8_t[]> buffer(new uint8_t[buf_size]);
 
     fidl::StringView strings[3] = {};
-    strings[0].set_data(const_cast<char*>(str1));
+    strings[0].set_data(str1);
     strings[0].set_size(sizeof(str1));
-    strings[1].set_data(const_cast<char*>(str2));
+    strings[1].set_data(str2);
     strings[1].set_size(sizeof(str2));
-    strings[2].set_data(const_cast<char*>(str3));
+    strings[2].set_data(str3);
     strings[2].set_size(sizeof(str3));
 
     VectorOfStringRequest message;
@@ -474,25 +474,6 @@ bool linearize_simple_table() {
 
 namespace {
 
-// Define the memory-layout of the inline object, for the group of tests below
-using TableOfStruct = fidl::VectorView<fidl_envelope_t>;
-struct TableOfStructEnvelopes {
-    alignas(FIDL_ALIGNMENT)
-    fidl_envelope_t a;
-    fidl_envelope_t b;
-};
-struct OrdinalOneStructWithHandle {
-    alignas(FIDL_ALIGNMENT)
-    zx_handle_t h;
-    int32_t foo;
-};
-struct OrdinalTwoStructWithManyHandles {
-    alignas(FIDL_ALIGNMENT)
-    zx_handle_t h1;
-    zx_handle_t h2;
-    fidl::VectorView<zx_handle_t> hs;
-};
-
 bool linearize_table_field_1() {
     BEGIN_TEST;
 
@@ -544,7 +525,7 @@ bool linearize_table_field_2() {
     table.set_data(&envelopes.a);
 
     zx_handle_t dummy_handles[4] = {};
-    auto handle_value_at = [] (int i) ->zx_handle_t { return static_cast<zx_handle_t>(100 + i); };
+    auto handle_value_at = [] (int i) -> zx_handle_t { return static_cast<zx_handle_t>(100 + i); };
     for (int i = 0; i < 4; i++) {
         dummy_handles[i] = handle_value_at(i);
     }
@@ -604,8 +585,8 @@ bool linearize_xunion_empty_invariant_empty() {
     BEGIN_TEST;
 
     // Non-zero ordinal with empty envelope is an error
-    SampleXUnionStruct xunion = {};
-    xunion.xu.header = (fidl_xunion_t) {
+    SampleNullableXUnionStruct xunion = {};
+    xunion.opt_xu.header = (fidl_xunion_t) {
         .tag = kSampleXUnionIntStructOrdinal,
         .padding = 0,
         .envelope = {}
@@ -615,7 +596,7 @@ bool linearize_xunion_empty_invariant_empty() {
     const char* error = nullptr;
     zx_status_t status;
     uint32_t actual_num_bytes = 0;
-    status = fidl_linearize(&fidl_test_coding_SampleXUnionStructTable,
+    status = fidl_linearize(&fidl_test_coding_SampleNullableXUnionStructTable,
                             &xunion,
                             buffer,
                             buf_size,
@@ -635,8 +616,8 @@ bool linearize_xunion_empty_invariant_zero_ordinal() {
     IntStruct int_struct = {
         .v = 100
     };
-    SampleXUnionStruct xunion = {};
-    xunion.xu.header = (fidl_xunion_t) {
+    SampleNullableXUnionStruct xunion = {};
+    xunion.opt_xu.header = (fidl_xunion_t) {
         .tag = 0,
         .padding = 0,
         .envelope = (fidl_envelope_t) {
@@ -650,7 +631,7 @@ bool linearize_xunion_empty_invariant_zero_ordinal() {
     const char* error = nullptr;
     zx_status_t status;
     uint32_t actual_num_bytes = 0;
-    status = fidl_linearize(&fidl_test_coding_SampleXUnionStructTable,
+    status = fidl_linearize(&fidl_test_coding_SampleNullableXUnionStructTable,
                             &xunion,
                             buffer,
                             buf_size,
@@ -659,6 +640,57 @@ bool linearize_xunion_empty_invariant_zero_ordinal() {
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
     EXPECT_NONNULL(error);
     EXPECT_STR_EQ(error, "xunion with zero as ordinal must be empty");
+
+    END_TEST;
+}
+
+bool linearize_xunion_primitive_field() {
+    BEGIN_TEST;
+
+    int32_t raw_int = 42;
+    SampleXUnionStruct xunion = {};
+    xunion.xu.header = (fidl_xunion_t) {
+        .tag = kSampleXUnionRawIntOrdinal,
+        .padding = 0,
+        .envelope = (fidl_envelope_t) {
+            .num_bytes = 0,
+            .num_handles = 0,
+            .data = &raw_int
+        }
+    };
+    constexpr uint32_t buf_size = 512;
+    uint8_t buffer[buf_size];
+    const char* error = nullptr;
+    zx_status_t status;
+    uint32_t actual_num_bytes = 0;
+    status = fidl_linearize(&fidl_test_coding_SampleXUnionStructTable,
+                            &xunion,
+                            buffer,
+                            buf_size,
+                            &actual_num_bytes,
+                            &error);
+    EXPECT_EQ(status, ZX_OK);
+    EXPECT_NULL(error, error);
+
+    uint8_t golden_linearized_prefix[] = {
+        0xe3, 0x60, 0x0e, 0x13, // The ordinal value is 0x130e60e3
+        0x00, 0x00, 0x00, 0x00, // xunion padding
+        0x08, 0x00, 0x00, 0x00, // num_bytes of envelope
+        0x00, 0x00, 0x00, 0x00, // num_handles of envelope
+        // The out-of-line address of the payload would follow.
+    };
+    constexpr uint32_t kEnvelopeDataPointerSize = sizeof(uintptr_t);
+    constexpr uint32_t kEnvelopePayloadSize = fidl::FidlAlign(sizeof(int32_t));
+    ASSERT_EQ(actual_num_bytes,
+              sizeof(golden_linearized_prefix) + kEnvelopeDataPointerSize + kEnvelopePayloadSize);
+    ASSERT_BYTES_EQ(buffer, golden_linearized_prefix, sizeof(golden_linearized_prefix),
+                    "linearized result is different from goldens");
+    SampleXUnionStruct* linearized = reinterpret_cast<SampleXUnionStruct*>(&buffer[0]);
+    int32_t* payload_addr = reinterpret_cast<int32_t*>(linearized->xu.header.envelope.data);
+    std::ptrdiff_t distance = reinterpret_cast<uint8_t*>(payload_addr) - &buffer[0];
+    ASSERT_EQ(distance,
+              sizeof(golden_linearized_prefix) + kEnvelopeDataPointerSize);
+    ASSERT_EQ(*payload_addr, raw_int);
 
     END_TEST;
 }
@@ -691,6 +723,7 @@ END_TEST_CASE(tables)
 BEGIN_TEST_CASE(xunions)
 RUN_TEST(linearize_xunion_empty_invariant_empty)
 RUN_TEST(linearize_xunion_empty_invariant_zero_ordinal)
+RUN_TEST(linearize_xunion_primitive_field)
 END_TEST_CASE(xunions)
 
 

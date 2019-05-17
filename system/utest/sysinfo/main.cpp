@@ -6,7 +6,9 @@
 #include <unistd.h>
 
 #include <fuchsia/sysinfo/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <lib/zx/channel.h>
 #include <zircon/boot/image.h>
 #include <zircon/syscalls.h>
@@ -99,7 +101,3 @@ RUN_TEST(get_root_resource_succeeds)
 RUN_TEST(get_board_name_succeeds)
 RUN_TEST(get_interrupt_controller_info_succeeds)
 END_TEST_CASE(sysinfo_tests)
-
-int main(int argc, char** argv) {
-    return unittest_run_all_tests(argc, argv) ? 0 : -1;
-}

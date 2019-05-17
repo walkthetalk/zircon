@@ -27,7 +27,7 @@ std::string NameSize(uint64_t size) {
 
 } // namespace
 
-std::string StringJoin(const std::vector<StringView>& strings, StringView separator) {
+std::string StringJoin(const std::vector<std::string_view>& strings, std::string_view separator) {
     std::string result;
     bool first = true;
     for (const auto& part : strings) {
@@ -178,6 +178,32 @@ std::string NameRawLiteralKind(raw::Literal::Kind kind) {
     }
 }
 
+void NameFlatTypeConstructorHelper(std::ostringstream& buf,
+                                   const flat::TypeConstructor* type_ctor) {
+    buf << NameName(type_ctor->name, ".", "/");
+    if (type_ctor->maybe_arg_type_ctor) {
+        buf << "<";
+        NameFlatTypeConstructorHelper(buf, type_ctor->maybe_arg_type_ctor.get());
+        buf << ">";
+    }
+    if (type_ctor->maybe_size) {
+        auto size = static_cast<const flat::Size&>(type_ctor->maybe_size->Value());
+        if (size != flat::Size::Max()) {
+            buf << ":";
+            buf << size.value;
+        }
+    }
+    if (type_ctor->nullability == types::Nullability::kNullable) {
+        buf << "?";
+    }
+}
+
+std::string NameFlatTypeConstructor(const flat::TypeConstructor* type_ctor) {
+    std::ostringstream buf;
+    NameFlatTypeConstructorHelper(buf, type_ctor);
+    return buf.str();
+}
+
 std::string NameFlatTypeKind(flat::Type::Kind kind) {
     switch (kind) {
     case flat::Type::Kind::kArray:
@@ -251,11 +277,11 @@ std::string NameHandleZXObjType(types::HandleSubtype subtype) {
     }
 }
 
-std::string NameUnionTag(StringView union_name, const flat::Union::Member& member) {
+std::string NameUnionTag(std::string_view union_name, const flat::Union::Member& member) {
     return std::string(union_name) + "Tag_" + NameIdentifier(member.name);
 }
 
-std::string NameXUnionTag(StringView xunion_name, const flat::XUnion::Member& member) {
+std::string NameXUnionTag(std::string_view xunion_name, const flat::XUnion::Member& member) {
     return std::string(xunion_name) + "Tag_" + NameIdentifier(member.name);
 }
 
@@ -263,7 +289,7 @@ std::string NameFlatConstant(const flat::Constant* constant) {
     switch (constant->kind) {
     case flat::Constant::Kind::kLiteral: {
         auto literal_constant = static_cast<const flat::LiteralConstant*>(constant);
-        return literal_constant->literal->location().data();
+        return std::string(literal_constant->literal->location().data());
     }
     case flat::Constant::Kind::kIdentifier: {
         auto identifier_constant = static_cast<const flat::IdentifierConstant*>(constant);
@@ -280,34 +306,31 @@ void NameFlatTypeHelper(std::ostringstream& buf, const flat::Type* type) {
     case flat::Type::Kind::kArray: {
         auto array_type = static_cast<const flat::ArrayType*>(type);
         buf << "array<";
-        NameFlatTypeHelper(buf, array_type->element_type.get());
+        NameFlatTypeHelper(buf, array_type->element_type);
         buf << ">";
-        auto element_count = static_cast<const flat::Size&>(array_type->element_count->Value());
-        if (element_count != flat::Size::Max()) {
+        if (*array_type->element_count != flat::Size::Max()) {
             buf << ":";
-            buf << element_count.value;
+            buf << array_type->element_count->value;
         }
         break;
     }
     case flat::Type::Kind::kVector: {
         auto vector_type = static_cast<const flat::VectorType*>(type);
         buf << "vector<";
-        NameFlatTypeHelper(buf, vector_type->element_type.get());
+        NameFlatTypeHelper(buf, vector_type->element_type);
         buf << ">";
-        auto element_count = static_cast<const flat::Size&>(vector_type->element_count->Value());
-        if (element_count != flat::Size::Max()) {
+        if (*vector_type->element_count != flat::Size::Max()) {
             buf << ":";
-            buf << element_count.value;
+            buf << vector_type->element_count->value;
         }
         break;
     }
     case flat::Type::Kind::kString: {
         auto string_type = static_cast<const flat::StringType*>(type);
         buf << "string";
-        auto max_size = static_cast<const flat::Size&>(string_type->max_size->Value());
-        if (max_size != flat::Size::Max()) {
+        if (*string_type->max_size != flat::Size::Max()) {
             buf << ":";
-            buf << max_size.value;
+            buf << string_type->max_size->value;
         }
         break;
     }
@@ -324,7 +347,7 @@ void NameFlatTypeHelper(std::ostringstream& buf, const flat::Type* type) {
     case flat::Type::Kind::kRequestHandle: {
         auto request_handle_type = static_cast<const flat::RequestHandleType*>(type);
         buf << "request<";
-        buf << NameName(request_handle_type->name, ".", "/");
+        buf << NameName(request_handle_type->interface_type->name, ".", "/");
         buf << ">";
         break;
     }
@@ -368,32 +391,30 @@ std::string NameFlatCType(const flat::Type* type, flat::Decl::Kind decl_kind) {
         }
 
         case flat::Type::Kind::kArray: {
-            auto array_type = static_cast<const flat::ArrayType*>(type);
-            type = array_type->element_type.get();
+            type = static_cast<const flat::ArrayType*>(type)->element_type;
             continue;
         }
 
         case flat::Type::Kind::kIdentifier: {
             auto identifier_type = static_cast<const flat::IdentifierType*>(type);
             switch (decl_kind) {
+            case flat::Decl::Kind::kBits:
             case flat::Decl::Kind::kConst:
             case flat::Decl::Kind::kEnum:
             case flat::Decl::Kind::kStruct:
-            case flat::Decl::Kind::kTable:
-            case flat::Decl::Kind::kUnion:
-            case flat::Decl::Kind::kXUnion: {
+            case flat::Decl::Kind::kUnion: {
                 std::string name = NameName(identifier_type->name, "_", "_");
                 if (identifier_type->nullability == types::Nullability::kNullable) {
                     name.push_back('*');
                 }
                 return name;
             }
-            case flat::Decl::Kind::kInterface: {
+            case flat::Decl::Kind::kTable:
+                return "fidl_table_t";
+            case flat::Decl::Kind::kXUnion:
+                return "fidl_xunion_t";
+            case flat::Decl::Kind::kInterface:
                 return "zx_handle_t";
-            }
-            default: {
-                abort();
-            }
             }
         }
         }
@@ -402,21 +423,24 @@ std::string NameFlatCType(const flat::Type* type, flat::Decl::Kind decl_kind) {
 
 std::string NameIdentifier(SourceLocation name) {
     // TODO(TO-704) C name escaping and ergonomics.
-    return name.data();
+    return std::string(name.data());
 }
 
-std::string NameName(const flat::Name& name, StringView library_separator, StringView name_separator) {
-    std::string compiled_name = LibraryName(name.library(), library_separator);
-    compiled_name += name_separator;
+std::string NameName(const flat::Name& name, std::string_view library_separator, std::string_view name_separator) {
+    std::string compiled_name("");
+    if (name.library() != nullptr) {
+        compiled_name += LibraryName(name.library(), library_separator);
+        compiled_name += name_separator;
+    }
     compiled_name += name.name_part();
     return compiled_name;
 }
 
-std::string NameLibrary(const std::vector<StringView>& library_name) {
+std::string NameLibrary(const std::vector<std::string_view>& library_name) {
     return StringJoin(library_name, ".");
 }
 
-std::string NameLibraryCHeader(const std::vector<StringView>& library_name) {
+std::string NameLibraryCHeader(const std::vector<std::string_view>& library_name) {
     return StringJoin(library_name, "/") + "/c/fidl.h";
 }
 
@@ -428,24 +452,24 @@ std::string NameDiscoverable(const flat::Interface& interface) {
     return NameName(interface.name, ".", ".");
 }
 
-std::string NameMethod(StringView interface_name, const flat::Interface::Method& method) {
+std::string NameMethod(std::string_view interface_name, const flat::Interface::Method& method) {
     return std::string(interface_name) + NameIdentifier(method.name);
 }
 
-std::string NameOrdinal(StringView method_name) {
+std::string NameOrdinal(std::string_view method_name) {
     std::string ordinal_name(method_name);
     ordinal_name += "Ordinal";
     return ordinal_name;
 }
 
 // TODO: Remove post-FIDL-425
-std::string NameGenOrdinal(StringView method_name) {
+std::string NameGenOrdinal(std::string_view method_name) {
     std::string ordinal_name(method_name);
     ordinal_name += "GenOrdinal";
     return ordinal_name;
 }
 
-std::string NameMessage(StringView method_name, types::MessageKind kind) {
+std::string NameMessage(std::string_view method_name, types::MessageKind kind) {
     std::string message_name(method_name);
     switch (kind) {
     case types::MessageKind::kRequest:
@@ -461,23 +485,23 @@ std::string NameMessage(StringView method_name, types::MessageKind kind) {
     return message_name;
 }
 
-std::string NameTable(StringView type_name) {
+std::string NameTable(std::string_view type_name) {
     return std::string(type_name) + "Table";
 }
 
-std::string NamePointer(StringView name) {
+std::string NamePointer(std::string_view name) {
     std::string pointer_name(name);
     pointer_name += "Pointer";
     return pointer_name;
 }
 
-std::string NameMembers(StringView name) {
+std::string NameMembers(std::string_view name) {
     std::string members_name(name);
     members_name += "Members";
     return members_name;
 }
 
-std::string NameFields(StringView name) {
+std::string NameFields(std::string_view name) {
     std::string fields_name(name);
     fields_name += "Fields";
     return fields_name;
@@ -506,28 +530,28 @@ std::string NameCodedHandle(types::HandleSubtype subtype, types::Nullability nul
     return name;
 }
 
-std::string NameCodedInterfaceHandle(StringView interface_name, types::Nullability nullability) {
+std::string NameCodedInterfaceHandle(std::string_view interface_name, types::Nullability nullability) {
     std::string name(interface_name);
     name += "Interface";
     name += NameNullability(nullability);
     return name;
 }
 
-std::string NameCodedRequestHandle(StringView interface_name, types::Nullability nullability) {
+std::string NameCodedRequestHandle(std::string_view interface_name, types::Nullability nullability) {
     std::string name(interface_name);
     name += "Request";
     name += NameNullability(nullability);
     return name;
 }
 
-std::string NameCodedArray(StringView element_name, uint64_t size) {
+std::string NameCodedArray(std::string_view element_name, uint64_t size) {
     std::string name("Array");
     name += element_name;
     name += NameSize(size);
     return name;
 }
 
-std::string NameCodedVector(StringView element_name, uint64_t max_size,
+std::string NameCodedVector(std::string_view element_name, uint64_t max_size,
                             types::Nullability nullability) {
     std::string name("Vector");
     name += element_name;

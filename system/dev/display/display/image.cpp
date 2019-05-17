@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <ddk/debug.h>
+#include <ddk/trace/event.h>
 
 #include <atomic>
 #include <utility>
@@ -12,8 +13,10 @@
 
 namespace display {
 
-Image::Image(Controller* controller, const image_t& image_config, zx::vmo handle)
-        : info_(image_config), controller_(controller), vmo_(std::move(handle)) { }
+Image::Image(Controller* controller, const image_t& image_config, zx::vmo handle,
+             uint32_t stride_px)
+    : info_(image_config), stride_px_(stride_px), controller_(controller), vmo_(std::move(handle)) {
+}
 
 Image::~Image() {
     ZX_DEBUG_ASSERT(!std::atomic_load(&in_use_));
@@ -46,6 +49,8 @@ void Image::OnFenceReady(FenceReference* fence) {
 void Image::StartPresent() {
     ZX_DEBUG_ASSERT(wait_fence_ == nullptr);
     ZX_DEBUG_ASSERT(mtx_trylock(controller_->mtx()) == thrd_busy);
+    TRACE_DURATION("gfx", "Image::StartPresent", "id", id);
+    TRACE_FLOW_BEGIN("gfx", "present_image", id);
 
     presenting_ = true;
 }

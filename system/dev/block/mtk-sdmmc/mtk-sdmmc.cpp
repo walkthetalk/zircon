@@ -161,7 +161,7 @@ zx_status_t MtkSdmmc::Create(void* ctx, zx_device_t* parent) {
     fbl::AllocChecker ac;
     fbl::unique_ptr<MtkSdmmc> device(new (&ac) MtkSdmmc(parent, *std::move(mmio), std::move(bti),
                                                         info, std::move(irq), reset_gpio,
-                                                        power_en_gpio, dev_info, config));
+                                                        power_en_gpio, config));
 
     if (!ac.check()) {
         zxlogf(ERROR, "%s: MtkSdmmc alloc failed\n", __FILE__);
@@ -179,6 +179,12 @@ zx_status_t MtkSdmmc::Create(void* ctx, zx_device_t* parent) {
     __UNUSED auto* dummy = device.release();
 
     return ZX_OK;
+}
+
+void MtkSdmmc::DdkRelease() {
+    irq_.reset();
+    JoinIrqThread();
+    delete this;
 }
 
 zx_status_t MtkSdmmc::Bind() {
@@ -200,9 +206,9 @@ zx_status_t MtkSdmmc::Init() {
     SdmmcSetBusFreq(kIdentificationModeBusFreq);
 
     auto sdc_cfg = SdcCfg::Get().ReadFrom(&mmio_);
-    if (dev_info_.did == PDEV_DID_MEDIATEK_SDIO) {
-        // TODO(bradenkell): Handle in-band interrupts from the SDIO device.
-        sdc_cfg.set_sdio_interrupt_enable(0).set_sdio_enable(1);
+    if (config_.is_sdio) {
+        sdc_cfg.set_sdio_interrupt_enable(1).set_sdio_enable(1);
+        MsdcIntEn::Get().FromValue(0).set_sdio_irq_enable(1).WriteTo(&mmio_);
     }
 
     sdc_cfg.set_bus_width(SdcCfg::kBusWidth1).WriteTo(&mmio_);
@@ -684,14 +690,23 @@ zx_status_t MtkSdmmc::RequestPreparePolled(sdmmc_req_t* req) {
 zx_status_t MtkSdmmc::RequestFinishPolled(sdmmc_req_t* req) {
     uint32_t bytes_remaining = req->blockcount * req->blocksize;
     uint8_t* data_ptr = reinterpret_cast<uint8_t*>(req->virt_buffer) + req->buf_offset;
-    while (bytes_remaining > 0) {
-        uint32_t fifo_count = MsdcFifoCs::Get().ReadFrom(&mmio_).rx_fifo_count();
 
-        for (uint32_t i = 0; i < fifo_count; i++) {
-            *data_ptr++ = MsdcRxData::Get().ReadFrom(&mmio_).data();
+    if (req->cmd_flags & SDMMC_CMD_READ) {
+        while (bytes_remaining > 0) {
+            uint32_t fifo_count = MsdcFifoCs::Get().ReadFrom(&mmio_).rx_fifo_count();
+
+            for (uint32_t i = 0; i < fifo_count; i++) {
+                *data_ptr++ = MsdcRxData::Get().ReadFrom(&mmio_).data();
+            }
+
+            bytes_remaining -= fifo_count;
         }
+    } else {
+        while (MsdcFifoCs::Get().ReadFrom(&mmio_).tx_fifo_count() != 0) {}
 
-        bytes_remaining -= fifo_count;
+        for (uint32_t i = 0; i < bytes_remaining; i++) {
+            MsdcTxData::Get().FromValue(*data_ptr++).WriteTo(&mmio_);
+        }
     }
 
     return ZX_OK;
@@ -702,11 +717,13 @@ zx_status_t MtkSdmmc::SdmmcRequest(sdmmc_req_t* req) {
 }
 
 RequestStatus MtkSdmmc::SdmmcRequestWithStatus(sdmmc_req_t* req) {
-    uint32_t is_data_request = req->cmd_flags & SDMMC_RESP_DATA_PRESENT;
-    if (is_data_request && !req->use_dma && !(req->cmd_flags & SDMMC_CMD_READ)) {
-        // TODO(bradenkell): Implement polled block writes.
+    if ((req->blockcount * req->blocksize) > config_.fifo_depth && !req->use_dma &&
+        !(req->cmd_flags & SDMMC_CMD_READ)) {
+        // TODO(bradenkell): Implement polled block writes greater than the FIFO size.
         return RequestStatus(ZX_ERR_NOT_SUPPORTED);
     }
+
+    uint32_t is_data_request = req->cmd_flags & SDMMC_RESP_DATA_PRESENT;
 
     zx_status_t status = ZX_OK;
 
@@ -737,7 +754,7 @@ RequestStatus MtkSdmmc::SdmmcRequestWithStatus(sdmmc_req_t* req) {
             .set_cmd_ready_enable(1)
             .WriteTo(&mmio_);
 
-        SdcCmd::FromRequest(req).WriteTo(&mmio_);
+        SdcCmd::FromRequest(req, config_.is_sdio).WriteTo(&mmio_);
     }
 
     sync_completion_wait(&req_completion_, ZX_TIME_INFINITE);
@@ -761,6 +778,16 @@ RequestStatus MtkSdmmc::SdmmcRequestWithStatus(sdmmc_req_t* req) {
     }
 
     return req_status;
+}
+
+zx_status_t
+MtkSdmmc::SdmmcRegisterInBandInterrupt(const in_band_interrupt_protocol_t* interrupt_cb) {
+    if (!config_.is_sdio) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    interrupt_cb_ = ddk::InBandInterruptProtocolClient(interrupt_cb);
+    return ZX_OK;
 }
 
 bool MtkSdmmc::CmdDone(const MsdcInt& msdc_int) {
@@ -801,7 +828,8 @@ bool MtkSdmmc::CmdDone(const MsdcInt& msdc_int) {
 
 int MtkSdmmc::IrqThread() {
     while (1) {
-        if (WaitForInterrupt() != ZX_OK) {
+        zx::time timestamp;
+        if (WaitForInterrupt(&timestamp) != ZX_OK) {
             zxlogf(ERROR, "%s: IRQ wait failed\n", __FILE__);
             return thrd_error;
         }
@@ -810,6 +838,23 @@ int MtkSdmmc::IrqThread() {
         auto msdc_int = MsdcInt::Get().ReadFrom(&mmio_).WriteTo(&mmio_);
 
         fbl::AutoLock mutex_al(&mutex_);
+
+        if (msdc_int.sdio_irq()) {
+            if (interrupt_cb_.is_valid()) {
+                interrupt_cb_.Callback();
+            }
+
+            msdc_int.set_sdio_irq(0);
+            if (req_ == nullptr) {
+                // The controller sometimes sets transfer_complete after an SDIO interrupt, so clear
+                // it here to avoid log spam.
+                msdc_int.set_transfer_complete(0);
+            }
+
+            if (msdc_int.reg_value() == 0) {
+                continue;
+            }
+        }
 
         if (req_ == nullptr) {
             zxlogf(ERROR, "%s: Received interrupt with no request, MSDC_INT=%08x\n", __FILE__,
@@ -843,15 +888,18 @@ int MtkSdmmc::IrqThread() {
             continue;
         }
 
-        MsdcIntEn::Get().FromValue(0).WriteTo(&mmio_);
+        MsdcIntEn::Get()
+            .FromValue(0)
+            .set_sdio_irq_enable(config_.is_sdio ? 1 : 0)
+            .WriteTo(&mmio_);
+
         req_ = nullptr;
         sync_completion_signal(&req_completion_);
     }
 }
 
-zx_status_t MtkSdmmc::WaitForInterrupt() {
-    zx::time timestamp;
-    return irq_.wait(&timestamp);
+zx_status_t MtkSdmmc::WaitForInterrupt(zx::time* timestamp) {
+    return irq_.wait(timestamp);
 }
 
 }  // namespace sdmmc
@@ -863,9 +911,10 @@ static zx_driver_ops_t mtk_sdmmc_driver_ops = []() -> zx_driver_ops_t {
     return ops;
 }();
 
-ZIRCON_DRIVER_BEGIN(mtk_sdmmc, mtk_sdmmc_driver_ops, "zircon", "0.1", 4)
+ZIRCON_DRIVER_BEGIN(mtk_sdmmc, mtk_sdmmc_driver_ops, "zircon", "0.1", 5)
     BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PDEV),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_MEDIATEK),
-    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_EMMC),
-    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_SDIO),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_MSDC0),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_MSDC1),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_DID, PDEV_DID_MEDIATEK_MSDC2),
 ZIRCON_DRIVER_END(mtk_sdmmc)

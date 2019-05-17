@@ -18,6 +18,8 @@
 #include <object/process_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
 #include <pretty/sizes.h>
+
+#include <zircon/syscalls/object.h>
 #include <zircon/types.h>
 
 // Machinery to walk over a job tree and run a callback on each process.
@@ -60,8 +62,6 @@ static void DumpProcessListKeyMap() {
 }
 
 static const char* ObjectTypeToString(zx_obj_type_t type) {
-    static_assert(ZX_OBJ_TYPE_LAST == 29, "need to update switch below");
-
     switch (type) {
         case ZX_OBJ_TYPE_PROCESS: return "process";
         case ZX_OBJ_TYPE_THREAD: return "thread";
@@ -87,6 +87,7 @@ static const char* ObjectTypeToString(zx_obj_type_t type) {
         case ZX_OBJ_TYPE_PMT: return "pmt";
         case ZX_OBJ_TYPE_SUSPEND_TOKEN: return "suspend-token";
         case ZX_OBJ_TYPE_PAGER: return "pager";
+        case ZX_OBJ_TYPE_EXCEPTION: return "exception";
         default: return "???";
     }
 }
@@ -115,9 +116,7 @@ static uint32_t BuildHandleStats(const ProcessDispatcher& pd,
 // buffer as strings.
 static void FormatHandleTypeCount(const ProcessDispatcher& pd,
                                   char *buf, size_t buf_len) {
-    static_assert(ZX_OBJ_TYPE_LAST == 29, "need to update table below");
-
-    uint32_t types[ZX_OBJ_TYPE_LAST] = {0};
+    uint32_t types[ZX_OBJ_TYPE_UPPER_BOUND] = {0};
     uint32_t handle_count = BuildHandleStats(pd, types, sizeof(types));
 
     snprintf(buf, buf_len, "%4u: %4u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u",
@@ -138,7 +137,8 @@ static void FormatHandleTypeCount(const ProcessDispatcher& pd,
              types[ZX_OBJ_TYPE_GUEST] + types[ZX_OBJ_TYPE_VCPU] +
              types[ZX_OBJ_TYPE_IOMMU] + types[ZX_OBJ_TYPE_BTI] +
              types[ZX_OBJ_TYPE_PROFILE] + types[ZX_OBJ_TYPE_PMT] +
-             types[ZX_OBJ_TYPE_SUSPEND_TOKEN] + types[ZX_OBJ_TYPE_PAGER]
+             types[ZX_OBJ_TYPE_SUSPEND_TOKEN] + types[ZX_OBJ_TYPE_PAGER] +
+             types[ZX_OBJ_TYPE_EXCEPTION]
              );
 }
 
@@ -146,7 +146,7 @@ void DumpProcessList() {
     printf("%7s  #h:  #jb #pr #th #vo #vm #ch #ev #po #so #tm #fi #?? [name]\n", "id");
 
     auto walker = MakeProcessWalker([](ProcessDispatcher* process) {
-        char handle_counts[(ZX_OBJ_TYPE_LAST * 4) + 1 + /*slop*/ 16];
+        char handle_counts[(ZX_OBJ_TYPE_UPPER_BOUND * 4) + 1 + /*slop*/ 16];
         FormatHandleTypeCount(*process, handle_counts, sizeof(handle_counts));
 
         char pname[ZX_MAX_NAME_LEN];
@@ -170,6 +170,60 @@ void DumpJobList() {
     });
 }
 
+static const char kRightsHeader[] = "dup tr r w x map gpr spr enm des spo gpo sig sigp wt ins mj mp mt ap";
+static void DumpHandleRightsKeyMap() {
+    printf("dup : ZX_RIGHT_DUPLICATE\n");
+    printf("tr  : ZX_RIGHT_TRANSFER\n");
+    printf("r   : ZX_RIGHT_READ\n");
+    printf("w   : ZX_RIGHT_WRITE\n");
+    printf("x   : ZX_RIGHT_EXECUTE\n");
+    printf("map : ZX_RIGHT_MAP\n");
+    printf("gpr : ZX_RIGHT_GET_PROPERTY\n");
+    printf("spr : ZX_RIGHT_SET_PROPERTY\n");
+    printf("enm : ZX_RIGHT_ENUMERATE\n");
+    printf("des : ZX_RIGHT_DESTROY\n");
+    printf("spo : ZX_RIGHT_SET_POLICY\n");
+    printf("gpo : ZX_RIGHT_GET_POLICY\n");
+    printf("sig : ZX_RIGHT_SIGNAL\n");
+    printf("sigp: ZX_RIGHT_SIGNAL_PEER\n");
+    printf("wt  : ZX_RIGHT_WAIT\n");
+    printf("ins : ZX_RIGHT_INSPECT\n");
+    printf("mj  : ZX_RIGHT_MANAGE_JOB\n");
+    printf("mp  : ZX_RIGHT_MANAGE_PROCESS\n");
+    printf("mt  : ZX_RIGHT_MANAGE_THREAD\n");
+    printf("ap  : ZX_RIGHT_APPLY_PROFILE\n");
+}
+
+static bool HasRights(zx_rights_t rights, zx_rights_t desired) {
+  return (rights & desired) == desired;
+}
+
+static void FormatHandleRightsMask(zx_rights_t rights, char *buf, size_t buf_len) {
+    snprintf(buf, buf_len,
+             "%3d %2d %1d %1d %1d %3d %3d %3d %3d %3d %3d %3d %3d %4d %2d %3d %2d %2d %2d %2d",
+             HasRights(rights, ZX_RIGHT_DUPLICATE),
+             HasRights(rights, ZX_RIGHT_TRANSFER),
+             HasRights(rights, ZX_RIGHT_READ),
+             HasRights(rights, ZX_RIGHT_WRITE),
+             HasRights(rights, ZX_RIGHT_EXECUTE),
+             HasRights(rights, ZX_RIGHT_MAP),
+             HasRights(rights, ZX_RIGHT_GET_PROPERTY),
+             HasRights(rights, ZX_RIGHT_SET_PROPERTY),
+             HasRights(rights, ZX_RIGHT_ENUMERATE),
+             HasRights(rights, ZX_RIGHT_DESTROY),
+             HasRights(rights, ZX_RIGHT_SET_POLICY),
+             HasRights(rights, ZX_RIGHT_GET_POLICY),
+             HasRights(rights, ZX_RIGHT_SIGNAL),
+             HasRights(rights, ZX_RIGHT_SIGNAL_PEER),
+             HasRights(rights, ZX_RIGHT_WAIT),
+             HasRights(rights, ZX_RIGHT_INSPECT),
+             HasRights(rights, ZX_RIGHT_MANAGE_JOB),
+             HasRights(rights, ZX_RIGHT_MANAGE_PROCESS),
+             HasRights(rights, ZX_RIGHT_MANAGE_THREAD),
+             HasRights(rights, ZX_RIGHT_APPLY_PROFILE)
+             );
+}
+
 void DumpProcessHandles(zx_koid_t id) {
     auto pd = ProcessDispatcher::LookupProcessById(id);
     if (!pd) {
@@ -177,18 +231,73 @@ void DumpProcessHandles(zx_koid_t id) {
         return;
     }
 
-    printf("process [%" PRIu64 "] handles :\n", id);
-    printf("handle       koid : type\n");
+    char pname[ZX_MAX_NAME_LEN];
+    pd->get_name(pname);
+    printf("process %" PRIu64 " ('%s') handles:\n", id, pname);
+    printf("%7s %10s %10s: {%s} [type]\n", "koid", "handle", "rights", kRightsHeader);
 
     uint32_t total = 0;
     pd->ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
                           const Dispatcher* disp) {
-        printf("%9x %7" PRIu64 " : %s\n",
-            handle, disp->get_koid(), ObjectTypeToString(disp->get_type()));
+        char rights_mask[sizeof(kRightsHeader)];
+        FormatHandleRightsMask(rights, rights_mask, sizeof(rights_mask));
+        printf("%7" PRIu64 " %#10x %#10x: {%s} [%s]\n",
+               disp->get_koid(),
+               handle,
+               rights,
+               rights_mask,
+               ObjectTypeToString(disp->get_type()));
         ++total;
         return ZX_OK;
     });
     printf("total: %u handles\n", total);
+}
+
+void DumpHandlesForKoid(zx_koid_t id) {
+    if (id < ZX_KOID_FIRST) {
+        printf("invalid koid, non-reserved koids start at %" PRIu64 "\n", ZX_KOID_FIRST);
+        return;
+    }
+
+    uint32_t total_proc = 0;
+    uint32_t total_handles = 0;
+    auto walker = MakeProcessWalker([&](ProcessDispatcher* process) {
+        bool found_handle = false;
+        process->ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
+                              const Dispatcher* disp) {
+            if (disp->get_koid() != id) {
+              return ZX_OK;
+            }
+
+            if (total_handles == 0) {
+                printf("handles for koid %" PRIu64 " (%s):\n",
+                       id, ObjectTypeToString(disp->get_type()));
+                printf("%7s %10s: {%s} [name]\n", "pid", "rights", kRightsHeader);
+            }
+
+            char pname[ZX_MAX_NAME_LEN];
+            char rights_mask[sizeof(kRightsHeader)];
+            process->get_name(pname);
+            FormatHandleRightsMask(rights, rights_mask, sizeof(rights_mask));
+            printf("%7" PRIu64 " %#10x: {%s} [%s]\n",
+                   process->get_koid(),
+                   rights,
+                   rights_mask,
+                   pname);
+
+            ++total_handles;
+            found_handle = true;
+            return ZX_OK;
+        });
+        total_proc += found_handle;
+    });
+    GetRootJobDispatcher()->EnumerateChildren(&walker, /* recurse */ true);
+
+    if (total_handles > 0) {
+      printf("total: %u handles in %u processes\n", total_handles, total_proc);
+    } else {
+      printf("no handles found for koid %" PRIu64 "\n", id);
+    }
 }
 
 void ktrace_report_live_processes() {
@@ -218,7 +327,7 @@ static const char* VmoRightsToString(uint32_t rights, char str[kRightsStrLen]) {
 // If |handles| is true, the dumped objects are expected to have handle info.
 static void PrintVmoDumpHeader(bool handles) {
     printf(
-        "%s koid parent #chld #map #shr    size   alloc name\n",
+        "%s koid obj                parent #chld #map #shr    size   alloc name\n",
         handles ? "      handle rights " : "           -      - ");
 }
 
@@ -254,13 +363,13 @@ static void DumpVmObject(
         strlcpy(alloc_str, "phys", sizeof(alloc_str));
     }
 
-    char clone_str[21];
-    if (vmo.is_cow_clone()) {
-        snprintf(clone_str, sizeof(clone_str),
+    char child_str[21];
+    if (vmo.child_type() != VmObject::kNotChild) {
+        snprintf(child_str, sizeof(child_str),
                  "%" PRIu64, vmo.parent_user_id());
     } else {
-        clone_str[0] = '-';
-        clone_str[1] = '\0';
+        child_str[0] = '-';
+        child_str[1] = '\0';
     }
 
     char name[ZX_MAX_NAME_LEN];
@@ -273,7 +382,8 @@ static void DumpVmObject(
     printf("  %10s " // handle
            "%6s " // rights
            "%5" PRIu64 " " // koid
-           "%6s " // clone parent koid
+           "%p " // vm_object
+           "%6s " // child parent koid
            "%5" PRIu32 " " // number of children
            "%4" PRIu32 " " // map count
            "%4" PRIu32 " " // share count
@@ -283,7 +393,8 @@ static void DumpVmObject(
            handle_str,
            rights_str,
            koid,
-           clone_str,
+           &vmo,
+           child_str,
            vmo.num_children(),
            vmo.num_mappings(),
            vmo.share_count(),
@@ -401,7 +512,7 @@ void KillProcess(zx_koid_t id) {
     }
     // if found, outside of the lock hit it with kill
     printf("killing process %" PRIu64 "\n", id);
-    pd->Kill();
+    pd->Kill(ZX_TASK_RETCODE_SYSCALL_KILL);
 }
 
 namespace {
@@ -738,6 +849,8 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         printf("not enough arguments:\n");
     usage:
         printf("%s ps                : list processes\n", argv[0].str);
+        printf("%s ps help           : print header label descriptions for 'ps'\n",
+               argv[0].str);
         printf("%s jobs              : list jobs\n", argv[0].str);
         printf("%s mwd  <mb>         : memory watchdog\n", argv[0].str);
         printf("%s ht   <pid>        : dump process handles\n", argv[0].str);
@@ -750,6 +863,9 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         printf("%s asd  <pid>|kernel : dump process/kernel address space\n",
                argv[0].str);
         printf("%s htinfo            : handle table info\n", argv[0].str);
+        printf("%s koid <koid>       : list all handles for a koid\n", argv[0].str);
+        printf("%s koid help         : print header label descriptions for 'koid'\n",
+               argv[0].str);
         return -1;
     }
 
@@ -818,6 +934,15 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         if (argc != 2)
             goto usage;
         DumpHandleTable();
+    } else if (strcmp(argv[1].str, "koid") == 0) {
+        if (argc < 3)
+            goto usage;
+
+        if (strcmp(argv[2].str, "help") == 0) {
+          DumpHandleRightsKeyMap();
+        } else {
+          DumpHandlesForKoid(argv[2].u);
+        }
     } else {
         printf("unrecognized subcommand '%s'\n", argv[1].str);
         goto usage;
@@ -827,4 +952,4 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
 
 STATIC_COMMAND_START
 STATIC_COMMAND("zx", "kernel object diagnostics", &cmd_diagnostics)
-STATIC_COMMAND_END(zx);
+STATIC_COMMAND_END(zx)

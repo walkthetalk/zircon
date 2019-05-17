@@ -7,10 +7,10 @@
 
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "flat_ast.h"
-#include "string_view.h"
 
 namespace fidl {
 
@@ -76,6 +76,11 @@ public:
     };
 
 private:
+    struct NamedBits {
+        std::string name;
+        const flat::Bits& bits_info;
+    };
+
     struct NamedConst {
         std::string name;
         const flat::Const& const_info;
@@ -120,19 +125,23 @@ private:
         kNonmessage,
     };
 
+    uint32_t GetMaxHandlesFor(Transport transport, const TypeShape& typeshape);
+
     void GeneratePrologues();
     void GenerateEpilogues();
 
-    void GenerateIntegerDefine(StringView name, types::PrimitiveSubtype subtype, StringView value);
-    void GenerateIntegerTypedef(types::PrimitiveSubtype subtype, StringView name);
-    void GeneratePrimitiveDefine(StringView name, types::PrimitiveSubtype subtype, StringView value);
-    void GenerateStringDefine(StringView name, StringView value);
-    void GenerateStructTypedef(StringView name);
+    void GenerateIntegerDefine(std::string_view name, types::PrimitiveSubtype subtype, std::string_view value);
+    void GenerateIntegerTypedef(types::PrimitiveSubtype subtype, std::string_view name);
+    void GeneratePrimitiveDefine(std::string_view name, types::PrimitiveSubtype subtype, std::string_view value);
+    void GenerateStringDefine(std::string_view name, std::string_view value);
+    void GenerateStructTypedef(std::string_view name);
 
-    void GenerateStructDeclaration(StringView name, const std::vector<Member>& members, StructKind kind);
-    void GenerateTaggedUnionDeclaration(StringView name, const std::vector<Member>& members);
-    void GenerateTaggedXUnionDeclaration(StringView name, const std::vector<Member>& members);
+    void GenerateStructDeclaration(std::string_view name, const std::vector<Member>& members, StructKind kind);
+    void GenerateTaggedUnionDeclaration(std::string_view name, const std::vector<Member>& members);
+    void GenerateTaggedXUnionDeclaration(std::string_view name, const std::vector<Member>& members);
 
+    std::map<const flat::Decl*, NamedBits>
+    NameBits(const std::vector<std::unique_ptr<flat::Bits>>& bits_infos);
     std::map<const flat::Decl*, NamedConst>
     NameConsts(const std::vector<std::unique_ptr<flat::Const>>& const_infos);
     std::map<const flat::Decl*, NamedEnum>
@@ -148,6 +157,7 @@ private:
     std::map<const flat::Decl*, NamedXUnion>
     NameXUnions(const std::vector<std::unique_ptr<flat::XUnion>>& xunion_infos);
 
+    void ProduceBitsForwardDeclaration(const NamedBits& named_bits);
     void ProduceConstForwardDeclaration(const NamedConst& named_const);
     void ProduceEnumForwardDeclaration(const NamedEnum& named_enum);
     void ProduceInterfaceForwardDeclaration(const NamedInterface& named_interface);

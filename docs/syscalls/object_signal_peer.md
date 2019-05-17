@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-object_signal_peer - signal an object's peer
+Signal an object's peer.
 
 ## SYNOPSIS
 
@@ -28,8 +28,6 @@ Most of the 32 signals are reserved for system use and are assigned to
 per-object functions, like **ZX_CHANNEL_READABLE** or **ZX_TASK_TERMINATED**. There
 are 8 signal bits available for userspace processes to use as they see fit:
 **ZX_USER_SIGNAL_0** through **ZX_USER_SIGNAL_7**.
-
-*Event* objects also allow control over the **ZX_EVENT_SIGNALED** bit.
 
 *Eventpair* objects also allow control over the **ZX_EVENTPAIR_SIGNALED** bit.
 
@@ -61,7 +59,6 @@ failure, a negative error value is returned.
 
 ## SEE ALSO
 
- - [`zx_event_create()`]
  - [`zx_eventpair_create()`]
  - [`zx_object_signal()`]
 

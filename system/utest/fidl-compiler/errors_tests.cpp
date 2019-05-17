@@ -14,7 +14,7 @@ bool GoodError() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error int32;
 };
 
@@ -29,9 +29,10 @@ interface Example {
     ASSERT_NOT_NULL(response);
     ASSERT_EQ(response->members.size(), 1);
     auto response_member = &response->members.at(0);
-    ASSERT_EQ(response_member->type->kind, fidl::flat::Type::Kind::kIdentifier);
-    auto result_identifier = static_cast<fidl::flat::IdentifierType*>(response_member->type.get());
-    const fidl::flat::Union* result_union = library.LookupUnion(result_identifier->name.name_part());
+    ASSERT_EQ(response_member->type_ctor->type->kind, fidl::flat::Type::Kind::kIdentifier);
+    auto result_identifier = static_cast<const fidl::flat::IdentifierType*>(response_member->type_ctor->type);
+    const fidl::flat::Union* result_union = library.LookupUnion(
+        std::string(result_identifier->name.name_part()));
     ASSERT_NOT_NULL(result_union);
     ASSERT_NOT_NULL(result_union->attributes);
     ASSERT_TRUE(result_union->attributes->HasAttribute("Result"));
@@ -42,9 +43,9 @@ interface Example {
     const fidl::flat::Union::Member& error = result_union->members.at(1);
     ASSERT_STR_EQ("err", std::string(error.name.data()).c_str());
 
-    ASSERT_NOT_NULL(error.type);
-    ASSERT_EQ(error.type->kind, fidl::flat::Type::Kind::kPrimitive);
-    auto primitive_type = static_cast<fidl::flat::PrimitiveType*>(error.type.get());
+    ASSERT_NOT_NULL(error.type_ctor->type);
+    ASSERT_EQ(error.type_ctor->type->kind, fidl::flat::Type::Kind::kPrimitive);
+    auto primitive_type = static_cast<const fidl::flat::PrimitiveType*>(error.type_ctor->type);
     ASSERT_EQ(primitive_type->subtype, fidl::types::PrimitiveSubtype::kInt32);
 
     END_TEST;
@@ -56,7 +57,7 @@ bool GoodErrorUnsigned() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error uint32;
 };
 
@@ -78,7 +79,7 @@ enum ErrorType : int32 {
     UGLY = 3;
 };
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error ErrorType;
 };
 
@@ -94,7 +95,7 @@ bool GoodErrorEnumAfter() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error ErrorType;
 };
 
@@ -116,7 +117,7 @@ bool BadErrorUnknownIdentifier() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error ErrorType;
 };
 )FIDL");
@@ -124,7 +125,7 @@ interface Example {
     ASSERT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "error: invalid error type");
+    ASSERT_STR_STR(errors[0].c_str(), "error: unknown type ErrorType");
     END_TEST;
 }
 
@@ -134,7 +135,7 @@ bool BadErrorWrongPrimitive() {
     TestLibrary library(R"FIDL(
 library example;
 
-interface Example {
+protocol Example {
     Method() -> (string foo) error float32;
 };
 )FIDL");
@@ -142,7 +143,7 @@ interface Example {
     ASSERT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "error: invalid error type");
+    ASSERT_STR_STR(errors[0].c_str(), "error: invalid error type: must be int32, uint32 or an enum therof");
     END_TEST;
 }
 
@@ -151,14 +152,14 @@ bool BadErrorMissingType() {
 
     TestLibrary library(R"FIDL(
 library example;
-interface Example {
+protocol Example {
     Method() -> (int32 flub) error;
 };
 )FIDL");
     ASSERT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "error: found unexpected token");
+    ASSERT_STR_STR(errors[0].c_str(), "error: unexpected token");
     END_TEST;
 }
 
@@ -167,14 +168,14 @@ bool BadErrorNotAType() {
 
     TestLibrary library(R"FIDL(
 library example;
-interface Example {
+protocol Example {
     Method() -> (int32 flub) error "hello";
 };
 )FIDL");
     ASSERT_FALSE(library.Compile());
     auto errors = library.errors();
     ASSERT_EQ(errors.size(), 1);
-    ASSERT_STR_STR(errors[0].c_str(), "error: found unexpected token");
+    ASSERT_STR_STR(errors[0].c_str(), "error: unexpected token");
     END_TEST;
 }
 
@@ -183,7 +184,7 @@ bool BadErrorNoResponse() {
 
     TestLibrary library(R"FIDL(
 library example;
-interface Example {
+protocol Example {
     Method() -> error int32;
 };
 )FIDL");
@@ -193,18 +194,46 @@ interface Example {
     ASSERT_STR_STR(errors[0].c_str(), "error: unexpected token \"error\"");
     END_TEST;
 }
+
+bool BadErrorUnexpectedEndOfFile() {
+    BEGIN_TEST;
+
+    TestLibrary library(R"FIDL(
+library example;
+table ForgotTheSemicolon {}
+)FIDL");
+
+    ASSERT_FALSE(library.Compile());
+    auto errors = library.errors();
+    ASSERT_GE(errors.size(), 1);
+    ASSERT_STR_STR(errors[0].c_str(), "error: unexpected token EndOfFile, was expecting Semicolon");
+    END_TEST;
+}
+
+bool BadErrorEmptyFile() {
+    BEGIN_TEST;
+
+    TestLibrary library("");
+
+    ASSERT_FALSE(library.Compile());
+    auto errors = library.errors();
+    ASSERT_GE(errors.size(), 1);
+    END_TEST;
+}
 } // namespace
 
-BEGIN_TEST_CASE(errors_tests);
+BEGIN_TEST_CASE(errors_tests)
 
-RUN_TEST(GoodError);
-RUN_TEST(GoodErrorUnsigned);
-RUN_TEST(GoodErrorEnum);
-RUN_TEST(GoodErrorEnumAfter);
-RUN_TEST(BadErrorUnknownIdentifier);
-RUN_TEST(BadErrorWrongPrimitive);
-RUN_TEST(BadErrorMissingType);
-RUN_TEST(BadErrorNotAType);
-RUN_TEST(BadErrorNoResponse);
+RUN_TEST(GoodError)
+RUN_TEST(GoodErrorUnsigned)
+RUN_TEST(GoodErrorEnum)
+RUN_TEST(GoodErrorEnumAfter)
+RUN_TEST(BadErrorUnknownIdentifier)
+RUN_TEST(BadErrorWrongPrimitive)
+RUN_TEST(BadErrorMissingType)
+RUN_TEST(BadErrorNotAType)
+RUN_TEST(BadErrorNoResponse)
+RUN_TEST(BadErrorUnexpectedEndOfFile)
+RUN_TEST(BadErrorEmptyFile)
 
-END_TEST_CASE(errors_tests);
+END_TEST_CASE(errors_tests)

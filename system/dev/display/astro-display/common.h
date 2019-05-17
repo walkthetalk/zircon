@@ -61,8 +61,8 @@ enum {
 constexpr uint8_t PANEL_DISPLAY_ID = 1;
 
 // Astro Display dimension
-constexpr uint32_t DISPLAY_WIDTH = 608;
-constexpr uint32_t DISPLAY_HEIGHT = 1024;
+constexpr uint32_t ASTRO_DISPLAY_WIDTH = 608;
+constexpr uint32_t ASTRO_DISPLAY_HEIGHT = 1024;
 
 // Sherlock Display dimension
 constexpr uint32_t SHERLOCK_DISPLAY_WIDTH = 800;
@@ -73,6 +73,8 @@ constexpr bool kBootloaderDisplayEnabled = true;
 // Supported panel types
 constexpr uint8_t  PANEL_TV070WSM_FT = 0x00;
 constexpr uint8_t  PANEL_P070ACB_FT = 0x01;
+constexpr uint8_t  PANEL_TV101WXM_FT = 0x02;
+constexpr uint8_t  PANEL_G101B158_FT = 0x03;
 constexpr uint8_t  PANEL_UNKNOWN = 0xff;
 
 // This display driver supports EVT hardware and onwards. For pre-EVT boards,
@@ -83,23 +85,3 @@ constexpr uint8_t  BOARD_REV_P2 = 1;
 constexpr uint8_t  BOARD_REV_EVT_1 = 2;
 constexpr uint8_t  BOARD_REV_EVT_2 = 3;
 constexpr uint8_t  BOARD_REV_UNKNOWN = 0xff;
-
-// This structure is populated based on hardware/lcd type. Its values come from vendor.
-// This table is the top level structure used to populated all Clocks/LCD/DSI/BackLight/etc
-// values
-struct DisplaySetting {
-    uint32_t lane_num;
-    uint32_t bit_rate_max;
-    uint32_t clock_factor;
-    uint32_t lcd_clock;
-    uint32_t h_active;
-    uint32_t v_active;
-    uint32_t h_period;
-    uint32_t v_period;
-    uint32_t hsync_width;
-    uint32_t hsync_bp;
-    uint32_t hsync_pol;
-    uint32_t vsync_width;
-    uint32_t vsync_bp;
-    uint32_t vsync_pol;
-};

@@ -17,6 +17,9 @@
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/i2c.h>
 #include <ddk/protocol/iommu.h>
+#include <hw/reg.h>
+#include <soc/hi3660/hi3660-hw.h>
+#include <soc/hi3660/hi3660-regs.h>
 
 #include <zircon/assert.h>
 #include <zircon/process.h>
@@ -26,13 +29,78 @@
 #include "hikey960.h"
 #include "hikey960-hw.h"
 
+static zx_status_t hikey960_enable_ldo3(hikey960_t* hikey) {
+    writel(LDO3_ENABLE_BIT, hikey->pmu_ssio.vaddr + LDO3_ENABLE_REG);
+    return ZX_OK;
+}
+
+static void hikey960_mmio_release(hikey960_t* hikey) {
+    mmio_buffer_release(&hikey->usb3otg_bc);
+    mmio_buffer_release(&hikey->peri_crg);
+    mmio_buffer_release(&hikey->pctrl);
+    mmio_buffer_release(&hikey->iomg_pmx4);
+    mmio_buffer_release(&hikey->pmu_ssio);
+    mmio_buffer_release(&hikey->iomcu);
+    mmio_buffer_release(&hikey->ufs_sctrl);
+}
+
+static zx_status_t hikey960_init(hikey960_t* hikey, zx_handle_t resource) {
+    zx_status_t status;
+    if ((status = mmio_buffer_init_physical(&hikey->usb3otg_bc, MMIO_USB3OTG_BC_BASE,
+                                            MMIO_USB3OTG_BC_LENGTH, resource,
+                                            ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK ||
+         (status = mmio_buffer_init_physical(&hikey->peri_crg, MMIO_PERI_CRG_BASE,
+                                             MMIO_PERI_CRG_LENGTH, resource,
+                                             ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK ||
+         (status = mmio_buffer_init_physical(&hikey->pctrl, MMIO_PCTRL_BASE, MMIO_PCTRL_LENGTH,
+                                             resource, ZX_CACHE_POLICY_UNCACHED_DEVICE) != ZX_OK) ||
+         (status = mmio_buffer_init_physical(&hikey->iomg_pmx4, MMIO_IOMG_PMX4_BASE,
+                                             MMIO_IOMG_PMX4_LENGTH, resource,
+                                             ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK ||
+         (status = mmio_buffer_init_physical(&hikey->pmu_ssio, MMIO_PMU_SSI0_BASE,
+                                             MMIO_PMU_SSI0_LENGTH, resource,
+                                             ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK ||
+         (status = mmio_buffer_init_physical(&hikey->iomcu, MMIO_IOMCU_CONFIG_BASE,
+                                             MMIO_IOMCU_CONFIG_LENGTH, resource,
+                                             ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK ||
+         (status = mmio_buffer_init_physical(&hikey->ufs_sctrl, MMIO_UFS_SYS_CTRL_BASE,
+                                             MMIO_UFS_SYS_CTRL_LENGTH, resource,
+                                             ZX_CACHE_POLICY_UNCACHED_DEVICE)) != ZX_OK) {
+        goto fail;
+    }
+
+    status = hikey960_ufs_init(hikey);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
+    status = hikey960_i2c1_init(hikey);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
+    status = hikey960_enable_ldo3(hikey);
+    if (status != ZX_OK) {
+      goto fail;
+    }
+
+    status = hikey960_i2c_pinmux(hikey);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
+    return ZX_OK;
+
+fail:
+    zxlogf(ERROR, "hikey960_init failed %d\n", status);
+    hikey960_mmio_release(hikey);
+    return status;
+}
 
 static void hikey960_release(void* ctx) {
     hikey960_t* hikey = ctx;
 
-    if (hikey->hi3660) {
-        hi3660_release(hikey->hi3660);
-    }
+    hikey960_mmio_release(hikey);
     zx_handle_close(hikey->bti_handle);
     free(hikey);
 }
@@ -45,19 +113,14 @@ static zx_protocol_device_t hikey960_device_protocol = {
 
 static int hikey960_start_thread(void* arg) {
     hikey960_t* hikey = arg;
-
-    zx_status_t status = hi3660_get_protocol(hikey->hi3660, ZX_PROTOCOL_GPIO_IMPL, &hikey->gpio);
-    if (status != ZX_OK) {
-        goto fail;
-    }
-    const platform_proxy_cb_t kCallback = {NULL, NULL};
-    status = pbus_register_protocol(&hikey->pbus, ZX_PROTOCOL_GPIO_IMPL, &hikey->gpio,
-                                    sizeof(hikey->gpio), &kCallback);
-    if (status != ZX_OK) {
-        goto fail;
-    }
+    zx_status_t status;
 
     status = hikey960_sysmem_init(hikey);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
+    status = hikey960_gpio_init(hikey);
     if (status != ZX_OK) {
         goto fail;
     }
@@ -68,13 +131,13 @@ static int hikey960_start_thread(void* arg) {
     }
 
     // must be after hikey960_i2c_init
-    status = hi3660_dsi_init(hikey->hi3660);
+    status = hikey960_dsi_init(hikey);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "hi3660_dsi_init failed\n");
+        zxlogf(ERROR, "hikey960_dsi_init failed\n");
     }
 
     if ((status = hikey960_add_devices(hikey)) != ZX_OK) {
-        zxlogf(ERROR, "hikey960_bind: hi3660_add_devices failed!\n");;
+        zxlogf(ERROR, "hikey960_bind: hikey960_add_devices failed!\n");;
     }
 
     return ZX_OK;
@@ -112,10 +175,11 @@ static zx_status_t hikey960_bind(void* ctx, zx_device_t* parent) {
     hikey->parent = parent;
 
     // TODO(voydanoff) get from platform bus driver somehow
+    // Please do not use get_root_resource() in new code. See ZX-1467.
     zx_handle_t resource = get_root_resource();
-    status = hi3660_init(resource, &hikey->hi3660);
+    status = hikey960_init(hikey, resource);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "hikey960_bind: hi3660_init failed %d\n", status);
+        zxlogf(ERROR, "hikey960_bind: hikey960_init failed %d\n", status);
         goto fail;
     }
 
@@ -125,7 +189,7 @@ static zx_status_t hikey960_bind(void* ctx, zx_device_t* parent) {
         .ctx = hikey,
         .ops = &hikey960_device_protocol,
         // nothing should bind to this device
-        // all interaction will be done via the pbus_interface_t
+        // all interaction will be done via the pbus_interface_protocol_t
         .flags = DEVICE_ADD_NON_BINDABLE,
     };
 

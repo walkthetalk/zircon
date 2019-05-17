@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <fuchsia/io/c/fidl.h>
+#include <lib/zx/channel.h>
 #include <lib/zxio/inception.h>
 #include <lib/zxio/null.h>
 #include <lib/zxio/ops.h>
@@ -10,19 +11,6 @@
 #include <zircon/syscalls.h>
 
 #define ZXIO_REMOTE_CHUNK_SIZE 8192
-
-static zx_status_t zxio_remote_release(zxio_t* io, zx_handle_t* out_handle) {
-    zxio_remote_t* rio = reinterpret_cast<zxio_remote_t*>(io);
-    zx_handle_t control = rio->control;
-    rio->control = ZX_HANDLE_INVALID;
-    if (rio->event != ZX_HANDLE_INVALID) {
-        zx_handle_t event = rio->event;
-        rio->event = ZX_HANDLE_INVALID;
-        zx_handle_close(event);
-    }
-    *out_handle = control;
-    return ZX_OK;
-}
 
 static zx_status_t zxio_remote_close(zxio_t* io) {
     zxio_remote_t* rio = reinterpret_cast<zxio_remote_t*>(io);
@@ -39,9 +27,33 @@ static zx_status_t zxio_remote_close(zxio_t* io) {
     return io_status != ZX_OK ? io_status : status;
 }
 
-static zx_status_t zxio_remote_clone_async(zxio_t* io, uint32_t flags, zx_handle_t request) {
+static zx_status_t zxio_remote_release(zxio_t* io, zx_handle_t* out_handle) {
     zxio_remote_t* rio = reinterpret_cast<zxio_remote_t*>(io);
-    return fuchsia_io_NodeClone(rio->control, flags, request);
+    zx_handle_t control = rio->control;
+    rio->control = ZX_HANDLE_INVALID;
+    if (rio->event != ZX_HANDLE_INVALID) {
+        zx_handle_t event = rio->event;
+        rio->event = ZX_HANDLE_INVALID;
+        zx_handle_close(event);
+    }
+    *out_handle = control;
+    return ZX_OK;
+}
+
+static zx_status_t zxio_remote_clone(zxio_t* io, zx_handle_t* out_handle) {
+    zxio_remote_t* rio = reinterpret_cast<zxio_remote_t*>(io);
+    zx::channel local, remote;
+    zx_status_t status = zx::channel::create(0, &local, &remote);
+    if (status != ZX_OK) {
+        return status;
+    }
+    uint32_t flags = fuchsia_io_CLONE_FLAG_SAME_RIGHTS;
+    status = fuchsia_io_NodeClone(rio->control, flags, remote.release());
+    if (status != ZX_OK) {
+        return status;
+    }
+    *out_handle = local.release();
+    return ZX_OK;
 }
 
 static zx_status_t zxio_remote_sync(zxio_t* io) {
@@ -350,11 +362,58 @@ static zx_status_t zxio_remote_rewind(zxio_t* io) {
     return io_status != ZX_OK ? io_status : status;
 }
 
+// Closes the |zx_handle_t| in |info|, if one exists.
+static void zxio_object_close_handle_if_present(const fuchsia_io_NodeInfo* info) {
+    switch (info->tag) {
+    case fuchsia_io_NodeInfoTag_file:
+        if (info->file.event != ZX_HANDLE_INVALID) {
+            zx_handle_close(info->file.event);
+        }
+        break;
+    case fuchsia_io_NodeInfoTag_pipe:
+        if (info->pipe.socket != ZX_HANDLE_INVALID) {
+            zx_handle_close(info->pipe.socket);
+        }
+        break;
+    case fuchsia_io_NodeInfoTag_vmofile:
+        if (info->vmofile.vmo != ZX_HANDLE_INVALID) {
+            zx_handle_close(info->vmofile.vmo);
+        }
+        break;
+    case fuchsia_io_NodeInfoTag_device:
+        if (info->device.event != ZX_HANDLE_INVALID) {
+            zx_handle_close(info->device.event);
+        }
+        break;
+    case fuchsia_io_NodeInfoTag_tty:
+        if (info->tty.event != ZX_HANDLE_INVALID) {
+            zx_handle_close(info->tty.event);
+        }
+        break;
+    }
+}
+
+static zx_status_t zxio_remote_isatty(zxio_t* io, bool* tty) {
+    zxio_remote_t* rio = reinterpret_cast<zxio_remote_t*>(io);
+    fuchsia_io_NodeInfo info;
+    zx_status_t io_status = fuchsia_io_NodeDescribe(rio->control, &info);
+    if (io_status == ZX_OK) {
+        if (info.tag == fuchsia_io_NodeInfoTag_tty) {
+            *tty = true;
+        } else {
+            *tty = false;
+        }
+        zxio_object_close_handle_if_present(&info);
+    }
+
+    return io_status;
+}
+
 static constexpr zxio_ops_t zxio_remote_ops = []() {
     zxio_ops_t ops = zxio_default_ops;
-    ops.release = zxio_remote_release;
     ops.close = zxio_remote_close;
-    ops.clone_async = zxio_remote_clone_async;
+    ops.release = zxio_remote_release;
+    ops.clone = zxio_remote_clone;
     ops.sync = zxio_remote_sync;
     ops.attr_get = zxio_remote_attr_get;
     ops.attr_set = zxio_remote_attr_set;
@@ -374,6 +433,7 @@ static constexpr zxio_ops_t zxio_remote_ops = []() {
     ops.link = zxio_remote_link;
     ops.readdir = zxio_remote_readdir;
     ops.rewind = zxio_remote_rewind;
+    ops.isatty = zxio_remote_isatty;
     return ops;
 }();
 
@@ -408,9 +468,9 @@ static zx_status_t zxio_dir_read_at(zxio_t* io, size_t offset, void* data,
 
 static constexpr zxio_ops_t zxio_dir_ops = []() {
     zxio_ops_t ops = zxio_default_ops;
-    ops.release = zxio_remote_release;
     ops.close = zxio_remote_close;
-    ops.clone_async = zxio_remote_clone_async;
+    ops.release = zxio_remote_release;
+    ops.clone = zxio_remote_clone;
     ops.sync = zxio_remote_sync;
     ops.attr_get = zxio_remote_attr_get;
     ops.attr_set = zxio_remote_attr_set;
@@ -434,5 +494,33 @@ zx_status_t zxio_dir_init(zxio_storage_t* storage, zx_handle_t control) {
     zxio_init(&remote->io, &zxio_dir_ops);
     remote->control = control;
     remote->event = ZX_HANDLE_INVALID;
+    return ZX_OK;
+}
+
+static constexpr zxio_ops_t zxio_file_ops = []() {
+    zxio_ops_t ops = zxio_default_ops;
+    ops.close = zxio_remote_close;
+    ops.release = zxio_remote_release;
+    ops.clone = zxio_remote_clone;
+    ops.sync = zxio_remote_sync;
+    ops.attr_get = zxio_remote_attr_get;
+    ops.attr_set = zxio_remote_attr_set;
+    ops.read = zxio_remote_read;
+    ops.read_at = zxio_remote_read_at;
+    ops.write = zxio_remote_write;
+    ops.write_at = zxio_remote_write_at;
+    ops.seek = zxio_remote_seek;
+    ops.truncate = zxio_remote_truncate;
+    ops.flags_get = zxio_remote_flags_get;
+    ops.flags_set = zxio_remote_flags_set;
+    return ops;
+}();
+
+zx_status_t zxio_file_init(zxio_storage_t* storage, zx_handle_t control,
+                           zx_handle_t event) {
+    zxio_remote_t* remote = reinterpret_cast<zxio_remote_t*>(storage);
+    zxio_init(&remote->io, &zxio_file_ops);
+    remote->control = control;
+    remote->event = event;
     return ZX_OK;
 }

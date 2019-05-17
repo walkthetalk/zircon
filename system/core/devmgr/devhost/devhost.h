@@ -5,7 +5,7 @@
 #pragma once
 
 #include "../shared/async-loop-owned-rpc-handler.h"
-#include "device-internal.h"
+#include "zx-device.h"
 #include "lock.h"
 
 #include <ddk/binding.h>
@@ -18,6 +18,7 @@
 #include <fbl/string.h>
 #include <fbl/unique_ptr.h>
 #include <lib/async/cpp/wait.h>
+#include <lib/async-loop/cpp/loop.h>
 #include <lib/zx/channel.h>
 #include <zircon/compiler.h>
 #include <zircon/fidl.h>
@@ -29,12 +30,18 @@
 
 namespace devmgr {
 
+struct BindContext {
+    fbl::RefPtr<zx_device_t> parent;
+    fbl::RefPtr<zx_device_t> child;
+};
+
 struct CreationContext {
     fbl::RefPtr<zx_device_t> parent;
     fbl::RefPtr<zx_device_t> child;
     zx::unowned_channel rpc;
 };
 
+void devhost_set_bind_context(BindContext* ctx);
 void devhost_set_creation_context(CreationContext* ctx);
 
 } // namespace devmgr
@@ -78,11 +85,11 @@ struct zx_driver : fbl::DoublyLinkedListable<fbl::RefPtr<zx_driver>>, fbl::RefCo
 
     zx_status_t InitOp() { return ops_->init(&ctx_); }
 
-    zx_status_t BindOp(devmgr::CreationContext* creation_context,
+    zx_status_t BindOp(devmgr::BindContext* bind_context,
                        const fbl::RefPtr<zx_device_t>& device) const {
-        devmgr::devhost_set_creation_context(creation_context);
+        devmgr::devhost_set_bind_context(bind_context);
         auto status = ops_->bind(ctx_, device.get());
-        devmgr::devhost_set_creation_context(nullptr);
+        devmgr::devhost_set_bind_context(nullptr);
         return status;
     }
 
@@ -101,7 +108,7 @@ struct zx_driver : fbl::DoublyLinkedListable<fbl::RefPtr<zx_driver>>, fbl::RefCo
     }
 
 private:
-    friend fbl::unique_ptr<zx_driver> fbl::make_unique<zx_driver>();
+    friend fbl::unique_ptr<zx_driver> std::make_unique<zx_driver>();
     zx_driver() = default;
 
     const char* name_ = nullptr;
@@ -129,12 +136,11 @@ zx_status_t devhost_device_bind(const fbl::RefPtr<zx_device_t>& dev,
                                 const char* drv_libname) REQ_DM_LOCK;
 zx_status_t devhost_device_rebind(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_LOCK;
 zx_status_t devhost_device_unbind(const fbl::RefPtr<zx_device_t>& dev) REQ_DM_LOCK;
-zx_status_t devhost_device_create(zx_driver_t* drv, const fbl::RefPtr<zx_device_t>& parent,
-                                  const char* name, void* ctx, zx_protocol_device_t* ops,
+zx_status_t devhost_device_create(zx_driver_t* drv, const char* name, void* ctx,
+                                  const zx_protocol_device_t* ops,
                                   fbl::RefPtr<zx_device_t>* out) REQ_DM_LOCK;
-zx_status_t devhost_device_open_at(const fbl::RefPtr<zx_device_t>& dev,
-                                   fbl::RefPtr<zx_device_t>* out, const char* path,
-                                   uint32_t flags) REQ_DM_LOCK;
+zx_status_t devhost_device_open(const fbl::RefPtr<zx_device_t>& dev, fbl::RefPtr<zx_device_t>* out,
+                                uint32_t flags) REQ_DM_LOCK;
 zx_status_t devhost_device_close(fbl::RefPtr<zx_device_t> dev, uint32_t flags) REQ_DM_LOCK;
 zx_status_t devhost_device_suspend(const fbl::RefPtr<zx_device_t>& dev, uint32_t flags) REQ_DM_LOCK;
 void devhost_device_destroy(zx_device_t* dev) REQ_DM_LOCK;
@@ -157,15 +163,30 @@ zx_status_t devhost_add_metadata(const fbl::RefPtr<zx_device_t>& dev, uint32_t t
 zx_status_t devhost_publish_metadata(const fbl::RefPtr<zx_device_t>& dev, const char* path,
                                      uint32_t type, const void* data, size_t length) REQ_DM_LOCK;
 
-// shared between devhost.c and rpc-device.c
-struct DevcoordinatorConnection : AsyncLoopOwnedRpcHandler<DevcoordinatorConnection> {
-    DevcoordinatorConnection() = default;
+zx_status_t devhost_device_add_composite(const fbl::RefPtr<zx_device_t>& dev,
+                                         const char* name, const zx_device_prop_t* props,
+                                         size_t props_count, const device_component_t* components,
+                                         size_t components_count,
+                                         uint32_t coresident_device_index) REQ_DM_LOCK;
 
-    static void HandleRpc(fbl::unique_ptr<DevcoordinatorConnection> conn,
+struct DeviceControllerConnection : AsyncLoopOwnedRpcHandler<DeviceControllerConnection> {
+    DeviceControllerConnection() = default;
+
+    static void HandleRpc(fbl::unique_ptr<DeviceControllerConnection> conn,
                           async_dispatcher_t* dispatcher, async::WaitBase* wait, zx_status_t status,
                           const zx_packet_signal_t* signal);
+    zx_status_t HandleRead();
 
     fbl::RefPtr<zx_device_t> dev;
+};
+
+struct DevhostControllerConnection : AsyncLoopOwnedRpcHandler<DevhostControllerConnection> {
+    DevhostControllerConnection() = default;
+
+    static void HandleRpc(fbl::unique_ptr<DevhostControllerConnection> conn,
+                          async_dispatcher_t* dispatcher, async::WaitBase* wait, zx_status_t status,
+                          const zx_packet_signal_t* signal);
+    zx_status_t HandleRead();
 };
 
 struct DevfsConnection : AsyncLoopOwnedRpcHandler<DevfsConnection> {
@@ -183,12 +204,8 @@ struct DevfsConnection : AsyncLoopOwnedRpcHandler<DevfsConnection> {
 zx_status_t devhost_fidl_handler(fidl_msg_t* msg, fidl_txn_t* txn, void* cookie);
 
 // Attaches channel |c| to new state representing an open connection to |dev|.
-// |path_data| and |flags| are forwarded to the |dev|'s |open_at| hook.
 zx_status_t devhost_device_connect(const fbl::RefPtr<zx_device_t>& dev, uint32_t flags,
-                                   const char* path_data, size_t path_size, zx::channel c);
-
-// Attaches channel |c| to new state representing an open connection to |dev|.
-void devhost_device_connect(const fbl::RefPtr<zx_device_t>& dev, zx::channel c);
+                                   zx::channel c);
 
 zx_status_t devhost_start_connection(fbl::unique_ptr<DevfsConnection> ios, zx::channel h);
 

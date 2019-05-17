@@ -2,13 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_LISTNODE_H_
+#define SYSROOT_ZIRCON_LISTNODE_H_
 
-#include <zircon/compiler.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <zircon/compiler.h>
 
-__BEGIN_CDECLS;
+__BEGIN_CDECLS
 
 #define containerof(ptr, type, member) ((type*)((uintptr_t)(ptr)-offsetof(type, member)))
 
@@ -116,7 +117,7 @@ static inline list_node_t* list_remove_tail(list_node_t* list) {
         __t;                                         \
     })
 
-static inline list_node_t* list_peek_head(list_node_t* list) {
+static inline list_node_t* list_peek_head(const list_node_t* list) {
     if (list->next != list) {
         return list->next;
     } else {
@@ -135,7 +136,7 @@ static inline list_node_t* list_peek_head(list_node_t* list) {
         __t;                                         \
     })
 
-static inline list_node_t* list_peek_tail(list_node_t* list) {
+static inline list_node_t* list_peek_tail(const list_node_t* list) {
     if (list->prev != list) {
         return list->prev;
     } else {
@@ -301,4 +302,6 @@ static inline void list_move(list_node_t* old_list, list_node_t* new_list) {
     list_splice_after(old_list, new_list);
 }
 
-__END_CDECLS;
+__END_CDECLS
+
+#endif  // SYSROOT_ZIRCON_LISTNODE_H_

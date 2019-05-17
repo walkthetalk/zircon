@@ -3,10 +3,14 @@
 // found in the LICENSE file.
 
 #include <fcntl.h>
+#include <fuchsia/device/manager/c/fidl.h>
+#include <fuchsia/hardware/pty/c/fidl.h>
 #include <hid/usages.h>
+#include <lib/fdio/directory.h>
+#include <lib/fdio/unsafe.h>
+#include <lib/zx/channel.h>
 #include <string.h>
 #include <sys/param.h>
-#include <zircon/device/pty.h>
 
 #include "keyboard-vt100.h"
 #include "keyboard.h"
@@ -90,6 +94,23 @@ static bool vc_handle_control_keys(uint8_t keycode, int modifiers) {
     return false;
 }
 
+static bool connect_to_service(const char* service, zx::channel* channel) {
+    zx::channel channel_remote;
+    zx_status_t status = zx::channel::create(0, channel, &channel_remote);
+    if (status != ZX_OK) {
+        fprintf(stderr, "failed to create channel: %d\n", status);
+        return false;
+    }
+
+    status = fdio_service_connect(service, channel_remote.release());
+    if (status != ZX_OK) {
+        fprintf(stderr, "failed to connect to service: %d\n", status);
+        return false;
+    }
+
+    return true;
+}
+
 // Process key sequences that affect the low-level control of the system
 // (switching display ownership, rebooting).  This returns whether this key press
 // was handled.
@@ -98,11 +119,16 @@ static bool vc_handle_device_control_keys(uint8_t keycode, int modifiers) {
     case HID_USAGE_KEY_DELETE:
         // Provide a CTRL-ALT-DEL reboot sequence
         if ((modifiers & MOD_CTRL) && (modifiers & MOD_ALT)) {
-            int fd;
-            // Send the reboot command to devmgr
-            if ((fd = open("/dev/misc/dmctl", O_WRONLY)) >= 0) {
-                write(fd, "reboot", strlen("reboot"));
-                close(fd);
+            zx::channel channel;
+            if (connect_to_service("/svc/fuchsia.device.manager.Administrator", &channel)) {
+                zx_status_t call_status;
+                const auto flag = fuchsia_device_manager_SUSPEND_FLAG_REBOOT;
+                auto status = fuchsia_device_manager_AdministratorSuspend(channel.get(), flag,
+                                                                          &call_status);
+                if (status != ZX_OK || call_status != ZX_OK) {
+                    fprintf(stderr, "Failed to reboot, statuses: local: %d remote: %d\n",
+                            status, call_status);
+                }
             }
             return true;
         }
@@ -148,12 +174,16 @@ void vc_show_active() {
     vc_t* vc = NULL;
     list_for_every_entry (&g_vc_list, vc, vc_t, node) {
         vc_attach_gfx(vc);
-        if (vc->fd >= 0) {
-            pty_window_size_t wsz = {
+        if ((vc->fd >= 0) && isatty(vc->fd)) {
+            fuchsia_hardware_pty_WindowSize wsz = {
                 .width = vc->columns,
                 .height = vc->rows,
             };
-            ioctl_pty_set_window_size(vc->fd, &wsz);
+
+            fdio_t* io = fdio_unsafe_fd_to_io(vc->fd);
+            zx_status_t status;
+            fuchsia_hardware_pty_DeviceSetWindowSize(fdio_unsafe_borrow_channel(io), &wsz, &status);
+            fdio_unsafe_release(io);
         }
         if (vc == g_active_vc) {
             vc_full_repaint(vc);

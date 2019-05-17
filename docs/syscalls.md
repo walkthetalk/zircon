@@ -8,10 +8,8 @@
 
 ## Objects
 + [object_get_child](syscalls/object_get_child.md) - find the child of an object by its koid
-+ [object_get_cookie](syscalls/object_get_cookie.md) - read an object cookie
 + [object_get_info](syscalls/object_get_info.md) - obtain information about an object
 + [object_get_property](syscalls/object_get_property.md) - read an object property
-+ [object_set_cookie](syscalls/object_set_cookie.md) - write an object cookie
 + [object_set_property](syscalls/object_set_property.md) - modify an object property
 + [object_signal](syscalls/object_signal.md) - set or clear the user signals on an object
 + [object_signal_peer](syscalls/object_signal_peer.md) - set or clear the user signals in the opposite end
@@ -39,9 +37,14 @@
 
 ## Tasks (Thread, Process, or Job)
 + [task_bind_exception_port](syscalls/task_bind_exception_port.md) - attach an exception port to a task
++ [task_create_exception_channel](syscalls/task_create_exception_channel.md) - create an exception channel on a task
 + [task_kill](syscalls/task_kill.md) - cause a task to stop running
 + [task_resume_from_exception](syscalls/task_resume_from_exception.md) - resume a task from a previously caught exception
 + [task_suspend](syscalls/task_suspend.md) - cause a task to be suspended
+
+## Exceptions
++ [exception_get_thread](syscalls/exception_get_thread.md) - create a handle for the exception thread
++ [exception_get_process](syscalls/exception_get_process.md) - create a handle for the exception process
 
 ## Channels
 + [channel_call](syscalls/channel_call.md) - synchronously send a message and receive a reply
@@ -82,13 +85,12 @@
 + [vmo_create](syscalls/vmo_create.md) - create a new vmo
 + [vmo_read](syscalls/vmo_read.md) - read from a vmo
 + [vmo_write](syscalls/vmo_write.md) - write to a vmo
-+ [vmo_clone](syscalls/vmo_clone.md) - clone a vmo
++ [vmo_create_child](syscalls/vmo_create_child.md) - creates a child of a vmo
 + [vmo_get_size](syscalls/vmo_get_size.md) - obtain the size of a vmo
 + [vmo_set_size](syscalls/vmo_set_size.md) - adjust the size of a vmo
 + [vmo_op_range](syscalls/vmo_op_range.md) - perform an operation on a range of a vmo
 + [vmo_replace_as_executable](syscalls/vmo_replace_as_executable.md) - add execute rights to a vmo
 + [vmo_create_physical](syscalls/vmo_create_physical.md) - create a VM object referring to a specific contiguous range of physical memory
-+ [vmo_clone](syscalls/vmo_clone.md) - clone a vmo
 + [vmo_set_cache_policy](syscalls/vmo_set_cache_policy.md) - set the caching policy for pages held by a VMO.
 
 ## Virtual Memory Address Regions (VMARs)
@@ -98,9 +100,15 @@
 + [vmar_protect](syscalls/vmar_protect.md) - adjust memory access permissions
 + [vmar_destroy](syscalls/vmar_destroy.md) - destroy a VMAR and all of its children
 
+## Userspace Pagers
++ [pager_create](syscalls/pager_create.md) - create a new pager object
++ [pager_create_vmo](syscalls/pager_create_vmo.md) - create a pager owned vmo
++ [pager_detach_vmo](syscalls/pager_detach_vmo.md) - detaches a pager from a vmo
++ [pager_supply_pages](syscalls/pager_supply_pages.md) - supply pages into a pager owned vmo
+
 ## Cryptographically Secure RNG
-+ [cprng_draw](syscalls/cprng_draw.md)
 + [cprng_add_entropy](syscalls/cprng_add_entropy.md)
++ [cprng_draw](syscalls/cprng_draw.md)
 
 ## Time
 + [nanosleep](syscalls/nanosleep.md) - sleep for some number of nanoseconds

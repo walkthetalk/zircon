@@ -1,0 +1,98 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("$zx/kernel/params.gni")
+
+group("pci") {
+  deps = [
+    ":bus-pci",
+  ]
+  if (!enable_user_pci) {
+    deps += [ ":bus-pci.proxy" ]
+  }
+}
+
+# The userspace PCI bus driver uses this set, as well as the
+# automated tests.
+source_set("user_pci") {
+  visibility = [ ":*" ]
+  sources = [
+    "allocation.cpp",
+    "bridge.cpp",
+    "bus.cpp",
+    "capabilities.cpp",
+    "config.cpp",
+    "device.cpp",
+    "protocol.cpp",
+    "upstream_node.cpp",
+  ]
+  public_deps = [
+    "$zx/system/banjo/ddk.protocol.pci",
+    "$zx/system/banjo/ddk.protocol.pciroot",
+    "$zx/system/ulib/ddk",
+    "$zx/system/ulib/ddktl",
+    "$zx/system/ulib/fbl",
+    "$zx/system/ulib/pretty",
+    "$zx/system/ulib/region-alloc",
+    "$zx/system/ulib/zircon",
+
+    # TODO(ZX-4062): This shouldn't be here if the mmio code is actually
+    # used in the test too.  Anything using that needs to be separately
+    # compiled for the test using the mock version.
+    "$zx/system/dev/lib/mmio",
+  ]
+}
+
+driver("bus-pci") {
+  if (enable_user_pci) {
+    sources = [
+      # The driver needs bind glue
+      "bind.cpp",
+    ]
+    deps = [
+      ":user_pci",
+    ]
+  } else {
+    sources = [
+      "kpci/kpci.c",
+    ]
+    deps = [
+      "$zx/system/banjo/ddk.protocol.pci",
+      "$zx/system/banjo/ddk.protocol.pciroot",
+      "$zx/system/banjo/ddk.protocol.platform.device",
+      "$zx/system/banjo/ddk.protocol.sysmem",
+      "$zx/system/ulib/ddk",
+      "$zx/system/ulib/zircon",
+    ]
+  }
+}
+
+driver("bus-pci.proxy") {
+  sources = [
+    "kpci/proxy.c",
+  ]
+  deps = [
+    "$zx/system/banjo/ddk.protocol.pci",
+    "$zx/system/banjo/ddk.protocol.pciroot",
+    "$zx/system/banjo/ddk.protocol.platform.device",
+    "$zx/system/banjo/ddk.protocol.sysmem",
+    "$zx/system/ulib/ddk",
+    "$zx/system/ulib/zircon",
+  ]
+}
+
+test("pci_tests") {
+  sources = [
+    "test/allocation_tests.cpp",
+    "test/config_tests.cpp",
+    "test/device_tests.cpp",
+    "test/main.cpp",
+  ]
+  deps = [
+    ":user_pci",
+    "$zx/system/dev/lib/fake_ddk",
+    "$zx/system/ulib/hwreg",
+    "$zx/system/ulib/zxtest",
+  ]
+}

@@ -11,31 +11,28 @@
 #include <arch/ops.h>
 #include <lib/ktrace.h>
 #include <lib/counters.h>
-#include <fbl/atomic.h>
 #include <fbl/mutex.h>
+#include <ktl/atomic.h>
 
 #include <object/tls_slots.h>
 
 
 // kernel counters. The following counters never decrease.
 // counts the number of times a dispatcher has been created and destroyed.
-KCOUNTER(dispatcher_create_count, "kernel.dispatcher.create");
-KCOUNTER(dispatcher_destroy_count, "kernel.dispatcher.destroy");
+KCOUNTER(dispatcher_create_count, "dispatcher.create")
+KCOUNTER(dispatcher_destroy_count, "dispatcher.destroy")
 // counts the number of times observers have been added to a kernel object.
-KCOUNTER(dispatcher_observe_count, "kernel.dispatcher.observer.add");
+KCOUNTER(dispatcher_observe_count, "dispatcher.observer.add")
 // counts the number of times observers have been canceled.
-KCOUNTER(dispatcher_cancel_bh_count, "kernel.dispatcher.observer.cancel.byhandle");
-KCOUNTER(dispatcher_cancel_bk_count, "kernel.dispatcher.observer.cancel.bykey");
-// counts the number of cookies set or changed (reset).
-KCOUNTER(dispatcher_cookie_set_count, "kernel.dispatcher.cookie.set");
-KCOUNTER(dispatcher_cookie_reset_count, "kernel.dispatcher.cookie.reset");
+KCOUNTER(dispatcher_cancel_count, "dispatcher.observer.cancel")
+KCOUNTER(dispatcher_cancel_bk_count, "dispatcher.observer.cancel.by_key.handled")
+KCOUNTER(dispatcher_cancel_bk_nh_count, "dispatcher.observer.cancel.by_key.not_handled")
 
 namespace {
-// The first 1K koids are reserved.
-fbl::atomic<zx_koid_t> global_koid(1024ULL);
+ktl::atomic<zx_koid_t> global_koid(ZX_KOID_FIRST);
 
 zx_koid_t GenerateKernelObjectId() {
-    return global_koid.fetch_add(1ULL, fbl::memory_order_relaxed);
+    return global_koid.fetch_add(1ULL, ktl::memory_order_relaxed);
 }
 
 // Helper class that safely allows deleting Dispatchers without
@@ -90,14 +87,9 @@ Dispatcher::~Dispatcher() {
 // can control the lifetime of others. For example events do
 // not fall in this category.
 void Dispatcher::fbl_recycle() {
-    SafeDeleter::Delete(this);
-}
+    canary_.Assert();
 
-zx_status_t Dispatcher::add_observer(StateObserver* observer) {
-    if (!is_waitable())
-        return ZX_ERR_NOT_SUPPORTED;
-    AddObserver(observer, nullptr);
-    return ZX_OK;
+    SafeDeleter::Delete(this);
 }
 
 namespace {
@@ -107,8 +99,6 @@ StateObserver::Flags CancelWithFunc(Dispatcher::ObserverList* observers,
                                     Lock<LockType>* observer_lock, Func f) {
     StateObserver::Flags flags = 0;
 
-    Dispatcher::ObserverList obs_to_remove;
-
     {
         Guard<LockType> guard{observer_lock};
         for (auto it = observers->begin(); it != observers->end();) {
@@ -117,15 +107,13 @@ StateObserver::Flags CancelWithFunc(Dispatcher::ObserverList* observers,
             if (it_flags & StateObserver::kNeedRemoval) {
                 auto to_remove = it;
                 ++it;
-                obs_to_remove.push_back(observers->erase(to_remove));
+                observers->erase(to_remove);
+                to_remove->OnRemoved();
+                kcounter_add(dispatcher_cancel_count, 1);
             } else {
                 ++it;
             }
         }
-    }
-
-    while (!obs_to_remove.is_empty()) {
-        obs_to_remove.pop_front()->OnRemoved();
     }
 
     // We've processed the removal flag, so strip it
@@ -142,6 +130,7 @@ template <typename LockType>
 void Dispatcher::AddObserverHelper(StateObserver* observer,
                                    const StateObserver::CountInfo* cinfo,
                                    Lock<LockType>* lock) TA_NO_THREAD_SAFETY_ANALYSIS {
+    canary_.Assert();
     ZX_DEBUG_ASSERT(is_waitable());
     DEBUG_ASSERT(observer != nullptr);
 
@@ -150,20 +139,19 @@ void Dispatcher::AddObserverHelper(StateObserver* observer,
         Guard<LockType> guard{lock};
 
         flags = observer->OnInitialize(signals_, cinfo);
-        if (!(flags & StateObserver::kNeedRemoval))
+        if (flags & StateObserver::kNeedRemoval) {
+            observer->OnRemoved();
+        } else {
             observers_.push_front(observer);
+        }
     }
-    if (flags & StateObserver::kNeedRemoval)
-        observer->OnRemoved();
 
     kcounter_add(dispatcher_observe_count, 1);
 }
 
-void Dispatcher::AddObserver(StateObserver* observer, const StateObserver::CountInfo* cinfo) {
-    AddObserverHelper(observer, cinfo, get_lock());
-}
-
 void Dispatcher::AddObserverLocked(StateObserver* observer, const StateObserver::CountInfo* cinfo) {
+    canary_.Assert();
+
     // Type tag and local NullLock to make lockdep happy.
     struct DispatcherAddObserverLocked {};
     DECLARE_LOCK(DispatcherAddObserverLocked, fbl::NullLock) lock;
@@ -171,25 +159,41 @@ void Dispatcher::AddObserverLocked(StateObserver* observer, const StateObserver:
     AddObserverHelper(observer, cinfo, &lock);
 }
 
-void Dispatcher::RemoveObserver(StateObserver* observer) {
+zx_status_t Dispatcher::AddObserver(StateObserver* observer) {
+    canary_.Assert();
+
+    if (!is_waitable())
+        return ZX_ERR_NOT_SUPPORTED;
+    AddObserverHelper(observer, nullptr, get_lock());
+    return ZX_OK;
+}
+
+bool Dispatcher::RemoveObserver(StateObserver* observer) {
+    canary_.Assert();
     ZX_DEBUG_ASSERT(is_waitable());
+    DEBUG_ASSERT(observer != nullptr);
 
     Guard<fbl::Mutex> guard{get_lock()};
-    DEBUG_ASSERT(observer != nullptr);
-    observers_.erase(*observer);
+
+    if (StateObserver::ObserverListTraits::node_state(*observer).InContainer()) {
+        observers_.erase(*observer);
+        return true;
+    }
+
+    return false;
 }
 
 void Dispatcher::Cancel(const Handle* handle) {
+    canary_.Assert();
     ZX_DEBUG_ASSERT(is_waitable());
 
     CancelWithFunc(&observers_, get_lock(), [handle](StateObserver* obs) {
         return obs->OnCancel(handle);
     });
-
-    kcounter_add(dispatcher_cancel_bh_count, 1);
 }
 
 bool Dispatcher::CancelByKey(const Handle* handle, const void* port, uint64_t key) {
+    canary_.Assert();
     ZX_DEBUG_ASSERT(is_waitable());
 
     StateObserver::Flags flags = CancelWithFunc(&observers_, get_lock(),
@@ -197,9 +201,13 @@ bool Dispatcher::CancelByKey(const Handle* handle, const void* port, uint64_t ke
         return obs->OnCancelByKey(handle, port, key);
     });
 
-    kcounter_add(dispatcher_cancel_bk_count, 1);
+    if (flags & StateObserver::kHandled) {
+        kcounter_add(dispatcher_cancel_bk_count, 1);
+        return true;
+    }
 
-    return flags & StateObserver::kHandled;
+    kcounter_add(dispatcher_cancel_bk_nh_count, 1);
+    return false;
 }
 
 // Since this conditionally takes the dispatcher's |lock_|, based on
@@ -210,7 +218,9 @@ template <typename LockType>
 void Dispatcher::UpdateStateHelper(zx_signals_t clear_mask,
                                    zx_signals_t set_mask,
                                    Lock<LockType>* lock) TA_NO_THREAD_SAFETY_ANALYSIS {
-    Dispatcher::ObserverList obs_to_remove;
+    canary_.Assert();
+    ZX_DEBUG_ASSERT(is_waitable());
+
     {
         Guard<LockType> guard{lock};
 
@@ -221,90 +231,34 @@ void Dispatcher::UpdateStateHelper(zx_signals_t clear_mask,
         if (previous_signals == signals_)
             return;
 
-        UpdateInternalLocked(&obs_to_remove, signals_);
+        for (auto it = observers_.begin(); it != observers_.end();) {
+            StateObserver::Flags it_flags = it->OnStateChange(signals_);
+            if (it_flags & StateObserver::kNeedRemoval) {
+                auto to_remove = it;
+                ++it;
+                observers_.erase(to_remove);
+                to_remove->OnRemoved();
+            } else {
+                ++it;
+            }
+        }
     }
 
-    while (!obs_to_remove.is_empty()) {
-        obs_to_remove.pop_front()->OnRemoved();
-    }
 }
 
 void Dispatcher::UpdateState(zx_signals_t clear_mask,
                              zx_signals_t set_mask) {
+    canary_.Assert();
+
     UpdateStateHelper(clear_mask, set_mask, get_lock());
 }
 
 void Dispatcher::UpdateStateLocked(zx_signals_t clear_mask,
                                    zx_signals_t set_mask) {
+    canary_.Assert();
+
     // Type tag and local NullLock to make lockdep happy.
     struct DispatcherUpdateStateLocked {};
     DECLARE_LOCK(DispatcherUpdateStateLocked, fbl::NullLock) lock;
     UpdateStateHelper(clear_mask, set_mask, &lock);
 }
-
-void Dispatcher::UpdateInternalLocked(ObserverList* obs_to_remove, zx_signals_t signals) {
-    ZX_DEBUG_ASSERT(is_waitable());
-
-    for (auto it = observers_.begin(); it != observers_.end();) {
-        StateObserver::Flags it_flags = it->OnStateChange(signals);
-        if (it_flags & StateObserver::kNeedRemoval) {
-            auto to_remove = it;
-            ++it;
-            obs_to_remove->push_back(observers_.erase(to_remove));
-        } else {
-            ++it;
-        }
-    }
-}
-
-zx_status_t Dispatcher::SetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t cookie) {
-    if (cookiejar == nullptr)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    Guard<fbl::Mutex> guard{get_lock()};
-
-    if (cookiejar->scope_ == ZX_KOID_INVALID) {
-        cookiejar->scope_ = scope;
-        cookiejar->cookie_ = cookie;
-
-        kcounter_add(dispatcher_cookie_set_count, 1);
-        return ZX_OK;
-    }
-
-    if (cookiejar->scope_ == scope) {
-        cookiejar->cookie_ = cookie;
-
-        kcounter_add(dispatcher_cookie_reset_count, 1);
-        return ZX_OK;
-    }
-
-    return ZX_ERR_ACCESS_DENIED;
-}
-
-zx_status_t Dispatcher::GetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t* cookie) {
-    if (cookiejar == nullptr)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    Guard<fbl::Mutex> guard{get_lock()};
-
-    if (cookiejar->scope_ == scope) {
-        *cookie = cookiejar->cookie_;
-        return ZX_OK;
-    }
-
-    return ZX_ERR_ACCESS_DENIED;
-}
-
-zx_status_t Dispatcher::InvalidateCookieLocked(CookieJar* cookiejar) {
-    if (cookiejar == nullptr)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    cookiejar->scope_ = ZX_KOID_KERNEL;
-    return ZX_OK;
-}
-
-zx_status_t Dispatcher::InvalidateCookie(CookieJar* cookiejar) {
-    Guard<fbl::Mutex> guard{get_lock()};
-    return InvalidateCookieLocked(cookiejar);
-}
-

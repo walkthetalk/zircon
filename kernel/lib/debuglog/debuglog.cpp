@@ -8,11 +8,13 @@
 
 #include <dev/udisplay.h>
 #include <err.h>
-#include <fbl/atomic.h>
 #include <kernel/spinlock.h>
 #include <kernel/thread.h>
+#include <ktl/atomic.h>
 #include <lib/crashlog.h>
 #include <kernel/cmdline.h>
+#include <kernel/lockdep.h>
+#include <kernel/mutex.h>
 #include <lib/io.h>
 #include <lib/version.h>
 #include <lk/init.h>
@@ -31,14 +33,32 @@ static_assert((DLOG_MAX_RECORD & 3) == 0, "E_DONT_DO_THAT");
 
 static uint8_t DLOG_DATA[DLOG_SIZE];
 
+struct dlog {
+    constexpr dlog(uint8_t* data_ptr) : data(data_ptr) {}
+
+    spin_lock_t lock = SPIN_LOCK_INITIAL_VALUE;
+
+    size_t head = 0;
+    size_t tail = 0;
+
+    uint8_t* const data;
+
+    bool panic = false;
+
+    event_t event = EVENT_INITIAL_VALUE(this->event, 0, EVENT_FLAG_AUTOUNSIGNAL);
+
+    DECLARE_LOCK(dlog, Mutex) readers_lock;
+    struct list_node readers = LIST_INITIAL_VALUE(this->readers);
+};
+
 static dlog_t DLOG(DLOG_DATA);
 
 static thread_t* notifier_thread;
 static thread_t* dumper_thread;
 
 // Used to request that notifier and dumper threads terminate.
-static fbl::atomic_bool notifier_shutdown_requested;
-static fbl::atomic_bool dumper_shutdown_requested;
+static ktl::atomic<bool> notifier_shutdown_requested;
+static ktl::atomic<bool> dumper_shutdown_requested;
 
 // dlog_bypass_ will directly write to console. It also has the side effect of
 // disabling uart Tx interrupts. So all serial console writes are polling.
@@ -98,9 +118,7 @@ zx_status_t dlog_write(uint32_t flags, const void* data_ptr, size_t len) {
     const uint8_t* ptr = static_cast<const uint8_t*>(data_ptr);
     dlog_t* log = &DLOG;
 
-    if (len > DLOG_MAX_DATA) {
-        return ZX_ERR_OUT_OF_RANGE;
-    }
+    len = len > DLOG_MAX_DATA ? DLOG_MAX_DATA : len;
 
     if (log->panic) {
         return ZX_ERR_BAD_STATE;
@@ -247,7 +265,7 @@ void dlog_reader_init(dlog_reader_t* rdr, void (*notify)(void*), void* cookie) {
     rdr->notify = notify;
     rdr->cookie = cookie;
 
-    mutex_acquire(&log->readers_lock);
+    Guard<Mutex> guard(&log->readers_lock);
     list_add_tail(&log->readers, &rdr->node);
 
     bool do_notify = false;
@@ -263,16 +281,14 @@ void dlog_reader_init(dlog_reader_t* rdr, void (*notify)(void*), void* cookie) {
     if (do_notify && notify) {
         notify(cookie);
     }
-
-    mutex_release(&log->readers_lock);
 }
 
 void dlog_reader_destroy(dlog_reader_t* rdr) {
     dlog_t* log = rdr->log;
-
-    mutex_acquire(&log->readers_lock);
-    list_delete(&rdr->node);
-    mutex_release(&log->readers_lock);
+    {
+        Guard<Mutex> guard(&log->readers_lock);
+        list_delete(&rdr->node);
+    }
 }
 
 // The debuglog notifier thread observes when the debuglog is
@@ -288,14 +304,15 @@ static int debuglog_notifier(void* arg) {
         event_wait(&log->event);
 
         // notify readers that new log items were posted
-        mutex_acquire(&log->readers_lock);
-        dlog_reader_t* rdr;
-        list_for_every_entry (&log->readers, rdr, dlog_reader_t, node) {
-            if (rdr->notify) {
-                rdr->notify(rdr->cookie);
+        {
+            Guard<Mutex> guard(&log->readers_lock);
+            dlog_reader_t* rdr;
+            list_for_every_entry (&log->readers, rdr, dlog_reader_t, node) {
+                if (rdr->notify) {
+                    rdr->notify(rdr->cookie);
+                }
             }
         }
-        mutex_release(&log->readers_lock);
     }
     return ZX_OK;
 }
@@ -303,6 +320,11 @@ static int debuglog_notifier(void* arg) {
 // Common bottleneck between sys_debug_write() and debuglog_dumper()
 // to reduce interleaved messages between the serial console and the
 // debuglog drainer.
+
+namespace {
+DECLARE_SINGLETON_MUTEX(DlogSerialWriteLock);
+}  // namespace
+
 void dlog_serial_write(const char* data, size_t len) {
     if (dlog_bypass_ == true) {
         // If LL DEBUG is enabled we take this path which uses a spinlock
@@ -311,10 +333,8 @@ void dlog_serial_write(const char* data, size_t len) {
         __kernel_serial_write(data, len);
     } else {
         // Otherwise we can use a mutex and avoid time under spinlock
-        static mutex_t lock;
-        mutex_acquire(&lock);
+        Guard<Mutex> guard{DlogSerialWriteLock::Get()};
         platform_dputs_thread(data, len);
-        mutex_release(&lock);
     }
 }
 
@@ -355,7 +375,7 @@ static int debuglog_dumper(void* arg) {
                 rec.data[rec.hdr.datalen] = 0;
             }
             int n;
-            n = snprintf(tmp, sizeof(tmp), "[%05d.%03d] %05" PRIu64 ".%05" PRIu64 "> %s\n",
+            n = snprintf(tmp, sizeof(tmp), "[%05d.%03d] %05" PRIu64 ":%05" PRIu64 "> %s\n",
                          (int)(rec.hdr.timestamp / ZX_SEC(1)),
                          (int)((rec.hdr.timestamp / ZX_MSEC(1)) % 1000ULL),
                          rec.hdr.pid, rec.hdr.tid, rec.data);
@@ -370,12 +390,6 @@ static int debuglog_dumper(void* arg) {
     return 0;
 }
 
-static void print_mmap(uintptr_t bias, void* begin, void* end, const char* perm) {
-  uintptr_t start = reinterpret_cast<uintptr_t>(begin);
-  size_t size = (uintptr_t)end - start;
-  dprintf(INFO, "{{{mmap:%#lx:%#lx:load:0:%s:%#lx}}}\n", start, size, perm, start + bias);
-}
-
 void dlog_bluescreen_init(void) {
     // if we're panicing, stop processing log writes
     // they'll fail over to kernel console and serial
@@ -385,23 +399,9 @@ void dlog_bluescreen_init(void) {
 
     // replay debug log?
 
-    dprintf(INFO, "\nZIRCON KERNEL PANIC\n\n");
-    dprintf(INFO, "UPTIME: %" PRIi64 "ms\n", current_time() / ZX_MSEC(1));
-    dprintf(INFO, "BUILDID %s\n\n", version.buildid);
-
-    // Log the ELF build ID in the format the symbolizer scripts understand.
-    if (version.elf_build_id[0] != '\0') {
-        uintptr_t bias = KERNEL_BASE - reinterpret_cast<uintptr_t>(__code_start);
-        dprintf(INFO, "{{{module:0:kernel:elf:%s}}}\n", version.elf_build_id);
-        // These four mappings match the mappings printed by vm_init().
-        print_mmap(bias, __code_start, __code_end, "rx");
-        print_mmap(bias, __rodata_start, __rodata_end, "r");
-        print_mmap(bias, __data_start, __data_end, "rw");
-        print_mmap(bias, __bss_start, _end, "rw");
-        dprintf(INFO, "dso: id=%s base=%#lx name=zircon.elf\n",
-                version.elf_build_id, (uintptr_t)__code_start);
-    }
-
+    printf("\nZIRCON KERNEL PANIC\n\n");
+    printf("UPTIME: %" PRIi64 "ms\n", current_time() / ZX_MSEC(1));
+    print_backtrace_version_info();
     crashlog.base_address = (uintptr_t)__code_start;
 }
 
@@ -453,4 +453,4 @@ static void dlog_init_hook(uint level) {
     }
 }
 
-LK_INIT_HOOK(debuglog, dlog_init_hook, LK_INIT_LEVEL_THREADING - 1);
+LK_INIT_HOOK(debuglog, dlog_init_hook, LK_INIT_LEVEL_TARGET)

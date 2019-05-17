@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 #include "devhost.h"
-#include "device-internal.h"
+#include "zx-device.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -19,18 +19,20 @@
 #include <ddk/driver.h>
 #include <lib/sync/completion.h>
 
-#include <zircon/device/device.h>
+#include <zircon/device/ioctl.h>
 #include <zircon/device/vfs.h>
 
 #include <zircon/processargs.h>
+#include <zircon/status.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 
 #include <fs/connection.h>
 #include <fs/handler.h>
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/device/manager/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
-#include <lib/fdio/debug.h>
+#include <lib/zircon-internal/debug.h>
 #include <lib/fdio/io.h>
 #include <lib/fdio/vfs.h>
 #include <lib/fidl/coding.h>
@@ -51,37 +53,52 @@ void describe_error(zx::channel h, zx_status_t status) {
     h.write(0, &msg, sizeof(msg), nullptr, 0);
 }
 
+static fidl_union_tag_t device_or_tty(const fbl::RefPtr<zx_device_t>& dev) {
+    // only a couple of special cases for now
+    const char *libname = dev->driver->libname().c_str();
+    if ((strcmp(libname, "/boot/driver/pty.so") == 0) ||
+        (strcmp(libname, "/boot/driver/console.so") == 0) ||
+        (strcmp(libname, "/boot/driver/virtio.so") == 0)) {
+        return fuchsia_io_NodeInfoTag_tty;
+    } else {
+        return fuchsia_io_NodeInfoTag_device;
+    }
+}
+
 static zx_status_t create_description(const fbl::RefPtr<zx_device_t>& dev, fs::OnOpenMsg* msg,
                                       zx::eventpair* handle) {
     memset(msg, 0, sizeof(*msg));
     msg->primary.hdr.ordinal = fuchsia_io_NodeOnOpenOrdinal;
-    msg->extra.tag = fuchsia_io_NodeInfoTag_device;
+    msg->extra.tag = device_or_tty(dev);
     msg->primary.s = ZX_OK;
     msg->primary.info = (fuchsia_io_NodeInfo*)FIDL_ALLOC_PRESENT;
     handle->reset();
+    zx_handle_t* event = (msg->extra.tag == fuchsia_io_NodeInfoTag_device)
+        ? &msg->extra.device.event
+        : &msg->extra.tty.event;
     if (dev->event.is_valid()) {
         zx_status_t r;
         if ((r = dev->event.duplicate(ZX_RIGHTS_BASIC, handle)) != ZX_OK) {
             msg->primary.s = r;
             return r;
         }
-        msg->extra.device.event = FIDL_HANDLE_PRESENT;
+        *event = FIDL_HANDLE_PRESENT;
     } else {
-        msg->extra.device.event = FIDL_HANDLE_ABSENT;
+        *event = FIDL_HANDLE_ABSENT;
     }
 
     return ZX_OK;
 }
 
-static zx_status_t devhost_get_handles(zx::channel rh, const fbl::RefPtr<zx_device_t>& dev,
-                                       const char* path, uint32_t flags) {
+zx_status_t devhost_device_connect(const fbl::RefPtr<zx_device_t>& dev, uint32_t flags,
+                                   zx::channel rh) {
     zx_status_t r;
     // detect response directives and discard all other
     // protocol flags
     bool describe = flags & ZX_FS_FLAG_DESCRIBE;
     flags &= (~ZX_FS_FLAG_DESCRIBE);
 
-    auto newconn = fbl::make_unique<DevfsConnection>();
+    auto newconn = std::make_unique<DevfsConnection>();
     if (!newconn) {
         r = ZX_ERR_NO_MEMORY;
         if (describe) {
@@ -93,10 +110,9 @@ static zx_status_t devhost_get_handles(zx::channel rh, const fbl::RefPtr<zx_devi
     newconn->flags = flags;
 
     fbl::RefPtr<zx_device_t> new_dev;
-    r = device_open_at(dev, &new_dev, path, flags);
+    r = device_open(dev, &new_dev, flags);
     if (r != ZX_OK) {
-        fprintf(stderr, "devhost_get_handles(%p:%s) open path='%s', r=%d\n", dev.get(), dev->name,
-                path ? path : "", r);
+        fprintf(stderr, "devhost_device_connect(%p:%s) open r=%d\n", dev.get(), dev->name, r);
         goto fail;
     }
     newconn->dev = new_dev;
@@ -120,7 +136,7 @@ static zx_status_t devhost_get_handles(zx::channel rh, const fbl::RefPtr<zx_devi
     // If we can't add the new conn and handle to the dispatcher our only option
     // is to give up and tear down.  In practice, this should never happen.
     if ((r = devhost_start_connection(std::move(newconn), std::move(rh))) != ZX_OK) {
-        fprintf(stderr, "devhost_get_handles: failed to start iostate\n");
+        fprintf(stderr, "devhost_device_connect: failed to start iostate\n");
         // TODO(teisenbe/kulakowski): Should this be goto fail_open?
         goto fail;
     }
@@ -154,114 +170,11 @@ static ssize_t do_sync_io(const fbl::RefPtr<zx_device_t>& dev, uint32_t opcode, 
     }
 }
 
-static ssize_t do_ioctl(const fbl::RefPtr<zx_device_t>& dev, uint32_t op, const void* in_buf,
-                        size_t in_len, void* out_buf, size_t out_len, size_t* out_actual) {
-    zx_status_t r;
-    switch (op) {
-    case IOCTL_DEVICE_BIND: {
-        char* drv_libname = in_len > 0 ? (char*)in_buf : nullptr;
-        if (in_len > PATH_MAX) {
-            return ZX_ERR_BAD_PATH;
-        }
-        drv_libname[in_len] = 0;
-        if ((r = device_bind(dev, drv_libname) < 0)) {
-            return r;
-        }
-        *out_actual = r;
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_GET_EVENT_HANDLE: {
-        if (out_len < sizeof(zx_handle_t)) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        auto raw_event = static_cast<zx_handle_t*>(out_buf);
-        zx::eventpair event;
-        if ((r = dev->event.duplicate(ZX_RIGHTS_BASIC, &event)) != ZX_OK) {
-            return r;
-        }
-        *raw_event = event.release();
-        *out_actual = sizeof(zx_handle_t);
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_GET_DRIVER_NAME: {
-        if (!dev->driver) {
-            return ZX_ERR_NOT_SUPPORTED;
-        }
-        const char* name = dev->driver->name();
-        if (name == nullptr) {
-            name = "unknown";
-        }
-        size_t len = strlen(name);
-        if (out_len <= len) {
-            r = ZX_ERR_BUFFER_TOO_SMALL;
-        } else {
-            strncpy(static_cast<char*>(out_buf), name, len);
-            *out_actual = len;
-            r = ZX_OK;
-        }
-        return r;
-    }
-    case IOCTL_DEVICE_GET_DEVICE_NAME: {
-        size_t actual = strlen(dev->name) + 1;
-        if (out_len < actual) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        memcpy(out_buf, dev->name, actual);
-        *out_actual = actual;
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_GET_TOPO_PATH: {
-        size_t actual;
-        if ((r = devhost_get_topo_path(dev, static_cast<char*>(out_buf), out_len, &actual)) < 0) {
-            return r;
-        }
-        *out_actual = actual;
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_DEBUG_SUSPEND: {
-        return dev->SuspendOp(0);
-    }
-    case IOCTL_DEVICE_DEBUG_RESUME: {
-        return dev->ResumeOp(0);
-    }
-    case IOCTL_DEVICE_GET_DRIVER_LOG_FLAGS: {
-        if (!dev->driver) {
-            return ZX_ERR_UNAVAILABLE;
-        }
-        if (out_len < sizeof(uint32_t)) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        *((uint32_t*)out_buf) = dev->driver->driver_rec()->log_flags;
-        *out_actual = sizeof(uint32_t);
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_SET_DRIVER_LOG_FLAGS: {
-        if (!dev->driver) {
-            return ZX_ERR_UNAVAILABLE;
-        }
-        if (in_len < sizeof(driver_log_flags_t)) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        driver_log_flags_t* flags = (driver_log_flags_t*)in_buf;
-        dev->driver->driver_rec()->log_flags &= ~flags->clear;
-        dev->driver->driver_rec()->log_flags |= flags->set;
-        *out_actual = sizeof(driver_log_flags_t);
-        return ZX_OK;
-    }
-    case IOCTL_DEVICE_UNBIND: {
-        return device_unbind(dev);
-    }
-    default: {
-        return dev->IoctlOp(op, in_buf, in_len, out_buf, out_len, out_actual);
-    }
-    }
-}
-
 static zx_status_t fidl_node_clone(void* ctx, uint32_t flags, zx_handle_t object) {
     auto conn = static_cast<DevfsConnection*>(ctx);
     zx::channel c(object);
     flags = conn->flags | (flags & ZX_FS_FLAG_DESCRIBE);
-    devhost_get_handles(std::move(c), conn->dev, nullptr, flags);
+    devhost_device_connect(conn->dev, flags, std::move(c));
     return ZX_OK;
 }
 
@@ -280,45 +193,26 @@ static zx_status_t fidl_node_describe(void* ctx, fidl_txn_t* txn) {
     const auto& dev = conn->dev;
     fuchsia_io_NodeInfo info;
     memset(&info, 0, sizeof(info));
-    info.tag = fuchsia_io_NodeInfoTag_device;
+    info.tag = device_or_tty(dev);
     if (dev->event != ZX_HANDLE_INVALID) {
         zx::eventpair event;
         zx_status_t status = dev->event.duplicate(ZX_RIGHTS_BASIC, &event);
         if (status != ZX_OK) {
             return status;
         }
-        info.device.event = event.release();
+        zx_handle_t* event_handle = (info.tag == fuchsia_io_NodeInfoTag_device)
+            ? &info.device.event
+            : &info.tty.event;
+        *event_handle = event.release();
     }
     return fuchsia_io_NodeDescribe_reply(txn, &info);
-}
-
-zx_status_t devhost_device_connect(const fbl::RefPtr<zx_device_t>& dev, uint32_t flags,
-                                   const char* path_data, size_t path_size, zx::channel c) {
-    if ((path_size < 1) || (path_size > 1024)) {
-        return ZX_OK;
-    }
-    // TODO(smklein): Avoid assuming paths are null-terminated; this is only
-    // safe because the path is the last secondary object in the DirectoryOpen
-    // request.
-    ((char*)path_data)[path_size] = 0;
-
-    if (!strcmp(path_data, ".")) {
-        path_data = nullptr;
-    }
-    devhost_get_handles(std::move(c), dev, path_data, flags);
-    return ZX_OK;
-}
-
-void devhost_device_connect(const fbl::RefPtr<zx_device_t>& dev, zx::channel c) {
-    devhost_get_handles(std::move(c), dev, nullptr /* path */, 0 /* flags */);
 }
 
 static zx_status_t fidl_directory_open(void* ctx, uint32_t flags, uint32_t mode,
                                        const char* path_data, size_t path_size,
                                        zx_handle_t object) {
-    auto conn = static_cast<DevfsConnection*>(ctx);
-    zx::channel c(object);
-    return devhost_device_connect(conn->dev, flags, path_data, path_size, std::move(c));
+    zx_handle_close(object);
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
 static zx_status_t fidl_directory_unlink(void* ctx, const char* path_data, size_t path_size,
@@ -627,7 +521,7 @@ static zx_status_t fidl_node_ioctl(void* ctx, uint32_t opcode, uint64_t max_out,
     uint8_t out[max_out];
     zx_handle_t* out_handles = (zx_handle_t*)out;
     size_t out_count = 0;
-    ssize_t r = do_ioctl(conn->dev, opcode, in_buf, in_count, out, max_out, &out_count);
+    ssize_t r = conn->dev->IoctlOp(opcode, in_buf, in_count, out, max_out, &out_count);
     size_t out_hcount = 0;
     if (r >= 0) {
         switch (IOCTL_KIND(opcode)) {
@@ -660,6 +554,124 @@ static const fuchsia_io_Node_ops_t kNodeOps = {
     .Ioctl = fidl_node_ioctl,
 };
 
+static zx_status_t fidl_DeviceControllerBind(void* ctx, const char* driver_data,
+                                             size_t driver_count, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    char drv_libname[fuchsia_device_MAX_DRIVER_PATH_LEN + 1];
+    memcpy(drv_libname, driver_data, driver_count);
+    drv_libname[driver_count] = 0;
+
+    // TODO(DNO-492): additional logging for debugging what looks like a
+    // deadlock.  Remove once bug is resolved.
+    printf("DeviceControllerBind running: %s\n", drv_libname);
+    // TODO(ZX-3431): We ignore the status from device_bind() for
+    // bug-compatibility reasons.  Once this bug is resolved, we can return the
+    // actual status.
+    __UNUSED zx_status_t status = device_bind(conn->dev, drv_libname);
+    // TODO(DNO-492): additional logging for debugging what looks like a
+    // deadlock.  Remove once bug is resolved.
+    printf("DeviceControllerBind finished: %s %s\n", drv_libname, zx_status_get_string(status));
+    return fuchsia_device_ControllerBind_reply(txn, ZX_OK);
+}
+
+static zx_status_t fidl_DeviceControllerUnbind(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    zx_status_t status = device_unbind(conn->dev);
+    return fuchsia_device_ControllerUnbind_reply(txn, status);
+}
+
+static zx_status_t fidl_DeviceControllerGetDriverName(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    if (!conn->dev->driver) {
+        return fuchsia_device_ControllerGetDriverName_reply(txn, ZX_ERR_NOT_SUPPORTED, nullptr, 0);
+    }
+    const char* name = conn->dev->driver->name();
+    if (name == nullptr) {
+        name = "unknown";
+    }
+    return fuchsia_device_ControllerGetDriverName_reply(txn, ZX_OK, name, strlen(name));
+}
+
+static zx_status_t fidl_DeviceControllerGetDeviceName(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    return fuchsia_device_ControllerGetDeviceName_reply(txn, conn->dev->name,
+                                                        strlen(conn->dev->name));
+}
+
+static zx_status_t fidl_DeviceControllerGetTopologicalPath(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    char buf[fuchsia_device_MAX_DEVICE_PATH_LEN + 1];
+    size_t actual;
+    zx_status_t status = devhost_get_topo_path(conn->dev, buf, sizeof(buf), &actual);
+    if (status != ZX_OK) {
+        return fuchsia_device_ControllerGetTopologicalPath_reply(txn, status, nullptr, 0);
+    }
+    if (actual > 0) {
+        // Remove the accounting for the null byte
+        actual--;
+    }
+    return fuchsia_device_ControllerGetTopologicalPath_reply(txn, ZX_OK, buf, actual);
+}
+
+static zx_status_t fidl_DeviceControllerGetEventHandle(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    zx::eventpair event;
+    zx_status_t status = conn->dev->event.duplicate(ZX_RIGHTS_BASIC, &event);
+    static_assert(fuchsia_device_DEVICE_SIGNAL_READABLE == DEV_STATE_READABLE);
+    static_assert(fuchsia_device_DEVICE_SIGNAL_WRITABLE == DEV_STATE_WRITABLE);
+    static_assert(fuchsia_device_DEVICE_SIGNAL_ERROR == DEV_STATE_ERROR);
+    static_assert(fuchsia_device_DEVICE_SIGNAL_HANGUP == DEV_STATE_HANGUP);
+    static_assert(fuchsia_device_DEVICE_SIGNAL_OOB == DEV_STATE_OOB);
+    return fuchsia_device_ControllerGetEventHandle_reply(txn, status, event.release());
+}
+
+static zx_status_t fidl_DeviceControllerGetDriverLogFlags(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    if (!conn->dev->driver) {
+        return fuchsia_device_ControllerGetDriverLogFlags_reply(txn, ZX_ERR_UNAVAILABLE, 0);
+    }
+    uint32_t flags = conn->dev->driver->driver_rec()->log_flags;
+    return fuchsia_device_ControllerGetDriverLogFlags_reply(txn, ZX_OK, flags);
+}
+
+static zx_status_t fidl_DeviceControllerSetDriverLogFlags(void* ctx,
+                                                          uint32_t clear_flags,
+                                                          uint32_t set_flags,
+                                                          fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    if (!conn->dev->driver) {
+        return fuchsia_device_ControllerSetDriverLogFlags_reply(txn, ZX_ERR_UNAVAILABLE);
+    }
+    uint32_t flags = conn->dev->driver->driver_rec()->log_flags;
+    flags &= ~clear_flags;
+    flags |= set_flags;
+    conn->dev->driver->driver_rec()->log_flags = flags;
+    return fuchsia_device_ControllerSetDriverLogFlags_reply(txn, ZX_OK);
+}
+
+static zx_status_t fidl_DeviceControllerDebugSuspend(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    return fuchsia_device_ControllerDebugSuspend_reply(txn, conn->dev->SuspendOp(0));
+}
+
+static zx_status_t fidl_DeviceControllerDebugResume(void* ctx, fidl_txn_t* txn) {
+    auto conn = static_cast<DevfsConnection*>(ctx);
+    return fuchsia_device_ControllerDebugResume_reply(txn, conn->dev->ResumeOp(0));
+}
+
+static const fuchsia_device_Controller_ops_t kDeviceControllerOps = {
+    .Bind = fidl_DeviceControllerBind,
+    .Unbind = fidl_DeviceControllerUnbind,
+    .GetDriverName = fidl_DeviceControllerGetDriverName,
+    .GetDeviceName = fidl_DeviceControllerGetDeviceName,
+    .GetTopologicalPath = fidl_DeviceControllerGetTopologicalPath,
+    .GetEventHandle = fidl_DeviceControllerGetEventHandle,
+    .GetDriverLogFlags = fidl_DeviceControllerGetDriverLogFlags,
+    .SetDriverLogFlags = fidl_DeviceControllerSetDriverLogFlags,
+    .DebugSuspend = fidl_DeviceControllerDebugSuspend,
+    .DebugResume = fidl_DeviceControllerDebugResume,
+};
+
 zx_status_t devhost_fidl_handler(fidl_msg_t* msg, fidl_txn_t* txn, void* cookie) {
     zx_status_t status = fuchsia_io_Node_try_dispatch(cookie, txn, msg, &kNodeOps);
     if (status != ZX_ERR_NOT_SUPPORTED) {
@@ -674,6 +686,10 @@ zx_status_t devhost_fidl_handler(fidl_msg_t* msg, fidl_txn_t* txn, void* cookie)
         return status;
     }
     status = fuchsia_io_DirectoryAdmin_try_dispatch(cookie, txn, msg, &kDirectoryAdminOps);
+    if (status != ZX_ERR_NOT_SUPPORTED) {
+        return status;
+    }
+    status = fuchsia_device_Controller_try_dispatch(cookie, txn, msg, &kDeviceControllerOps);
     if (status != ZX_ERR_NOT_SUPPORTED) {
         return status;
     }

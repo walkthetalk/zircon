@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_UNIQUE_FD_H_
+#define FBL_UNIQUE_FD_H_
 
 #include <stdlib.h>
 #include <unistd.h>
 
 #include <fbl/macros.h>
-#include <fbl/type_support.h>
 
 namespace fbl {
 
@@ -42,7 +42,7 @@ public:
     // move semantics only
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(unique_fd);
 
-    fbl::unique_fd duplicate() {
+    fbl::unique_fd duplicate() const {
         return fbl::unique_fd(dup(fd_));
     }
 
@@ -86,3 +86,5 @@ private:
 };
 
 }  // namespace fbl
+
+#endif  // FBL_UNIQUE_FD_H_

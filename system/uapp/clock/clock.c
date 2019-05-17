@@ -3,7 +3,10 @@
 // found in the LICENSE file.
 
 #include <fuchsia/hardware/rtc/c/fidl.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
+#include <zircon/syscalls.h>
 
 #include <ctype.h>
 #include <dirent.h>
@@ -17,11 +20,13 @@
 int usage(const char* cmd) {
     fprintf(
         stderr,
-        "Interact with the real-time clock:\n"
+        "Interact with the real-time or monotonic clocks:\n"
         "   %s                              Print the time\n"
         "   %s --help                       Print this message\n"
         "   %s --set YYYY-mm-ddThh:mm:ss    Set the time\n"
+        "   %s --monotonic                  Print nanoseconds since boot\n"
         "   optionally specify an RTC device with --dev PATH_TO_DEVICE_NODE\n",
+        cmd,
         cmd,
         cmd,
         cmd);
@@ -116,14 +121,19 @@ int set_rtc(const char *path, const char* time) {
     return set_status;
 }
 
+void print_monotonic(void) {
+    printf("%lu\n", zx_clock_get_monotonic());
+}
+
 int main(int argc, char** argv) {
-    int err;
+    int err = 0;
     const char* cmd = basename(argv[0]);
     char *path = NULL;
     char *set = NULL;
     static const struct option opts[] = {
         {"set",  required_argument, NULL, 's'},
         {"dev",  required_argument, NULL, 'd'},
+        {"monotonic", no_argument, NULL, 'm'},
         {"help", no_argument,       NULL, 'h'},
         {0},
     };
@@ -135,6 +145,9 @@ int main(int argc, char** argv) {
         case 'd':
             path = strdup(optarg);
             break;
+        case 'm':
+            print_monotonic();
+            goto done;
         case 'h':
             usage(cmd);
             err = 0;

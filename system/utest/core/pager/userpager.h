@@ -6,6 +6,8 @@
 
 #include <fbl/function.h>
 #include <fbl/intrusive_double_list.h>
+#include <lib/zx/pager.h>
+#include <lib/zx/port.h>
 #include <lib/zx/vmar.h>
 #include <lib/zx/vmo.h>
 #include <zircon/syscalls/port.h>
@@ -26,6 +28,12 @@ public:
 
     // Validates this vmo's content in the specified pages using a mapped vmar.
     bool CheckVmar(uint64_t page_offset, uint64_t page_count, const void* expected = nullptr);
+    // Validates this vmo's content in the specified pages using vmo_read.
+    bool CheckVmo(uint64_t page_offset, uint64_t page_count, const void* expected = nullptr);
+
+    bool Resize(uint64_t new_page_count) {
+        return vmo_.set_size(new_page_count) == ZX_OK;
+    }
 
     // Commits the specified pages in this vmo.
     bool Commit(uint64_t page_offset, uint64_t page_count) {
@@ -39,6 +47,7 @@ public:
 
     uint64_t GetKey() const { return base_val_; }
     uintptr_t GetBaseAddr() const { return base_addr_; }
+    const zx::vmo& vmo() const { return vmo_; }
 
     fbl::unique_ptr<Vmo> Clone();
 
@@ -68,13 +77,11 @@ public:
     bool Init();
     //  Closes the pager handle.
     void ClosePagerHandle() {
-        zx_handle_close(pager_);
-        pager_ = ZX_HANDLE_INVALID;
+        pager_.reset();
     }
     // Closes the pager's port handle.
     void ClosePortHandle() {
-        zx_handle_close(port_);
-        port_ = ZX_HANDLE_INVALID;
+        port_.reset();
     }
 
     // Creates a new paged vmo.
@@ -106,11 +113,11 @@ public:
     bool GetPageReadRequest(Vmo* vmo, zx_time_t deadline,
                             uint64_t* page_offset, uint64_t* page_count);
 
-    zx_handle_t pager() const { return pager_; }
+    const zx::pager& pager() const { return pager_; }
 
 private:
-    zx_handle_t pager_ = ZX_HANDLE_INVALID;
-    zx_handle_t port_ = ZX_HANDLE_INVALID;
+    zx::pager pager_;
+    zx::port port_;
     uint64_t next_base_ = 0;
 
     fbl::DoublyLinkedList<fbl::unique_ptr<Vmo>> vmos_;

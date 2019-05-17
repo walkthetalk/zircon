@@ -13,6 +13,7 @@
 #include <lib/fidl-async-2/fidl_struct.h>
 #include <lib/zx/channel.h>
 
+#include <list>
 #include <map>
 #include <memory>
 
@@ -100,14 +101,14 @@ private:
 
     bool CombineConstraints();
 
-    bool CheckBufferCollectionConstraints(
-        const fuchsia_sysmem_BufferCollectionConstraints* constraints);
-
-    bool CheckImageFormatConstraints(
-        const fuchsia_sysmem_ImageFormatConstraints* constraints);
-
-    void SanitizeBufferCollectionConstraints(
+    bool CheckSanitizeBufferCollectionConstraints(
         fuchsia_sysmem_BufferCollectionConstraints* constraints);
+
+    bool CheckSanitizeBufferMemoryConstraints(
+        fuchsia_sysmem_BufferMemoryConstraints* constraints);
+
+    bool CheckSanitizeImageFormatConstraints(
+        fuchsia_sysmem_ImageFormatConstraints* constraints);
 
     Constraints BufferCollectionConstraintsClone(
         const fuchsia_sysmem_BufferCollectionConstraints* input);
@@ -160,6 +161,9 @@ private:
     using CollectionMap =
         std::map<BufferCollection*, std::unique_ptr<BufferCollection>>;
     CollectionMap collection_views_;
+
+    using ConstraintsList = std::list<Constraints>;
+    ConstraintsList constraints_list_;
 
     bool is_allocate_attempted_ = false;
 

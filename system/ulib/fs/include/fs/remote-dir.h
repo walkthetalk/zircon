@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FS_REMOTE_DIR_H_
+#define FS_REMOTE_DIR_H_
 
 #include <fbl/macros.h>
 
@@ -23,7 +24,7 @@ namespace fs {
 // This class is thread-safe.
 class RemoteDir : public Vnode {
 public:
-    // Binds to a remotely hosted directory using the specified RIO client
+    // Binds to a remotely hosted directory using the specified FIDL client
     // channel endpoint.  The channel must be valid.
     RemoteDir(zx::channel remote_dir_client);
 
@@ -34,6 +35,8 @@ public:
     zx_status_t Getattr(vnattr_t* a) final;
     bool IsRemote() const final;
     zx_handle_t GetRemote() const final;
+    bool IsDirectory() const final { return true; }
+    zx_status_t GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) final;
 
 private:
     zx::channel const remote_dir_client_;
@@ -42,3 +45,5 @@ private:
 };
 
 } // namespace fs
+
+#endif // FS_REMOTE_DIR_H_

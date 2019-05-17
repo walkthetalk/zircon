@@ -3,11 +3,15 @@
 // found in the LICENSE file.
 
 #include <ddk/debug.h>
+#include <ddk/trace/event.h>
+#include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
+#include <fuchsia/sysmem/c/fidl.h>
 #include <lib/async/cpp/task.h>
 #include <lib/edid/edid.h>
 #include <lib/fidl/cpp/builder.h>
 #include <lib/fidl/cpp/message.h>
+#include <lib/image-format/image_format.h>
 #include <math.h>
 #include <utility>
 #include <zircon/device/display-controller.h>
@@ -31,6 +35,7 @@ zx_status_t decode_message(fidl::Message* msg) {
     const fidl_type_t* table = nullptr;
     switch (msg->ordinal()) {
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerImportVmoImage);
+        SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerImportImage);
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerReleaseImage);
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerImportEvent);
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerReleaseEvent);
@@ -52,6 +57,10 @@ zx_status_t decode_message(fidl::Message* msg) {
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerSetVirtconMode);
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerComputeLinearImageStride);
         SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerAllocateVmo);
+        SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerImportBufferCollection);
+        SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerSetBufferCollectionConstraints);
+        SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerReleaseBufferCollection);
+        SELECT_TABLE_CASE(fuchsia_hardware_display_ControllerGetSingleBufferFramebuffer);
     }
     if (table != nullptr) {
         const char* err;
@@ -160,6 +169,7 @@ void Client::HandleControllerApi(async_dispatcher_t* dispatcher, async::WaitBase
 
     switch (msg.ordinal()) {
     HANDLE_REQUEST_CASE(ImportVmoImage);
+    HANDLE_REQUEST_CASE(ImportImage);
     HANDLE_REQUEST_CASE(ReleaseImage);
     HANDLE_REQUEST_CASE(ImportEvent);
     HANDLE_REQUEST_CASE(ReleaseEvent);
@@ -180,10 +190,20 @@ void Client::HandleControllerApi(async_dispatcher_t* dispatcher, async::WaitBase
     HANDLE_REQUEST_CASE(EnableVsync);
     HANDLE_REQUEST_CASE(SetVirtconMode);
     HANDLE_REQUEST_CASE(ComputeLinearImageStride);
+    HANDLE_REQUEST_CASE(ImportBufferCollection);
+    HANDLE_REQUEST_CASE(ReleaseBufferCollection);
+    HANDLE_REQUEST_CASE(SetBufferCollectionConstraints);
     case fuchsia_hardware_display_ControllerAllocateVmoOrdinal: {
         auto r = reinterpret_cast<const fuchsia_hardware_display_ControllerAllocateVmoRequest*>(
             msg.bytes().data());
         HandleAllocateVmo(r, &builder, &out_handle, &has_out_handle, &out_type);
+        break;
+    }
+    case fuchsia_hardware_display_ControllerGetSingleBufferFramebufferOrdinal: {
+        auto r = reinterpret_cast<
+            const fuchsia_hardware_display_ControllerGetSingleBufferFramebufferRequest*>(
+            msg.bytes().data());
+        HandleGetSingleBufferFramebuffer(r, &builder, &out_handle, &has_out_handle, &out_type);
         break;
     }
     default:
@@ -233,7 +253,11 @@ void Client::HandleImportVmoImage(
 
     if (resp->res == ZX_OK) {
         fbl::AllocChecker ac;
-        auto image = fbl::AdoptRef(new (&ac) Image(controller_, dc_image, std::move(vmo)));
+        uint32_t stride = 0;
+        if (is_vc_) {
+            stride = controller_->dc()->ComputeLinearStride(dc_image.width, dc_image.pixel_format);
+        }
+        auto image = fbl::AdoptRef(new (&ac) Image(controller_, dc_image, std::move(vmo), stride));
         if (!ac.check()) {
             controller_->dc()->ReleaseImage(&dc_image);
 
@@ -243,6 +267,82 @@ void Client::HandleImportVmoImage(
 
         image->id = next_image_id_++;
         resp->image_id = image->id;
+        images_.insert(std::move(image));
+    }
+}
+
+void Client::HandleImportImage(const fuchsia_hardware_display_ControllerImportImageRequest* req,
+                               fidl::Builder* resp_builder, const fidl_type_t** resp_table) {
+    auto resp = resp_builder->New<fuchsia_hardware_display_ControllerImportImageResponse>();
+    *resp_table = &fuchsia_hardware_display_ControllerImportImageResponseTable;
+
+    auto it = collection_map_.find(req->collection_id);
+    if (it == collection_map_.end()) {
+        resp->res = ZX_ERR_INVALID_ARGS;
+        return;
+    }
+    zx::channel& collection = it->second.driver;
+    zx_status_t status2;
+    zx_status_t status =
+        fuchsia_sysmem_BufferCollectionCheckBuffersAllocated(collection.get(), &status2);
+
+    if (status != ZX_OK || status2 != ZX_OK) {
+        resp->res = ZX_ERR_SHOULD_WAIT;
+        return;
+    }
+
+    image_t dc_image = {};
+    dc_image.height = req->image_config.height;
+    dc_image.width = req->image_config.width;
+    dc_image.pixel_format = req->image_config.pixel_format;
+    dc_image.type = req->image_config.type;
+
+    resp->res = controller_->dc()->ImportImage(&dc_image, collection.get(), req->index);
+
+    if (resp->res == ZX_OK) {
+        auto release_image =
+            fbl::MakeAutoCall([this, &dc_image]() { controller_->dc()->ReleaseImage(&dc_image); });
+        zx::vmo vmo;
+        uint32_t stride = 0;
+        if (is_vc_) {
+            ZX_ASSERT(it->second.kernel);
+            fuchsia_sysmem_BufferCollectionInfo_2 info;
+            zx_status_t status2;
+            status = fuchsia_sysmem_BufferCollectionWaitForBuffersAllocated(it->second.kernel.get(),
+                                                                            &status2, &info);
+            if (status != ZX_OK || status2 != ZX_OK) {
+                resp->res = ZX_ERR_NO_MEMORY;
+                return;
+            }
+            fbl::Vector<zx::vmo> vmos;
+            for (uint32_t i = 0; i < info.buffer_count; ++i) {
+                vmos.push_back(zx::vmo(info.buffers[i].vmo));
+            }
+
+            if (!info.settings.has_image_format_constraints || req->index >= vmos.size()) {
+                resp->res = ZX_ERR_OUT_OF_RANGE;
+                return;
+            }
+            uint32_t minimum_row_bytes;
+            if (!ImageFormatMinimumRowBytes(&info.settings.image_format_constraints, dc_image.width,
+                                            &minimum_row_bytes)) {
+                resp->res = ZX_ERR_INVALID_ARGS;
+                return;
+            }
+            vmo = std::move(vmos[req->index]);
+            stride = minimum_row_bytes / ZX_PIXEL_FORMAT_BYTES(dc_image.pixel_format);
+        }
+
+        fbl::AllocChecker ac;
+        auto image = fbl::AdoptRef(new (&ac) Image(controller_, dc_image, std::move(vmo), stride));
+        if (!ac.check()) {
+            resp->res = ZX_ERR_NO_MEMORY;
+            return;
+        }
+
+        image->id = next_image_id_++;
+        resp->image_id = image->id;
+        release_image.cancel();
         images_.insert(std::move(image));
     }
 }
@@ -286,6 +386,156 @@ void Client::HandleImportEvent(const fuchsia_hardware_display_ControllerImportEv
     if (!success) {
         zxlogf(ERROR, "Failed to import event#%ld (%d)\n", req->id, status);
         TearDown();
+    }
+}
+
+void Client::HandleImportBufferCollection(
+    const fuchsia_hardware_display_ControllerImportBufferCollectionRequest* req,
+    fidl::Builder* resp_builder, const fidl_type_t** resp_table) {
+    auto resp = resp_builder->New<fuchsia_hardware_display_ControllerImportBufferCollectionResponse>();
+    *resp_table = &fuchsia_hardware_display_ControllerImportBufferCollectionResponseTable;
+    zx::channel collection_token(req->collection_token);
+    if (!sysmem_allocator_) {
+        resp->res = ZX_ERR_INTERNAL;
+        return;
+    }
+
+    // TODO: Switch to .contains() when C++20.
+    if (collection_map_.count(req->collection_id)) {
+        resp->res = ZX_ERR_INVALID_ARGS;
+        return;
+    }
+
+    zx::channel vc_collection;
+
+    // Make a second handle to represent the kernel's usage of the buffer as a
+    // framebuffer, so we can set constraints and get VMOs for zx_framebuffer_set_range.
+    if (is_vc_) {
+        zx::channel vc_token_server, vc_token_client;
+        zx::channel::create(0, &vc_token_server, &vc_token_client);
+        zx_status_t status = fuchsia_sysmem_BufferCollectionTokenDuplicate(
+            collection_token.get(), UINT32_MAX, vc_token_server.release());
+
+        if (status != ZX_OK) {
+            resp->res = ZX_ERR_INTERNAL;
+            return;
+        }
+        status = fuchsia_sysmem_BufferCollectionTokenSync(collection_token.get());
+        if (status != ZX_OK) {
+            resp->res = ZX_ERR_INTERNAL;
+            return;
+        }
+
+        zx::channel collection_server;
+        zx::channel::create(0, &collection_server, &vc_collection);
+        status = fuchsia_sysmem_AllocatorBindSharedCollection(
+            sysmem_allocator_.get(), vc_token_client.release(), collection_server.release());
+
+        if (status != ZX_OK) {
+            resp->res = ZX_ERR_INTERNAL;
+            return;
+        }
+    }
+
+    zx::channel collection_server, collection_client;
+    zx::channel::create(0, &collection_server, &collection_client);
+    zx_status_t status = fuchsia_sysmem_AllocatorBindSharedCollection(
+        sysmem_allocator_.get(), collection_token.release(), collection_server.release());
+
+    if (status != ZX_OK) {
+        resp->res = ZX_ERR_INTERNAL;
+        return;
+    }
+
+    collection_map_[req->collection_id] =
+        Collections{std::move(collection_client), std::move(vc_collection)};
+    resp->res = ZX_OK;
+}
+
+void Client::HandleReleaseBufferCollection(
+    const fuchsia_hardware_display_ControllerReleaseBufferCollectionRequest* req,
+    fidl::Builder* resp_builder, const fidl_type_t** resp_table) {
+    auto it = collection_map_.find(req->collection_id);
+    if (it == collection_map_.end()) {
+        return;
+    }
+
+    fuchsia_sysmem_BufferCollectionClose(it->second.driver.get());
+    if (it->second.kernel) {
+        fuchsia_sysmem_BufferCollectionClose(it->second.kernel.get());
+    }
+    collection_map_.erase(it);
+}
+
+void Client::HandleSetBufferCollectionConstraints(
+    const fuchsia_hardware_display_ControllerSetBufferCollectionConstraintsRequest* req,
+    fidl::Builder* resp_builder, const fidl_type_t** resp_table) {
+    auto resp =
+        resp_builder->New<fuchsia_hardware_display_ControllerSetBufferCollectionConstraintsResponse>();
+    *resp_table = &fuchsia_hardware_display_ControllerSetBufferCollectionConstraintsResponseTable;
+    auto it = collection_map_.find(req->collection_id);
+    if (it == collection_map_.end()) {
+        resp->res = ZX_ERR_INVALID_ARGS;
+        return;
+    }
+    image_t dc_image;
+    dc_image.height = req->config.height;
+    dc_image.width = req->config.width;
+    dc_image.pixel_format = req->config.pixel_format;
+    dc_image.type = req->config.type;
+    for (uint32_t i = 0; i < fbl::count_of(dc_image.planes); i++) {
+        dc_image.planes[i].byte_offset = req->config.planes[i].byte_offset;
+        dc_image.planes[i].bytes_per_row = req->config.planes[i].bytes_per_row;
+    }
+
+    resp->res =
+        controller_->dc()->SetBufferCollectionConstraints(&dc_image, it->second.driver.get());
+
+    if (resp->res == ZX_OK && is_vc_) {
+        ZX_ASSERT(it->second.kernel);
+
+        // Constraints to be used with zx_framebuffer_set_range.
+        fuchsia_sysmem_BufferCollectionConstraints constraints = {};
+        constraints.usage.display = fuchsia_sysmem_displayUsageLayer;
+        constraints.has_buffer_memory_constraints = true;
+        fuchsia_sysmem_BufferMemoryConstraints& buffer_constraints =
+            constraints.buffer_memory_constraints;
+        buffer_constraints.min_size_bytes = 0;
+        buffer_constraints.max_size_bytes = 0xffffffff;
+        buffer_constraints.physically_contiguous_required = true;
+        buffer_constraints.secure_required = false;
+        buffer_constraints.secure_permitted = false;
+        constraints.image_format_constraints_count = 1;
+        fuchsia_sysmem_ImageFormatConstraints& image_constraints =
+            constraints.image_format_constraints[0];
+        switch (req->config.pixel_format) {
+        case ZX_PIXEL_FORMAT_RGB_x888:
+        case ZX_PIXEL_FORMAT_ARGB_8888:
+            image_constraints.pixel_format.type = fuchsia_sysmem_PixelFormatType_BGRA32;
+            break;
+        }
+
+        image_constraints.color_spaces_count = 1;
+        image_constraints.color_space[0].type = fuchsia_sysmem_ColorSpaceType_SRGB;
+        image_constraints.min_coded_width = 0;
+        image_constraints.max_coded_width = 0xffffffff;
+        image_constraints.min_coded_height = 0;
+        image_constraints.max_coded_height = 0xffffffff;
+        image_constraints.min_bytes_per_row = 0;
+        image_constraints.max_bytes_per_row = 0xffffffff;
+        image_constraints.max_coded_width_times_coded_height = 0xffffffff;
+        image_constraints.layers = 1;
+        image_constraints.coded_width_divisor = 1;
+        image_constraints.coded_height_divisor = 1;
+        image_constraints.bytes_per_row_divisor = 4;
+        image_constraints.start_offset_divisor = 1;
+        image_constraints.display_width_divisor = 1;
+        image_constraints.display_height_divisor = 1;
+
+        if (image_constraints.pixel_format.type) {
+            resp->res = fuchsia_sysmem_BufferCollectionSetConstraints(it->second.kernel.get(), true,
+                                                                      &constraints);
+        }
     }
 }
 
@@ -887,6 +1137,23 @@ void Client::HandleAllocateVmo(const fuchsia_hardware_display_ControllerAllocate
     resp->vmo = *has_handle_out ? FIDL_HANDLE_PRESENT : FIDL_HANDLE_ABSENT;
 }
 
+void Client::HandleGetSingleBufferFramebuffer(
+    const fuchsia_hardware_display_ControllerGetSingleBufferFramebufferRequest* req,
+    fidl::Builder* resp_builder, zx_handle_t* handle_out, bool* has_handle_out,
+    const fidl_type_t** resp_table) {
+    auto resp =
+        resp_builder->New<fuchsia_hardware_display_ControllerGetSingleBufferFramebufferResponse>();
+    *resp_table = &fuchsia_hardware_display_ControllerGetSingleBufferFramebufferResponseTable;
+
+    zx::vmo vmo;
+    uint32_t stride = 0;
+    resp->res = controller_->dc()->GetSingleBufferFramebuffer(&vmo, &stride);
+    *has_handle_out = resp->res == ZX_OK;
+    *handle_out = vmo.release();
+    resp->vmo = *has_handle_out ? FIDL_HANDLE_PRESENT : FIDL_HANDLE_ABSENT;
+    resp->stride = stride;
+}
+
 bool Client::CheckConfig(fidl::Builder* resp_builder) {
     const display_config_t* configs[configs_.size()];
     layer_t* layers[layers_.size()];
@@ -1083,6 +1350,7 @@ bool Client::CheckConfig(fidl::Builder* resp_builder) {
 
 void Client::ApplyConfig() {
     ZX_DEBUG_ASSERT(controller_->current_thread_is_loop());
+    TRACE_DURATION("gfx", "Display::Client::ApplyConfig");
 
     bool config_missing_image = false;
     layer_t* layers[layers_.size()];
@@ -1138,10 +1406,10 @@ void Client::ApplyConfig() {
                     console_fb_display_id_ = display_config.id;
 
                     auto fb = layer->displayed_image_;
-                    uint32_t stride = controller_->dc()->ComputeLinearStride(
-                        fb->info().width, fb->info().pixel_format);
+                    uint32_t stride = fb->stride_px();
                     uint32_t size = fb->info().height *
                             ZX_PIXEL_FORMAT_BYTES(fb->info().pixel_format) * stride;
+                    // Please do not use get_root_resource() in new code. See ZX-1467.
                     zx_framebuffer_set_range(get_root_resource(),
                                        fb->vmo().get(), size, fb->info().pixel_format,
                                        fb->info().width, fb->info().height, stride);
@@ -1149,6 +1417,7 @@ void Client::ApplyConfig() {
                     // If this display doesnt' have an image but it was the display which had the
                     // kernel's framebuffer, make the kernel drop the reference. Note that this
                     // executes when tearing down the virtcon client.
+                    // Please do not use get_root_resource() in new code. See ZX-1467.
                     zx_framebuffer_set_range(get_root_resource(), ZX_HANDLE_INVALID, 0, 0, 0, 0, 0);
                     console_fb_display_id_ = -1;
                 }
@@ -1513,6 +1782,18 @@ zx_status_t Client::Init(zx_handle_t server_handle) {
     }
 
     server_handle_ = server_handle;
+
+    zx::channel sysmem_allocator_request;
+    zx::channel::create(0, &sysmem_allocator_request, &sysmem_allocator_);
+    status = controller_->dc()->GetSysmemConnection(std::move(sysmem_allocator_request));
+    if (status != ZX_OK) {
+        // Not a fatal error, but BufferCollection functions won't work.
+        // TODO(ZX-3355) TODO: Fail creation once all drivers implement this.
+        zxlogf(ERROR, "GetSysmemConnection failed (continuing) - status: %d\n",
+               status);
+        sysmem_allocator_.reset();
+    }
+
     mtx_init(&fence_mtx_, mtx_plain);
 
     return ZX_OK;
@@ -1587,7 +1868,7 @@ void ClientProxy::OnDisplayVsync(uint64_t display_id, zx_time_t timestamp,
 
     memcpy(msg + 1, image_ids, sizeof(uint64_t) * count);
 
-    zx_status_t status = server_handle_.write(0, data, size, nullptr, 0);
+    zx_status_t status = server_channel_.write(0, data, size, nullptr, 0);
     if (status != ZX_OK) {
         zxlogf(WARN, "Failed to send vsync event %d\n", status);
     }
@@ -1597,7 +1878,7 @@ void ClientProxy::OnClientDead() {
     controller_->OnClientDead(this);
     // After OnClientDead, there won't be any more vsync calls. Since that is the only use of
     // the channel off of the loop thread, there's no need to worry about synchronization.
-    server_handle_.reset();
+    server_channel_.reset();
 }
 
 void ClientProxy::Close() {
@@ -1639,28 +1920,8 @@ void ClientProxy::Close() {
     }
 }
 
-zx_status_t ClientProxy::DdkIoctl(uint32_t op, const void* in_buf, size_t in_len, void* out_buf,
-                             size_t out_len, size_t* actual) {
-    switch (op) {
-    case IOCTL_DISPLAY_CONTROLLER_GET_HANDLE: {
-        if (out_len != sizeof(zx_handle_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-
-        if (client_handle_.get() == ZX_HANDLE_INVALID) {
-            return ZX_ERR_ALREADY_BOUND;
-        }
-
-        *reinterpret_cast<zx_handle_t*>(out_buf) = client_handle_.release();
-        *actual = sizeof(zx_handle_t);
-        return ZX_OK;
-    }
-    default:
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-}
-
 zx_status_t ClientProxy::DdkClose(uint32_t flags) {
+    printf("DdkClose\n");
     Close();
     return ZX_OK;
 }
@@ -1669,15 +1930,9 @@ void ClientProxy::DdkRelease() {
     delete this;
 }
 
-zx_status_t ClientProxy::Init() {
-    zx_status_t status;
-    if ((status = zx_channel_create(0, server_handle_.reset_and_get_address(),
-                                    client_handle_.reset_and_get_address())) != ZX_OK) {
-        zxlogf(ERROR, "Failed to create channels %d\n", status);
-        return status;
-    }
-
-    return handler_.Init(server_handle_.get());
+zx_status_t ClientProxy::Init(zx::channel server_channel) {
+    server_channel_ = std::move(server_channel);
+    return handler_.Init(server_channel_.get());
 }
 
 ClientProxy::ClientProxy(Controller* controller, bool is_vc)

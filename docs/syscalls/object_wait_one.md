@@ -4,7 +4,7 @@
 
 <!-- Updated by update-docs-from-abigen, do not edit. -->
 
-object_wait_one - wait for signals on an object
+Wait for signals on an object.
 
 ## SYNOPSIS
 
@@ -77,11 +77,9 @@ not be waited upon.
 
 ## SEE ALSO
 
- - [timer slack]
+ - [timer slack](../timer_slack.md)
  - [`zx_object_wait_async()`]
  - [`zx_object_wait_many()`]
-
-[timer slack]: ../timer_slack.md
 
 <!-- References updated by update-docs-from-abigen, do not edit. -->
 

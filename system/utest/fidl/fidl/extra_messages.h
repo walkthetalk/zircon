@@ -19,11 +19,20 @@ extern const fidl_type_t fidl_test_coding_TableOfStructWithHandleTable;
 extern const fidl_type_t fidl_test_coding_OlderSimpleTableTable;
 extern const fidl_type_t fidl_test_coding_NewerSimpleTableTable;
 extern const fidl_type_t fidl_test_coding_SimpleTableTable;
+extern const fidl_type_t fidl_test_coding_TableOfStructWithHandleTable;
+extern const fidl_type_t fidl_test_coding_SmallerTableOfStructWithHandleTable;
 extern const fidl_type_t fidl_test_coding_SampleXUnionTable;
 extern const fidl_type_t fidl_test_coding_SampleXUnionStructTable;
+extern const fidl_type_t fidl_test_coding_SampleNullableXUnionStructTable;
 
 extern const fidl_type_t fidl_test_coding_LinearizerTestVectorOfUint32RequestTable;
 extern const fidl_type_t fidl_test_coding_LinearizerTestVectorOfStringRequestTable;
+
+#if defined(__cplusplus)
+}
+#endif
+
+namespace fidl {
 
 using SimpleTable = fidl::VectorView<fidl_envelope_t>;
 struct SimpleTableEnvelopes {
@@ -39,6 +48,36 @@ struct IntStruct {
     int64_t v;
 };
 
+using TableOfStruct = fidl::VectorView<fidl_envelope_t>;
+struct TableOfStructEnvelopes {
+    alignas(FIDL_ALIGNMENT)
+    fidl_envelope_t a;
+    fidl_envelope_t b;
+};
+struct OrdinalOneStructWithHandle {
+    alignas(FIDL_ALIGNMENT)
+    zx_handle_t h;
+    int32_t foo;
+};
+struct OrdinalTwoStructWithManyHandles {
+    alignas(FIDL_ALIGNMENT)
+    zx_handle_t h1;
+    zx_handle_t h2;
+    fidl::VectorView<zx_handle_t> hs;
+};
+struct TableOfStructLayout {
+    TableOfStruct envelope_vector;
+    TableOfStructEnvelopes envelopes;
+    OrdinalOneStructWithHandle a;
+    OrdinalTwoStructWithManyHandles b;
+};
+
+using SmallerTableOfStruct = fidl::VectorView<fidl_envelope_t>;
+struct SmallerTableOfStructEnvelopes {
+    alignas(FIDL_ALIGNMENT)
+    fidl_envelope_t b;
+};
+
 struct SampleXUnion {
     FIDL_ALIGNDECL
     fidl_xunion_t header;
@@ -50,15 +89,22 @@ struct SampleXUnion {
 
         FIDL_ALIGNDECL
         SimpleTable st;
+
+        FIDL_ALIGNDECL
+        int32_t raw_int;
     };
 };
 constexpr uint32_t kSampleXUnionIntStructOrdinal = 376675050;
+constexpr uint32_t kSampleXUnionRawIntOrdinal = 319709411;
 
 struct SampleXUnionStruct {
     FIDL_ALIGNDECL
     SampleXUnion xu;
 };
 
-#if defined(__cplusplus)
-}
-#endif
+struct SampleNullableXUnionStruct {
+    FIDL_ALIGNDECL
+    SampleXUnion opt_xu;
+};
+
+} // namespace fidl

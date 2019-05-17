@@ -68,6 +68,11 @@ int Sherlock::Thread() {
         return -1;
     }
 
+    if (BoardInit() != ZX_OK) {
+        zxlogf(ERROR, "BoardInit() failed\n");
+        return -1;
+    }
+
     if (ClkInit() != ZX_OK) {
         zxlogf(ERROR, "ClkInit() failed\n");
         return -1;
@@ -79,6 +84,10 @@ int Sherlock::Thread() {
 
     if (CanvasInit() != ZX_OK) {
         zxlogf(ERROR, "CanvasInit() failed\n");
+    }
+
+    if (ThermalInit() != ZX_OK) {
+        zxlogf(ERROR, "ThermalInit() failed\n");
     }
 
     if (DisplayInit() != ZX_OK) {
@@ -120,10 +129,6 @@ int Sherlock::Thread() {
         zxlogf(ERROR, "MaliInit() failed\n");
     }
 
-    if (BacklightInit() != ZX_OK) {
-        zxlogf(ERROR, "BacklightInit() failed\n");
-    }
-
     if (ButtonsInit() != ZX_OK) {
         zxlogf(ERROR, "ButtonsInit() failed\n");
     }
@@ -132,6 +137,12 @@ int Sherlock::Thread() {
         zxlogf(ERROR, "AudioInit() failed\n");
         return -1;
     }
+
+    if (TouchInit() != ZX_OK) {
+        zxlogf(ERROR, "TouchInit() failed\n");
+        return -1;
+    }
+
     return 0;
 }
 

@@ -238,6 +238,11 @@ static void mp_unplug_trampoline(void) {
     // should be quick), then this CPU may execute the task.
     mp_set_curr_cpu_online(false);
 
+    // We had better not be holding any OwnedWaitQueues at this point in time
+    // (it is unclear how we would have ever obtained any in the first place
+    // since everything this thread ever does is in this function).
+    DEBUG_ASSERT(ct->owned_wait_queues.is_empty());
+
     // do *not* enable interrupts, we want this CPU to never receive another
     // interrupt
     spin_unlock(&thread_lock);
@@ -261,29 +266,24 @@ static void mp_unplug_trampoline(void) {
 // This should be called in a thread context
 zx_status_t mp_hotplug_cpu_mask(cpu_mask_t cpu_mask) {
     DEBUG_ASSERT(!arch_ints_disabled());
-
-    zx_status_t status = ZX_OK;
-
-    mutex_acquire(&mp.hotplug_lock);
+    Guard<Mutex>(&mp.hotplug_lock);
 
     // Make sure all of the requested CPUs are offline
     if (cpu_mask & mp_get_online_mask()) {
-        status = ZX_ERR_BAD_STATE;
-        goto cleanup_mutex;
+        return ZX_ERR_BAD_STATE;
     }
 
     while (cpu_mask != 0) {
         cpu_num_t cpu_id = highest_cpu_set(cpu_mask);
         cpu_mask &= ~cpu_num_to_mask(cpu_id);
 
-        status = platform_mp_cpu_hotplug(cpu_id);
+        zx_status_t status = platform_mp_cpu_hotplug(cpu_id);
         if (status != ZX_OK) {
-            break;
+            return status;
         }
     }
-cleanup_mutex:
-    mutex_release(&mp.hotplug_lock);
-    return status;
+
+    return ZX_OK;
 }
 
 // Unplug a single CPU.  Must be called while holding the hotplug lock
@@ -354,7 +354,13 @@ static zx_status_t mp_unplug_cpu_mask_single_locked(cpu_num_t cpu_id) {
 // queues.  Since the CPU running this thread is now shutdown, we can just
 // erase the thread's existence.
 cleanup_thread:
-    thread_forget(t);
+    // ZX-2232: workaround race in thread cleanup by leaking the thread
+    // and stack structure. Since we're only using this while turning off
+    // the system currently, it's not a big problem leaking the thread structure
+    // and stack.
+    // thread_forget(t);
+    TRACEF("WARNING: leaking thread for cpu %u\n", cpu_id);
+
     return status;
 }
 
@@ -364,30 +370,24 @@ cleanup_thread:
 // This should be called in a thread context
 zx_status_t mp_unplug_cpu_mask(cpu_mask_t cpu_mask) {
     DEBUG_ASSERT(!arch_ints_disabled());
-
-    zx_status_t status = ZX_OK;
-
-    mutex_acquire(&mp.hotplug_lock);
+    Guard<Mutex>(&mp.hotplug_lock);
 
     // Make sure all of the requested CPUs are online
     if (cpu_mask & ~mp_get_online_mask()) {
-        status = ZX_ERR_BAD_STATE;
-        goto cleanup_mutex;
+        return ZX_ERR_BAD_STATE;
     }
 
     while (cpu_mask != 0) {
         cpu_num_t cpu_id = highest_cpu_set(cpu_mask);
         cpu_mask &= ~cpu_num_to_mask(cpu_id);
 
-        status = mp_unplug_cpu_mask_single_locked(cpu_id);
+        zx_status_t status = mp_unplug_cpu_mask_single_locked(cpu_id);
         if (status != ZX_OK) {
-            break;
+            return status;
         }
     }
 
-cleanup_mutex:
-    mutex_release(&mp.hotplug_lock);
-    return status;
+    return ZX_OK;
 }
 
 interrupt_eoi mp_mbx_generic_irq(void*) {

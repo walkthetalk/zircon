@@ -9,17 +9,16 @@
 #include <limits>
 #include <stdalign.h>
 
+#include <lib/fidl/envelope_frames.h>
 #include <lib/fidl/internal.h>
+#include <lib/fidl/visitor.h>
+#include <lib/fidl/walker.h>
 #include <zircon/assert.h>
 #include <zircon/compiler.h>
 
 #ifdef __Fuchsia__
 #include <zircon/syscalls.h>
 #endif
-
-#include "envelope_frames.h"
-#include "visitor.h"
-#include "walker.h"
 
 // TODO(kulakowski) Design zx_status_t error values.
 
@@ -35,7 +34,7 @@ struct StartingPoint {
 struct Position {
     uint32_t offset;
     Position operator+(uint32_t size) const {
-        return Position { offset + size };
+        return Position{offset + size};
     }
     Position& operator+=(uint32_t size) {
         offset += size;
@@ -48,13 +47,13 @@ struct Position {
 };
 
 Position StartingPoint::ToPosition() const {
-    return Position { 0 };
+    return Position{0};
 }
 
 using EnvelopeState = ::fidl::EnvelopeFrames::EnvelopeState;
 
 class FidlEncoder final : public fidl::Visitor<
-    fidl::MutatingVisitorTrait, StartingPoint, Position> {
+                              fidl::MutatingVisitorTrait, StartingPoint, Position> {
 public:
     FidlEncoder(void* bytes, uint32_t num_bytes, zx_handle_t* handles, uint32_t max_handles,
                 uint32_t next_out_of_line, const char** out_error_msg)
@@ -185,7 +184,7 @@ private:
             SetError("message tried to encode more than provided number of bytes");
             return false;
         }
-        *out_position = Position { next_out_of_line_ };
+        *out_position = Position{next_out_of_line_};
         next_out_of_line_ = new_offset;
         return true;
     }
@@ -209,8 +208,9 @@ private:
 zx_status_t fidl_encode(const fidl_type_t* type, void* bytes, uint32_t num_bytes,
                         zx_handle_t* handles, uint32_t max_handles, uint32_t* out_actual_handles,
                         const char** out_error_msg) {
-    auto set_error = [&out_error_msg] (const char* msg) {
-        if (out_error_msg) *out_error_msg = msg;
+    auto set_error = [&out_error_msg](const char* msg) {
+        if (out_error_msg)
+            *out_error_msg = msg;
     };
     if (bytes == nullptr) {
         set_error("Cannot encode null bytes");
@@ -218,14 +218,6 @@ zx_status_t fidl_encode(const fidl_type_t* type, void* bytes, uint32_t num_bytes
     }
     if (!fidl::IsAligned(reinterpret_cast<uint8_t*>(bytes))) {
         set_error("Bytes must be aligned to FIDL_ALIGNMENT");
-        return ZX_ERR_INVALID_ARGS;
-    }
-    if (handles == nullptr && max_handles != 0) {
-        set_error("Cannot provide non-zero handle count and null handle pointer");
-        return ZX_ERR_INVALID_ARGS;
-    }
-    if (out_actual_handles == nullptr) {
-        set_error("Cannot encode with null out_actual_handles");
         return ZX_ERR_INVALID_ARGS;
     }
 
@@ -241,14 +233,16 @@ zx_status_t fidl_encode(const fidl_type_t* type, void* bytes, uint32_t num_bytes
     FidlEncoder encoder(bytes, num_bytes, handles, max_handles, next_out_of_line, out_error_msg);
     fidl::Walk(encoder,
                type,
-               StartingPoint { reinterpret_cast<uint8_t*>(bytes) });
+               StartingPoint{reinterpret_cast<uint8_t*>(bytes)});
 
-    auto drop_all_handles = [&] () {
-        *out_actual_handles = 0;
+    auto drop_all_handles = [&]() {
+        if (out_actual_handles) {
+            *out_actual_handles = 0;
+        }
 #ifdef __Fuchsia__
         if (handles) {
             // Return value intentionally ignored. This is best-effort cleanup.
-            (void)zx_handle_close_many(handles, max_handles);
+            (void)zx_handle_close_many(handles, encoder.handle_idx());
         }
 #endif
     };
@@ -259,9 +253,20 @@ zx_status_t fidl_encode(const fidl_type_t* type, void* bytes, uint32_t num_bytes
             drop_all_handles();
             return ZX_ERR_INVALID_ARGS;
         }
+        if (out_actual_handles == nullptr) {
+            set_error("Cannot encode with null out_actual_handles");
+            drop_all_handles();
+            return ZX_ERR_INVALID_ARGS;
+        }
         *out_actual_handles = encoder.handle_idx();
     } else {
         drop_all_handles();
+    }
+
+    if (handles == nullptr && max_handles != 0) {
+        set_error("Cannot provide non-zero handle count and null handle pointer");
+        // When |handles| is nullptr, handles are closed as part of traversal.
+        return ZX_ERR_INVALID_ARGS;
     }
 
     return encoder.status();

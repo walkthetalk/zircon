@@ -9,6 +9,7 @@
 
 #ifndef __ASSEMBLER__
 
+#include <arch/arm64/iframe.h>
 #include <arm_acle.h>
 #include <assert.h>
 #include <stdbool.h>
@@ -39,12 +40,6 @@
 
 __BEGIN_CDECLS
 
-void arm64_context_switch(vaddr_t* old_sp, vaddr_t new_sp);
-void arm64_uspace_entry(uintptr_t arg1, uintptr_t arg2,
-                        uintptr_t pc, uintptr_t sp,
-                        vaddr_t kstack, uint32_t spsr,
-                        uint32_t mdscr) __NO_RETURN;
-
 typedef struct {
     uint8_t ctype;
     bool write_through;
@@ -65,50 +60,46 @@ typedef struct {
     arm64_cache_desc_t level_inst_type[7];
 } arm64_cache_info_t;
 
-/* exception handling */
-struct arm64_iframe_long {
-    uint64_t r[30];
-    uint64_t lr;
-    uint64_t usp;
-    uint64_t elr;
-    uint64_t spsr;
-    uint64_t mdscr;
-    uint64_t pad2[1]; // Keep structure multiple of 16-bytes for stack alignment.
-};
-
-struct arm64_iframe_short {
-    uint64_t r[20];
-    // pad the short frame out so that it has the same general shape and size as a long
-    uint64_t pad[10];
-    uint64_t lr;
-    uint64_t usp;
-    uint64_t elr;
-    uint64_t spsr;
-    uint64_t pad2[2];
-};
-
-static_assert(sizeof(struct arm64_iframe_long) == sizeof(struct arm64_iframe_short), "");
-
 struct arch_exception_context {
-    struct arm64_iframe_long* frame;
+    struct iframe_t* frame;
     uint64_t far;
     uint32_t esr;
 };
 
+// Register state layout used by arm64_context_switch().
+struct arm64_context_switch_frame {
+    uint64_t tpidr_el0;
+    uint64_t tpidrro_el0;
+    uint64_t r19;
+    uint64_t r20;
+    uint64_t r21;
+    uint64_t r22;
+    uint64_t r23;
+    uint64_t r24;
+    uint64_t r25;
+    uint64_t r26;
+    uint64_t r27;
+    uint64_t r28;
+    uint64_t r29;
+    uint64_t lr;
+};
+
 struct thread;
+
+void arm64_context_switch(vaddr_t* old_sp, vaddr_t new_sp);
+void arm64_uspace_entry(iframe_t* iframe, vaddr_t kstack) __NO_RETURN;
+arm64_context_switch_frame* arm64_get_context_switch_frame(struct thread* thread);
+
 extern void arm64_el1_exception_base(void);
 void arm64_el3_to_el1(void);
-void arm64_sync_exception(struct arm64_iframe_long* iframe, uint exception_flags, uint32_t esr);
-void arm64_thread_process_pending_signals(struct arm64_iframe_long* iframe);
+void arm64_sync_exception(arm64_iframe_t* iframe, uint exception_flags, uint32_t esr);
+void arm64_thread_process_pending_signals(arm64_iframe_t* iframe);
 
-typedef struct arm64_iframe_long iframe_t;
-typedef struct arm64_iframe_short iframe;
-
-void platform_irq(iframe* frame);
-void platform_fiq(iframe* frame);
+void platform_irq(iframe_short_t* frame);
+void platform_fiq(iframe_short_t* frame);
 
 /* fpu routines */
-void arm64_fpu_exception(struct arm64_iframe_long* iframe, uint exception_flags);
+void arm64_fpu_exception(arm64_iframe_t* iframe, uint exception_flags);
 void arm64_fpu_context_switch(struct thread* oldthread, struct thread* newthread);
 
 uint64_t arm64_get_boot_el(void);

@@ -4,6 +4,8 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <ddk/metadata.h>
+#include <ddk/metadata/gpio.h>
 #include <ddk/platform-defs.h>
 #include <ddk/protocol/platform/bus.h>
 
@@ -13,6 +15,7 @@
 #include <limits.h>
 
 #include "astro.h"
+#include "astro-gpios.h"
 
 // uncomment to disable LED blinky test
 // #define GPIO_TEST 1
@@ -69,6 +72,31 @@ static const pbus_irq_t gpio_irqs[] = {
     */
 };
 
+// GPIOs to expose from generic GPIO driver.
+static const gpio_pin_t gpio_pins[] = {
+    // For wifi.
+    { S905D2_WIFI_SDIO_WAKE_HOST },
+    // For display.
+    { GPIO_PANEL_DETECT },
+    { GPIO_LCD_RESET },
+    // For touch screen.
+    { GPIO_TOUCH_INTERRUPT },
+    { GPIO_TOUCH_RESET },
+    // For light sensor.
+    { GPIO_LIGHT_INTERRUPT },
+    // For audio.
+    { GPIO_AUDIO_SOC_FAULT_L },
+    { GPIO_SOC_AUDIO_EN },
+};
+
+static const pbus_metadata_t gpio_metadata[] = {
+    {
+        .type = DEVICE_METADATA_GPIO_PINS,
+        .data_buffer = &gpio_pins,
+        .data_size = sizeof(gpio_pins),
+    }
+};
+
 static pbus_dev_t gpio_dev = {
     .name = "gpio",
     .vid = PDEV_VID_AMLOGIC,
@@ -78,6 +106,8 @@ static pbus_dev_t gpio_dev = {
     .mmio_count = countof(gpio_mmios),
     .irq_list = gpio_irqs,
     .irq_count = countof(gpio_irqs),
+    .metadata_list = gpio_metadata,
+    .metadata_count = countof(gpio_metadata),
 };
 
 zx_status_t aml_gpio_init(aml_bus_t* bus) {
@@ -91,6 +121,12 @@ zx_status_t aml_gpio_init(aml_bus_t* bus) {
     if (status != ZX_OK) {
         zxlogf(ERROR, "aml_gpio_init: device_get_protocol failed: %d\n", status);
         return status;
+    }
+
+    // Enable mute LED so it will be controlled by mute switch.
+    status = gpio_impl_config_out(&bus->gpio, S905D2_GPIOAO(11), 1);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "aml_gpio_init: gpio_impl_config_out failed: %d\n", status);
     }
 
 #if GPIO_TEST

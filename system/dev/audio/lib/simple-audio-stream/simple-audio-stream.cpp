@@ -11,21 +11,31 @@
 
 namespace audio {
 
+// Device FIDL thunks
+fuchsia_hardware_audio_Device_ops_t SimpleAudioStream::AUDIO_FIDL_THUNKS {
+    .GetChannel = [](void* ctx, fidl_txn_t* txn) -> zx_status_t {
+                        return reinterpret_cast<SimpleAudioStream*>(ctx)->GetChannel(txn);
+                   },
+};
+
 void SimpleAudioStream::Shutdown() {
-    if (domain_ != nullptr) {
-        domain_->Deactivate();
-    }
+    if (!is_shutdown_) {
+        if (domain_ != nullptr) {
+            domain_->Deactivate();
+        }
 
-    {
-        // Now that we know our domain has been deactivated, it should be safe to
-        // assert that we are holding the domain token (assuming that users of
-        // Shutdown behave in a single threaded fashion)
-        OBTAIN_EXECUTION_DOMAIN_TOKEN(t, domain_);
+        {
+            // Now that we know our domain has been deactivated, it should be safe to
+            // assert that we are holding the domain token (assuming that users of
+            // Shutdown behave in a single threaded fashion)
+            OBTAIN_EXECUTION_DOMAIN_TOKEN(t, domain_);
 
-        // Channels-to-notify should already be empty. Explicitly clear it, to be safe.
-        plug_notify_channels_.clear();
+            // Channels-to-notify should already be empty. Explicitly clear it, to be safe.
+            plug_notify_channels_.clear();
 
-        ShutdownHook();
+            ShutdownHook();
+        }
+        is_shutdown_ = true;
     }
 }
 
@@ -44,7 +54,7 @@ zx_status_t SimpleAudioStream::CreateInternal() {
             return res;
         }
         // If no subclass has set this, we need to do so here.
-        if (plug_time_ == 0) { plug_time_ = zx_clock_get(ZX_CLOCK_MONOTONIC); }
+        if (plug_time_ == 0) { plug_time_ = zx_clock_get_monotonic(); }
     }
 
     domain_ = dispatcher::ExecutionDomain::Create();
@@ -71,6 +81,7 @@ zx_status_t SimpleAudioStream::CreateInternal() {
 zx_status_t SimpleAudioStream::PublishInternal() {
     device_name_[sizeof(device_name_) - 1] = 0;
     if (!strlen(device_name_)) {
+        zxlogf(ERROR, "Zero-length device name in %s\n", __PRETTY_FUNCTION__);
         return ZX_ERR_BAD_STATE;
     }
 
@@ -93,7 +104,7 @@ void SimpleAudioStream::SetInitialPlugState(audio_pd_notify_flags_t initial_stat
     ZX_DEBUG_ASSERT((initial_state & known_flags) == initial_state);
 
     pd_flags_ = initial_state;
-    plug_time_ = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    plug_time_ = zx_clock_get_monotonic();
 }
 
 // Called by a child subclass when a dynamic plug state change occurs.
@@ -105,7 +116,7 @@ zx_status_t SimpleAudioStream::SetPlugState(bool plugged) {
 
     if (plugged) { pd_flags_ |=  AUDIO_PDNF_PLUGGED; }
     else         { pd_flags_ &= ~AUDIO_PDNF_PLUGGED; }
-    plug_time_ = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    plug_time_ = zx_clock_get_monotonic();
 
     if (pd_flags_ & AUDIO_PDNF_CAN_NOTIFY) { return NotifyPlugDetect(); }
 
@@ -154,19 +165,15 @@ void SimpleAudioStream::DdkRelease() {
     auto thiz = fbl::internal::MakeRefPtrNoAdopt(this);
 }
 
-zx_status_t SimpleAudioStream::DdkIoctl(uint32_t op, const void* in_buf, size_t in_len,
-                                        void* out_buf, size_t out_len, size_t* out_actual) {
-    // The only IOCTL we support is get channel.
-    if (op != AUDIO_IOCTL_GET_CHANNEL) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
+zx_status_t SimpleAudioStream::DdkSuspend(uint32_t flags) {
+    // TODO(voydanoff) do different things based on the flags.
+    // for now we shutdown the driver in preparation for mexec
+    Shutdown();
+    DdkRemove();
+    return ZX_OK;
+}
 
-    if ((out_buf == nullptr) ||
-        (out_actual == nullptr) ||
-        (out_len != sizeof(zx_handle_t))) {
-        return ZX_ERR_INVALID_ARGS;
-    }
-
+zx_status_t SimpleAudioStream::GetChannel(fidl_txn_t* txn) {
     fbl::AutoLock channel_lock(&channel_lock_);
 
     // Attempt to allocate a new driver channel and bind it to us.  If we don't
@@ -175,8 +182,10 @@ zx_status_t SimpleAudioStream::DdkIoctl(uint32_t op, const void* in_buf, size_t 
     // formats).
     bool privileged = (stream_channel_ == nullptr);
     auto channel = dispatcher::Channel::Create<AudioStreamChannel>();
-    if (channel == nullptr)
+    if (channel == nullptr) {
+        zxlogf(ERROR, "Could not allocate dispatcher::channel in %s\n", __PRETTY_FUNCTION__);
         return ZX_ERR_NO_MEMORY;
+    }
 
     dispatcher::Channel::ProcessHandler phandler(
         [ stream = fbl::WrapRefPtr(this), privileged ](dispatcher::Channel * channel)->zx_status_t {
@@ -202,8 +211,7 @@ zx_status_t SimpleAudioStream::DdkIoctl(uint32_t op, const void* in_buf, size_t 
             stream_channel_ = channel;
         }
 
-        *(reinterpret_cast<zx_handle_t*>(out_buf)) = client_endpoint.release();
-        *out_actual = sizeof(zx_handle_t);
+        return fuchsia_hardware_audio_DeviceGetChannel_reply(txn, client_endpoint.release());
     }
 
     return res;
@@ -245,8 +253,10 @@ zx_status_t SimpleAudioStream::ProcessStreamChannel(dispatcher::Channel* channel
         return res;
 
     if ((req_size < sizeof(req.hdr) ||
-         (req.hdr.transaction_id == AUDIO_INVALID_TRANSACTION_ID)))
+         (req.hdr.transaction_id == AUDIO_INVALID_TRANSACTION_ID))) {
+        zxlogf(ERROR, "Bad request in %s\n", __PRETTY_FUNCTION__);
         return ZX_ERR_INVALID_ARGS;
+    }
 
     // Strip the NO_ACK flag from the request before selecting the dispatch target.
     auto cmd = static_cast<audio_proto::Cmd>(req.hdr.cmd & ~AUDIO_FLAG_NO_ACK);
@@ -284,8 +294,10 @@ zx_status_t SimpleAudioStream::ProcessRingBufferChannel(dispatcher::Channel* cha
         return res;
 
     if ((req_size < sizeof(req.hdr) ||
-         (req.hdr.transaction_id == AUDIO_INVALID_TRANSACTION_ID)))
+         (req.hdr.transaction_id == AUDIO_INVALID_TRANSACTION_ID))) {
+        zxlogf(ERROR, "Bad request in %s\n", __PRETTY_FUNCTION__);
         return ZX_ERR_INVALID_ARGS;
+    }
 
     // Strip the NO_ACK flag from the request before selecting the dispatch target.
     auto cmd = static_cast<audio_proto::Cmd>(req.hdr.cmd & ~AUDIO_FLAG_NO_ACK);
@@ -376,6 +388,7 @@ zx_status_t SimpleAudioStream::OnSetStreamFormat(dispatcher::Channel* channel,
 
     // Only the privileged stream channel is allowed to change the format.
     if (!privileged) {
+        zxlogf(ERROR, "Unprivileged channel cannot SetStreamFormat\n");
         resp.result = ZX_ERR_ACCESS_DENIED;
         goto finished;
     }
@@ -392,6 +405,7 @@ zx_status_t SimpleAudioStream::OnSetStreamFormat(dispatcher::Channel* channel,
     }
 
     if (!found_one) {
+        zxlogf(ERROR, "Could not find a suitable format in %s\n", __PRETTY_FUNCTION__);
         resp.result = ZX_ERR_INVALID_ARGS;
         goto finished;
     }
@@ -419,6 +433,7 @@ zx_status_t SimpleAudioStream::OnSetStreamFormat(dispatcher::Channel* channel,
     // Actually attempt to change the format.
     resp.result = ChangeFormat(req);
     if (resp.result != ZX_OK) {
+        zxlogf(ERROR, "Could not ChangeFormat in %s\n", __PRETTY_FUNCTION__);
         goto finished;
     }
 
@@ -428,6 +443,7 @@ zx_status_t SimpleAudioStream::OnSetStreamFormat(dispatcher::Channel* channel,
         fbl::AutoLock channel_lock(&channel_lock_);
         rb_channel_ = dispatcher::Channel::Create();
         if (rb_channel_ == nullptr) {
+            zxlogf(ERROR, "Failed to create rb_channel in %s\n", __PRETTY_FUNCTION__);
             resp.result = ZX_ERR_NO_MEMORY;
         } else {
             dispatcher::Channel::ProcessHandler phandler(
@@ -448,6 +464,7 @@ zx_status_t SimpleAudioStream::OnSetStreamFormat(dispatcher::Channel* channel,
                                                 std::move(phandler),
                                                 std::move(chandler));
             if (resp.result != ZX_OK) {
+                zxlogf(ERROR, "rb_channel Activate failed in %s\n", __PRETTY_FUNCTION__);
                 rb_channel_.reset();
             }
         }

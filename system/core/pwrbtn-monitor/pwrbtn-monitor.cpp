@@ -11,22 +11,26 @@
 #include <fbl/alloc_checker.h>
 #include <fbl/array.h>
 #include <fbl/auto_call.h>
+#include <fbl/string.h>
 #include <fbl/unique_fd.h>
+#include <fuchsia/device/manager/c/fidl.h>
 #include <fuchsia/hardware/input/c/fidl.h>
 #include <hid-parser/parser.h>
 #include <hid-parser/usages.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/directory.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
 #include <lib/fdio/watcher.h>
 #include <lib/fzl/fdio.h>
-#include <zircon/device/device.h>
+#include <lib/zx/channel.h>
 #include <zircon/processargs.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
+#include <ddk/device.h>
 
 #include <utility>
 
 #define INPUT_PATH "/input"
-#define DMCTL_PATH "/misc/dmctl"
 
 namespace {
 
@@ -52,64 +56,26 @@ zx_status_t FindSystemPowerDown(const hid::DeviceDescriptor* desc,
     };
 
     // Search for the field
-    bool found = false;
-    for (size_t rpt_idx = 0; rpt_idx < desc->rep_count && !found; ++rpt_idx) {
-        const hid::ReportDescriptor& report = desc->report[rpt_idx];
-        for (size_t i = 0; i < report.count; ++i) {
-            const hid::ReportField& field = report.first_field[i];
-            if (field.type != hid::kInput || !usage_eq(field.attr.usage, power_down)) {
-                continue;
-            }
-
-            const hid::Collection* collection = hid::GetAppCollection(&field);
-            if (!collection || !usage_eq(collection->usage, system_control)) {
-                continue;
-            }
-
-            found = true;
-            *report_id = field.report_id;
-            break;
-        }
-    }
-
-    if (!found) {
-        return ZX_ERR_NOT_FOUND;
-    }
-
-    // Compute the offset of the field.  Since reports may be discontinuous, we
-    // have to search from the beginning.
-    *bit_offset = 0;
     for (size_t rpt_idx = 0; rpt_idx < desc->rep_count; ++rpt_idx) {
         const hid::ReportDescriptor& report = desc->report[rpt_idx];
-        if (report.report_id != *report_id) {
-            continue;
-        }
 
-        for (size_t i = 0; i < report.count; ++i) {
-            const hid::ReportField& field = report.first_field[i];
-            if (field.type != hid::kInput) {
-                continue;
-            }
+        for (size_t i = 0; i < report.input_count; ++i) {
+            const hid::ReportField& field = report.input_fields[i];
 
-            *bit_offset += field.attr.bit_sz;
-
-            // Check if we found the field again, and if so return.
             if (!usage_eq(field.attr.usage, power_down)) {
                 continue;
             }
+
             const hid::Collection* collection = hid::GetAppCollection(&field);
             if (!collection || !usage_eq(collection->usage, system_control)) {
                 continue;
             }
-
-            // Subtract out the field, since we want its start not its end.
-            *bit_offset -= field.attr.bit_sz;
+            *report_id = field.report_id;
+            *bit_offset = field.attr.offset;
             return ZX_OK;
         }
     }
-
-    // Should be unreachable
-    return ZX_ERR_INTERNAL;
+    return ZX_ERR_NOT_FOUND;
 }
 
 struct PowerButtonInfo {
@@ -179,6 +145,33 @@ static zx_status_t InputDeviceAdded(int dirfd, int event, const char* name, void
     return ZX_ERR_STOP;
 }
 
+zx_status_t send_poweroff() {
+    zx::channel channel_local, channel_remote;
+    zx_status_t status = zx::channel::create(0, &channel_local, &channel_remote);
+    if (status != ZX_OK) {
+        printf("failed to create channel: %d\n", status);
+        return ZX_ERR_INTERNAL;
+    }
+
+    const char* service = "/svc/" fuchsia_device_manager_Administrator_Name;
+    status = fdio_service_connect(service, channel_remote.get());
+    if (status != ZX_OK) {
+        fprintf(stderr, "failed to connect to service %s: %d\n", service, status);
+        return ZX_ERR_INTERNAL;
+    }
+
+    zx_status_t call_status;
+    status = fuchsia_device_manager_AdministratorSuspend(channel_local.get(),
+                                                         DEVICE_SUSPEND_FLAG_POWEROFF,
+                                                         &call_status);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        fprintf(stderr, "Call to %s failed: ret: %d  remote: %d\n", service, status, call_status);
+        return status != ZX_OK ? status : call_status;
+    }
+
+    return ZX_OK;
+}
+
 } // namespace
 
 int main(int argc, char**argv) {
@@ -244,13 +237,11 @@ int main(int argc, char**argv) {
 
         // Check if the power button is pressed, and request a poweroff if so.
         if (report[byte_index] & (1u << (info.bit_offset % 8))) {
-            int fd = open(DMCTL_PATH, O_WRONLY);
-            if (fd < 0) {
-                printf("pwrbtn-monitor: input-watcher: failed to open dmctl\n");
+            auto status = send_poweroff();
+            if (status != ZX_OK) {
+                printf("pwrbtn-monitor: input-watcher: failed send poweroff to device manager.\n");
                 continue;
             }
-            write(fd, "poweroff", strlen("poweroff"));
-            close(fd);
         }
     }
 }

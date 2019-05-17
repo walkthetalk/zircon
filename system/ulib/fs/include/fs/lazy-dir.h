@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FS_LAZY_DIR_H_
+#define FS_LAZY_DIR_H_
 
 #include "vnode.h"
 #include <fbl/function.h>
@@ -40,6 +41,8 @@ public:
     // if the "." entry has been returned. All IDs other than 0 are valid.
     zx_status_t Readdir(vdircookie_t* cookie, void* dirents, size_t len, size_t* out_actual) final;
     zx_status_t Lookup(fbl::RefPtr<fs::Vnode>* out_vnode, fbl::StringPiece name) final;
+    bool IsDirectory() const final { return true; }
+    zx_status_t GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) final;
 
 protected:
     // Get the contents of the directory in an output vector.
@@ -50,3 +53,5 @@ protected:
 };
 
 } // namespace fs
+
+#endif // FS_LAZY_DIR_H_

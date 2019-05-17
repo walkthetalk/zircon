@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef FBL_MUTEX_H_
+#define FBL_MUTEX_H_
 
 #ifdef __cplusplus
 
@@ -17,41 +18,9 @@
 // automatically initializing and destroying the internal mutex object.
 #if _KERNEL
 #include <kernel/mutex.h>
-#include <sys/types.h>
 
 namespace fbl {
-
-class __TA_CAPABILITY("mutex") Mutex {
-public:
-    constexpr Mutex() = default;
-    ~Mutex() = default;
-    void Acquire() __TA_ACQUIRE() { mutex_acquire(&mutex_); }
-    void Release() __TA_RELEASE() { mutex_release(&mutex_); }
-
-    bool IsHeld() const {
-        return is_mutex_held(&mutex_);
-    }
-
-    mutex_t* GetInternal() __TA_RETURN_CAPABILITY(mutex_) {
-        return &mutex_;
-    }
-
-    // suppress default constructors
-    DISALLOW_COPY_ASSIGN_AND_MOVE(Mutex);
-
-private:
-    mutex_t mutex_;
-};
-
-class __TA_CAPABILITY("mutex") NullMutex {
-public:
-    constexpr NullMutex() = default;
-    void Acquire() __TA_ACQUIRE() { }
-    void Release() __TA_RELEASE() { }
-
-    DISALLOW_COPY_ASSIGN_AND_MOVE(NullMutex);
-};
-
+using Mutex = ::Mutex;
 } // namespace fbl
 
 #else   // if _KERNEL
@@ -93,3 +62,5 @@ private:
 
 #endif  // if _KERNEL
 #endif  // ifdef __cplusplus
+
+#endif  // FBL_MUTEX_H_

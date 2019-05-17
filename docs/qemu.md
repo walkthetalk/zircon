@@ -1,7 +1,7 @@
 # QEMU
 
 Zircon can [run under
-emulation](https://fuchsia.googlesource.com/docs/+/master/getting_started.md#Boot-from-QEMU)
+emulation](https://fuchsia.googlesource.com/fuchsia/+/master/docs/getting_started.md#Boot-from-QEMU)
 using QEMU. QEMU can either be installed via prebuilt binaries, or built
 locally.
 
@@ -75,8 +75,7 @@ create a persistent tun/tap device ahead of time (which does require you be root
 On Linux:
 
 ```
-sudo apt-get install uml-utilities
-sudo tunctl -u $USER -t qemu
+sudo ip tuntap add dev qemu mode tap user $USER
 sudo ifconfig qemu up
 ```
 
@@ -272,4 +271,4 @@ directory and anyone should be able to restore your state and start to poke
 at stuff from the QEMU console.
 
 
-[minfs-create-image]: https://fuchsia.googlesource.com/zircon/+/master/docs/minfs.md#Host-Device-QEMU-Only
+[minfs-create-image]: https://fuchsia.googlesource.com/fuchsia/+/master/zircon/docs/minfs.md#Host-Device-QEMU-Only

@@ -5,6 +5,7 @@
 #include <audio-proto-utils/format-utils.h>
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <ddk/protocol/composite.h>
 #include <ddk/protocol/platform-device-lib.h>
 #include <lib/zx/vmar.h>
 #include <limits>
@@ -19,6 +20,19 @@
 namespace audio {
 namespace gauss {
 
+enum {
+    COMPONENT_PDEV,
+    COMPONENT_I2C,
+    COMPONENT_COUNT,
+};
+
+// Device FIDL thunks
+fuchsia_hardware_audio_Device_ops_t TdmOutputStream::AUDIO_FIDL_THUNKS {
+    .GetChannel = [](void* ctx, fidl_txn_t* txn) -> zx_status_t {
+                        return reinterpret_cast<TdmOutputStream*>(ctx)->GetChannel(txn);
+                   },
+};
+
 #define RegOffset(field) offsetof(aml_tdm_regs_t, field)
 
 TdmOutputStream::~TdmOutputStream() {}
@@ -32,7 +46,22 @@ zx_status_t TdmOutputStream::Create(zx_device_t* parent) {
     auto stream = fbl::AdoptRef(
         new TdmOutputStream(parent, std::move(domain)));
 
-    zx_status_t res = device_get_protocol(parent, ZX_PROTOCOL_PDEV, &stream->pdev_);
+    composite_protocol_t composite;
+    zx_status_t res = device_get_protocol(parent, ZX_PROTOCOL_COMPOSITE, &composite);
+    if (res != ZX_OK) {
+        zxlogf(ERROR, "Could not get composite protocol\n");
+        return res;
+    }
+
+    zx_device_t* components[COMPONENT_COUNT]; 
+    size_t actual;
+    composite_get_components(&composite, components, fbl::count_of(components), &actual);
+    if (actual != countof(components)) {
+        zxlogf(ERROR, "could not get components\n");
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    res = device_get_protocol(components[COMPONENT_PDEV], ZX_PROTOCOL_PDEV, &stream->pdev_);
     if (res != ZX_OK) {
         return res;
     }
@@ -56,7 +85,7 @@ zx_status_t TdmOutputStream::Create(zx_device_t* parent) {
     //Sleep to let clocks stabilize in amps.
     zx_nanosleep(zx_deadline_after(ZX_MSEC(20)));
 
-    res = device_get_protocol(parent, ZX_PROTOCOL_I2C, &stream->i2c_);
+    res = device_get_protocol(components[COMPONENT_I2C], ZX_PROTOCOL_I2C, &stream->i2c_);
     if ( res != ZX_OK) {
         zxlogf(ERROR,"tdm-output-driver: failed to acquire i2c\n");
         return res;
@@ -181,23 +210,7 @@ void TdmOutputStream::DdkRelease() {
     auto thiz = fbl::internal::MakeRefPtrNoAdopt(this);
 }
 
-zx_status_t TdmOutputStream::DdkIoctl(uint32_t op,
-                                      const void* in_buf,
-                                      size_t in_len,
-                                      void* out_buf,
-                                      size_t out_len,
-                                      size_t* out_actual) {
-    // The only IOCTL we support is get channel.
-    if (op != AUDIO_IOCTL_GET_CHANNEL) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    if ((out_buf == nullptr) ||
-        (out_actual == nullptr) ||
-        (out_len != sizeof(zx_handle_t))) {
-        return ZX_ERR_INVALID_ARGS;
-    }
-
+zx_status_t TdmOutputStream::GetChannel(fidl_txn_t* txn) {
     fbl::AutoLock lock(&lock_);
 
     // Attempt to allocate a new driver channel and bind it to us.  If we don't
@@ -235,8 +248,7 @@ zx_status_t TdmOutputStream::DdkIoctl(uint32_t op,
             stream_channel_ = channel;
         }
 
-        *(reinterpret_cast<zx_handle_t*>(out_buf)) = client_endpoint.release();
-        *out_actual = sizeof(zx_handle_t);
+        return fuchsia_hardware_audio_DeviceGetChannel_reply(txn, client_endpoint.release());
     }
 
     return res;

@@ -18,11 +18,24 @@
 #include <lib/async/dispatcher.h>
 #endif
 
+#include <minfs/bcache.h>
 #include <minfs/format.h>
 
 #include <utility>
 
 namespace minfs {
+
+// Controls the validation-checking performed by minfs when loading
+// structures from disk.
+enum class IntegrityCheck {
+    // Do not attempt to validate structures on load. This is useful
+    // for inspection tools, which do not depend on the correctness
+    // of on-disk structures.
+    kNone,
+    // Validate structures (locally) before usage. This is the
+    // recommended option for mounted filesystems.
+    kAll,
+};
 
 struct MountOptions {
     bool readonly;
@@ -49,7 +62,7 @@ inline zx_status_t Mkfs(fbl::unique_ptr<Bcache> bc) {
 // This function does not start the async_dispatcher_t object owned by |vfs|;
 // requests will not be dispatched if that async_dispatcher_t object is not
 // active.
-zx_status_t MountAndServe(const MountOptions* options, async_dispatcher_t* dispatcher,
+zx_status_t MountAndServe(const MountOptions& options, async_dispatcher_t* dispatcher,
                           fbl::unique_ptr<Bcache> bc, zx::channel mount_channel,
                           fbl::Closure on_unmount);
 #endif

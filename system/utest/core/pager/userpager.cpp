@@ -5,6 +5,7 @@
 #include <atomic>
 #include <fbl/algorithm.h>
 #include <fbl/array.h>
+#include <fbl/auto_call.h>
 #include <lib/zx/vmar.h>
 #include <string.h>
 #include <zircon/process.h>
@@ -36,6 +37,42 @@ bool Vmo::CheckVmar(uint64_t offset, uint64_t len, const void* expected) {
     return true;
 }
 
+bool Vmo::CheckVmo(uint64_t offset, uint64_t len, const void* expected) {
+    len *= ZX_PAGE_SIZE;
+    offset *= ZX_PAGE_SIZE;
+
+    zx::vmo tmp_vmo;
+    zx_vaddr_t buf = 0;
+
+    if (zx::vmo::create(len, ZX_VMO_RESIZABLE, &tmp_vmo) != ZX_OK) {
+        return false;
+    }
+
+    if (zx::vmar::root_self()->map(0, tmp_vmo, 0, len,
+                                   ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, &buf) != ZX_OK) {
+        return false;
+    }
+
+    auto unmap = fbl::MakeAutoCall([&]() {
+        zx_vmar_unmap(zx_vmar_root_self(), buf, len);
+    });
+
+    if (vmo_.read(reinterpret_cast<void*>(buf), offset, len) != ZX_OK) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < len / sizeof(uint64_t); i++) {
+        auto data_buf = reinterpret_cast<uint64_t*>(buf);
+        auto expected_buf = static_cast<const uint64_t*>(expected);
+        if (data_buf[i] != (expected
+                    ? expected_buf[i] : base_val_ + (offset / sizeof(uint64_t)) + i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool Vmo::OpRange(uint32_t op, uint64_t offset, uint64_t len) {
     return vmo_.op_range(op, offset * ZX_PAGE_SIZE, len * ZX_PAGE_SIZE, nullptr, 0) == ZX_OK;
 }
@@ -51,7 +88,8 @@ void Vmo::GenerateBufferContents(void* dest_buffer, uint64_t len, uint64_t paged
 
 fbl::unique_ptr<Vmo> Vmo::Clone() {
     zx::vmo clone;
-    if (vmo_.clone(ZX_VMO_CLONE_COPY_ON_WRITE, 0, size_, &clone) != ZX_OK) {
+    if (vmo_.create_child(ZX_VMO_CHILD_COPY_ON_WRITE | ZX_VMO_CHILD_RESIZABLE,
+                          0, size_, &clone) != ZX_OK) {
         return nullptr;
     }
 
@@ -70,19 +108,16 @@ UserPager::~UserPager() {
         auto vmo = vmos_.pop_front();
         zx::vmar::root_self()->unmap(vmo->base_addr_, vmo->size_);
     }
-    zx_handle_close(port_);
-    zx_handle_close(pager_);
 }
 
 bool UserPager::Init() {
-    return zx_pager_create(0, &pager_) == ZX_OK && zx_port_create(0, &port_) == ZX_OK;
+    return zx::pager::create(0, &pager_) == ZX_OK && zx::port::create(0, &port_) == ZX_OK;
 }
 
 bool UserPager::CreateVmo(uint64_t size, Vmo** vmo_out) {
     zx::vmo vmo;
     size *= ZX_PAGE_SIZE;
-    if (zx_pager_create_vmo(pager_, 0, port_, next_base_, size,
-                            vmo.reset_and_get_address()) != ZX_OK) {
+    if (pager_.create_vmo(ZX_VMO_RESIZABLE, port_, next_base_, size, &vmo) != ZX_OK) {
         return false;
     }
 
@@ -110,8 +145,7 @@ bool UserPager::UnmapVmo(Vmo* vmo) {
 bool UserPager::ReplaceVmo(Vmo* vmo, zx::vmo* old_vmo) {
     zx::vmo new_vmo;
     zx_status_t s;
-    if ((s = zx_pager_create_vmo(pager_, 0, port_, next_base_, vmo->size_,
-                                 new_vmo.reset_and_get_address())) != ZX_OK) {
+    if ((s = pager_.create_vmo(0, port_, next_base_, vmo->size_, &new_vmo)) != ZX_OK) {
         return false;
     }
 
@@ -139,7 +173,7 @@ bool UserPager::ReplaceVmo(Vmo* vmo, zx::vmo* old_vmo) {
 }
 
 bool UserPager::DetachVmo(Vmo* vmo) {
-    return zx_pager_detach_vmo(pager_, vmo->vmo_.get()) == ZX_OK;
+    return pager_.detach_vmo(vmo->vmo()) == ZX_OK;
 }
 
 void UserPager::ReleaseVmo(Vmo* vmo) {
@@ -211,13 +245,13 @@ bool UserPager::WaitForRequest(fbl::Function<bool(const zx_port_packet_t& packet
         zx_port_packet_t actual_packet;
         // TODO: this can block forever if the thread that's
         // supposed to generate the request unexpectedly dies.
-        zx_status_t status = zx_port_wait(port_, deadline, &actual_packet);
+        zx_status_t status = port_.wait(zx::time(deadline), &actual_packet);
         if (status == ZX_OK) {
             if (cmp_fn(actual_packet)) {
                 return true;
             }
 
-            auto req = fbl::make_unique<request>();
+            auto req = std::make_unique<request>();
             req->req = actual_packet;
             requests_.push_front(std::move(req));
         } else {
@@ -253,9 +287,9 @@ bool UserPager::SupplyPages(Vmo* paged_vmo, uint64_t dest_offset,
 bool UserPager::SupplyPages(Vmo* paged_vmo, uint64_t dest_offset,
                             uint64_t length, zx::vmo src, uint64_t src_offset) {
     zx_status_t status;
-    if ((status = zx_pager_supply_pages(pager_, paged_vmo->vmo_.get(),
-                                        dest_offset * ZX_PAGE_SIZE, length * ZX_PAGE_SIZE,
-                                        src.get(), src_offset * ZX_PAGE_SIZE)) != ZX_OK) {
+    if ((status = pager_.supply_pages(paged_vmo->vmo_,
+                                      dest_offset * ZX_PAGE_SIZE, length * ZX_PAGE_SIZE,
+                                      src, src_offset * ZX_PAGE_SIZE)) != ZX_OK) {
         return false;
     }
     return true;

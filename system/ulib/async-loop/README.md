@@ -1,7 +1,7 @@
 # libasync-loop and libasync-loop-cpp
 
 This library provides a general-purpose thread-safe message loop
-implementation declared in [async/loop.h](include/async/loop.h).
+implementation declared in [async-loop/loop.h](include/lib/async-loop/loop.h).
 It must be statically linked into clients that want to use this particular
 message loop implementation.  Note that clients can implement their own
 asynchronous dispatchers instead if they have more specialized needs.
@@ -32,7 +32,7 @@ See [async/loop.h](include/async/loop.h) for details.
 static async_loop_t* g_loop;
 
 int main(int argc, char** argv) {
-    async_loop_create(&kAsyncLoopConfigAttachToCurrentThread, &g_loop);
+    async_loop_create(&kAsyncLoopConfigAttachToThread, &g_loop);
 
     do_stuff();
 

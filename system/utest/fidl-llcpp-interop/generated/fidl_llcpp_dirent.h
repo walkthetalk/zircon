@@ -5,9 +5,11 @@
 #include <lib/fidl/internal.h>
 #include <lib/fidl/cpp/vector_view.h>
 #include <lib/fidl/cpp/string_view.h>
-#include <lib/fidl/llcpp/array_wrapper.h>
+#include <lib/fidl/llcpp/array.h>
 #include <lib/fidl/llcpp/coding.h>
 #include <lib/fidl/llcpp/traits.h>
+#include <lib/fidl/llcpp/transaction.h>
+#include <lib/fit/function.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/eventpair.h>
 #include <zircon/fidl.h>
@@ -20,9 +22,9 @@ namespace dirent {
 struct DirEnt;
 class DirEntTestInterface;
 
-constexpr uint32_t SMALL_DIR_VECTOR_SIZE = 3;
+constexpr uint32_t TEST_MAX_PATH = 10u;
 
-constexpr uint32_t TEST_MAX_PATH = 10;
+constexpr uint32_t SMALL_DIR_VECTOR_SIZE = 3u;
 
 extern "C" const fidl_type_t fidl_test_llcpp_dirent_DirEntTable;
 
@@ -52,7 +54,7 @@ extern "C" const fidl_type_t fidl_test_llcpp_dirent_DirEntTestInterfaceOneWayDir
 class DirEntTestInterface final {
  public:
 
-  struct CountNumDirectoriesResponse {
+  struct CountNumDirectoriesResponse final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     int64_t num_dir;
@@ -62,7 +64,7 @@ class DirEntTestInterface final {
     static constexpr uint32_t PrimarySize = 24;
     static constexpr uint32_t MaxOutOfLine = 0;
   };
-  struct CountNumDirectoriesRequest {
+  struct CountNumDirectoriesRequest final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     ::fidl::VectorView<DirEnt> dirents;
@@ -74,7 +76,7 @@ class DirEntTestInterface final {
     using ResponseType = CountNumDirectoriesResponse;
   };
 
-  struct ReadDirResponse {
+  struct ReadDirResponse final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     ::fidl::VectorView<DirEnt> dirents;
@@ -87,7 +89,7 @@ class DirEntTestInterface final {
   using ReadDirRequest = ::fidl::AnyZeroArgMessage;
 
   using ConsumeDirectoriesResponse = ::fidl::AnyZeroArgMessage;
-  struct ConsumeDirectoriesRequest {
+  struct ConsumeDirectoriesRequest final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     ::fidl::VectorView<DirEnt> dirents;
@@ -98,7 +100,7 @@ class DirEntTestInterface final {
     static constexpr uint32_t MaxOutOfLine = 144;
   };
 
-  struct OnDirentsResponse {
+  struct OnDirentsResponse final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     ::fidl::VectorView<DirEnt> dirents;
@@ -108,7 +110,7 @@ class DirEntTestInterface final {
     static constexpr uint32_t PrimarySize = 32;
     static constexpr uint32_t MaxOutOfLine = 48000;
   };
-  struct OneWayDirentsRequest {
+  struct OneWayDirentsRequest final {
     FIDL_ALIGNDECL
     fidl_message_header_t _hdr;
     ::fidl::VectorView<DirEnt> dirents;
@@ -121,6 +123,15 @@ class DirEntTestInterface final {
   };
 
 
+  struct EventHandlers {
+    // Event
+    fit::function<zx_status_t(::fidl::VectorView<DirEnt> dirents)> on_dirents;
+
+    // Fallback handler when an unknown ordinal is received.
+    // Caller may put custom error handling logic here.
+    fit::function<zx_status_t()> unknown;
+  };
+
   class SyncClient final {
    public:
     SyncClient(::zx::channel channel) : channel_(std::move(channel)) {}
@@ -132,7 +143,8 @@ class DirEntTestInterface final {
 
     // Iterate over the dirents and return the number of directories within them.
     // Caller provides the backing storage for FIDL message via request and response buffers.
-    zx_status_t CountNumDirectories(::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents, ::fidl::BytePart _response_buffer, int64_t* out_num_dir);
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    ::fidl::DecodeResult<CountNumDirectoriesResponse> CountNumDirectories(::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents, ::fidl::BytePart _response_buffer, int64_t* out_num_dir);
 
     // Iterate over the dirents and return the number of directories within them.
     // Messages are encoded and decoded in-place.
@@ -141,7 +153,8 @@ class DirEntTestInterface final {
 
     // Return a vector of dirents. Empty request. Response may stack-allocate.
     // Caller provides the backing storage for FIDL message via request and response buffers.
-    zx_status_t ReadDir(::fidl::BytePart _response_buffer, ::fidl::VectorView<DirEnt>* out_dirents);
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    ::fidl::DecodeResult<ReadDirResponse> ReadDir(::fidl::BytePart _response_buffer, ::fidl::VectorView<DirEnt>* out_dirents);
 
     // Return a vector of dirents. Empty request. Response may stack-allocate.
     // Messages are encoded and decoded in-place.
@@ -152,7 +165,8 @@ class DirEntTestInterface final {
 
     // Consume dirents. Empty response. Request may stack-allocate.
     // Caller provides the backing storage for FIDL message via request and response buffers.
-    zx_status_t ConsumeDirectories(::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents);
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    ::fidl::DecodeResult<ConsumeDirectoriesResponse> ConsumeDirectories(::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents);
 
     // Consume dirents. Empty response. Request may stack-allocate.
     // Messages are encoded and decoded in-place.
@@ -172,9 +186,156 @@ class DirEntTestInterface final {
     // Messages are encoded and decoded in-place.
     zx_status_t OneWayDirents(::fidl::DecodedMessage<OneWayDirentsRequest> params);
 
+    // Handle all possible events defined in this protocol.
+    // Blocks to consume exactly one message from the channel, then call the corresponding handler
+    // defined in |EventHandlers|. The return status of the handler function is folded with any
+    // transport-level errors and returned.
+    zx_status_t HandleEvents(EventHandlers handlers);
    private:
     ::zx::channel channel_;
   };
+
+  // Methods to make a sync FIDL call directly on an unowned channel, avoiding setting up a client.
+  class Call final {
+   public:
+
+    // Iterate over the dirents and return the number of directories within them.
+    static zx_status_t CountNumDirectories(zx::unowned_channel _client_end, ::fidl::VectorView<DirEnt> dirents, int64_t* out_num_dir);
+
+    // Iterate over the dirents and return the number of directories within them.
+    // Caller provides the backing storage for FIDL message via request and response buffers.
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    static ::fidl::DecodeResult<CountNumDirectoriesResponse> CountNumDirectories(zx::unowned_channel _client_end, ::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents, ::fidl::BytePart _response_buffer, int64_t* out_num_dir);
+
+    // Iterate over the dirents and return the number of directories within them.
+    // Messages are encoded and decoded in-place.
+    static ::fidl::DecodeResult<CountNumDirectoriesResponse> CountNumDirectories(zx::unowned_channel _client_end, ::fidl::DecodedMessage<CountNumDirectoriesRequest> params, ::fidl::BytePart response_buffer);
+
+
+    // Return a vector of dirents. Empty request. Response may stack-allocate.
+    // Caller provides the backing storage for FIDL message via request and response buffers.
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    static ::fidl::DecodeResult<ReadDirResponse> ReadDir(zx::unowned_channel _client_end, ::fidl::BytePart _response_buffer, ::fidl::VectorView<DirEnt>* out_dirents);
+
+    // Return a vector of dirents. Empty request. Response may stack-allocate.
+    // Messages are encoded and decoded in-place.
+    static ::fidl::DecodeResult<ReadDirResponse> ReadDir(zx::unowned_channel _client_end, ::fidl::BytePart response_buffer);
+
+    // Consume dirents. Empty response. Request may stack-allocate.
+    static zx_status_t ConsumeDirectories(zx::unowned_channel _client_end, ::fidl::VectorView<DirEnt> dirents);
+
+    // Consume dirents. Empty response. Request may stack-allocate.
+    // Caller provides the backing storage for FIDL message via request and response buffers.
+    // The lifetime of handles in the response, unless moved, is tied to the returned RAII object.
+    static ::fidl::DecodeResult<ConsumeDirectoriesResponse> ConsumeDirectories(zx::unowned_channel _client_end, ::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents);
+
+    // Consume dirents. Empty response. Request may stack-allocate.
+    // Messages are encoded and decoded in-place.
+    static zx_status_t ConsumeDirectories(zx::unowned_channel _client_end, ::fidl::DecodedMessage<ConsumeDirectoriesRequest> params);
+
+    // Binding will not wait for response.
+    // But here we send an eventpair which the server will signal upon receipt of message.
+    static zx_status_t OneWayDirents(zx::unowned_channel _client_end, ::fidl::VectorView<DirEnt> dirents, ::zx::eventpair ep);
+
+    // Binding will not wait for response.
+    // But here we send an eventpair which the server will signal upon receipt of message.
+    // Caller provides the backing storage for FIDL message via request and response buffers.
+    static zx_status_t OneWayDirents(zx::unowned_channel _client_end, ::fidl::BytePart _request_buffer, ::fidl::VectorView<DirEnt> dirents, ::zx::eventpair ep);
+
+    // Binding will not wait for response.
+    // But here we send an eventpair which the server will signal upon receipt of message.
+    // Messages are encoded and decoded in-place.
+    static zx_status_t OneWayDirents(zx::unowned_channel _client_end, ::fidl::DecodedMessage<OneWayDirentsRequest> params);
+
+    // Handle all possible events defined in this protocol.
+    // Blocks to consume exactly one message from the channel, then call the corresponding handler
+    // defined in |EventHandlers|. The return status of the handler function is folded with any
+    // transport-level errors and returned.
+    static zx_status_t HandleEvents(zx::unowned_channel client_end, EventHandlers handlers);
+  };
+
+  // Pure-virtual interface to be implemented by a server.
+  class Interface {
+   public:
+    Interface() = default;
+    virtual ~Interface() = default;
+    using _Outer = DirEntTestInterface;
+    using _Base = ::fidl::CompleterBase;
+
+    class CountNumDirectoriesCompleterBase : public _Base {
+     public:
+      void Reply(int64_t num_dir);
+      void Reply(::fidl::BytePart _buffer, int64_t num_dir);
+      void Reply(::fidl::DecodedMessage<CountNumDirectoriesResponse> params);
+
+     protected:
+      using ::fidl::CompleterBase::CompleterBase;
+    };
+
+    using CountNumDirectoriesCompleter = ::fidl::Completer<CountNumDirectoriesCompleterBase>;
+
+    virtual void CountNumDirectories(::fidl::VectorView<DirEnt> dirents, CountNumDirectoriesCompleter::Sync _completer) = 0;
+
+    class ReadDirCompleterBase : public _Base {
+     public:
+      void Reply(::fidl::VectorView<DirEnt> dirents);
+      void Reply(::fidl::BytePart _buffer, ::fidl::VectorView<DirEnt> dirents);
+      void Reply(::fidl::DecodedMessage<ReadDirResponse> params);
+
+     protected:
+      using ::fidl::CompleterBase::CompleterBase;
+    };
+
+    using ReadDirCompleter = ::fidl::Completer<ReadDirCompleterBase>;
+
+    virtual void ReadDir(ReadDirCompleter::Sync _completer) = 0;
+
+    class ConsumeDirectoriesCompleterBase : public _Base {
+     public:
+      void Reply();
+
+     protected:
+      using ::fidl::CompleterBase::CompleterBase;
+    };
+
+    using ConsumeDirectoriesCompleter = ::fidl::Completer<ConsumeDirectoriesCompleterBase>;
+
+    virtual void ConsumeDirectories(::fidl::VectorView<DirEnt> dirents, ConsumeDirectoriesCompleter::Sync _completer) = 0;
+
+    using OneWayDirentsCompleter = ::fidl::Completer<>;
+
+    virtual void OneWayDirents(::fidl::VectorView<DirEnt> dirents, ::zx::eventpair ep, OneWayDirentsCompleter::Sync _completer) = 0;
+
+  };
+
+  // Attempts to dispatch the incoming message to a handler function in the server implementation.
+  // If there is no matching handler, it returns false, leaving the message and transaction intact.
+  // In all other cases, it consumes the message and returns true.
+  // It is possible to chain multiple TryDispatch functions in this manner.
+  static bool TryDispatch(Interface* impl, fidl_msg_t* msg, ::fidl::Transaction* txn);
+
+  // Dispatches the incoming message to one of the handlers functions in the interface.
+  // If there is no matching handler, it closes all the handles in |msg| and closes the channel with
+  // a |ZX_ERR_NOT_SUPPORTED| epitaph, before returning false. The message should then be discarded.
+  static bool Dispatch(Interface* impl, fidl_msg_t* msg, ::fidl::Transaction* txn);
+
+  // Same as |Dispatch|, but takes a |void*| instead of |Interface*|. Only used with |fidl::Bind|
+  // to reduce template expansion.
+  // Do not call this method manually. Use |Dispatch| instead.
+  static bool TypeErasedDispatch(void* impl, fidl_msg_t* msg, ::fidl::Transaction* txn) {
+    return Dispatch(static_cast<Interface*>(impl), msg, txn);
+  }
+
+  // Event
+  static zx_status_t SendOnDirentsEvent(::zx::unowned_channel _chan, ::fidl::VectorView<DirEnt> dirents);
+
+  // Event
+  // Caller provides the backing storage for FIDL message via response buffers.
+  static zx_status_t SendOnDirentsEvent(::zx::unowned_channel _chan, ::fidl::BytePart _buffer, ::fidl::VectorView<DirEnt> dirents);
+
+  // Event
+  // Messages are encoded in-place.
+  static zx_status_t SendOnDirentsEvent(::zx::unowned_channel _chan, ::fidl::DecodedMessage<OnDirentsResponse> params);
 
 };
 

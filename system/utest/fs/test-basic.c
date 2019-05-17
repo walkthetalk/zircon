@@ -10,7 +10,9 @@
 #include <unistd.h>
 
 #include <lib/fdio/limits.h>
-#include <lib/fdio/util.h>
+#include <lib/fdio/fd.h>
+#include <lib/fdio/fdio.h>
+#include <lib/fdio/directory.h>
 #include <unittest/unittest.h>
 #include <zircon/syscalls.h>
 
@@ -31,21 +33,6 @@ bool test_basic(void) {
     ASSERT_EQ(write(fd1, "Hello, World!\n", 14), 14, "");
     ASSERT_EQ(close(fd1), 0, "");
     ASSERT_EQ(close(fd2), 0, "");
-
-    // test pipelined opens
-    // the open itself will always succeed if the remote side exists,
-    // but we'll get an error when we try to do an operation on the file
-    fd1 = open("::alpha/bravo/charlie/delta/echo/foxtrot", O_RDONLY | O_PIPELINE, 0644);
-    ASSERT_GT(fd1, 0, "");
-    char tmp[14];
-    ASSERT_EQ(read(fd1, tmp, 14), 14, "");
-    ASSERT_EQ(close(fd1), 0, "");
-    ASSERT_EQ(memcmp(tmp, "Hello, World!\n", 14), 0, "");
-
-    fd1 = open("::alpha/banana", O_RDONLY | O_PIPELINE, 0644);
-    ASSERT_GT(fd1, 0, "");
-    ASSERT_EQ(read(fd1, tmp, 14), -1, "");
-    ASSERT_EQ(close(fd1), -1, "");
 
     fd1 = open("::file.txt", O_CREAT | O_RDWR, 0644);
     ASSERT_GT(fd1, 0, "");
@@ -80,12 +67,12 @@ bool test_unclean_close(void) {
     // Try closing a connection to a file with an "unclean" shutdown,
     // noticed by the filesystem server as a closed handle rather than
     // an explicit "Close" call.
-    zx_handle_t handles[FDIO_MAX_HANDLES];
-    uint32_t types[FDIO_MAX_HANDLES];
-    zx_status_t r = fdio_transfer_fd(fd, 0, handles, types);
+    zx_handle_t handle = ZX_HANDLE_INVALID;
+    fdio_fd_transfer(fd, &handle);
+    // TODO: Should we check the status returned by fdio_fd_transfer?
     ASSERT_GE(fd, 0, "");
-    for (size_t i = 0; i < (size_t) r; i++) {
-        ASSERT_EQ(zx_handle_close(handles[i]), ZX_OK, "");
+    if (handle != ZX_HANDLE_INVALID) {
+        ASSERT_EQ(zx_handle_close(handle), ZX_OK, "");
     }
 
     ASSERT_EQ(unlink("::foobar"), 0, "");

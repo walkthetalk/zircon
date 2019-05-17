@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include <object/dispatcher.h>
+#include <object/handle.h>
 
 #include <zircon/rights.h>
 #include <zircon/types.h>
@@ -21,8 +22,8 @@
 class FifoDispatcher final : public PeeredDispatcher<FifoDispatcher, ZX_DEFAULT_FIFO_RIGHTS> {
 public:
     static zx_status_t Create(size_t elem_count, size_t elem_size, uint32_t options,
-                              fbl::RefPtr<Dispatcher>* dispatcher0,
-                              fbl::RefPtr<Dispatcher>* dispatcher1,
+                              KernelHandle<FifoDispatcher>* handle0,
+                              KernelHandle<FifoDispatcher>* handle1,
                               zx_rights_t* rights);
 
     ~FifoDispatcher() final;
@@ -47,7 +48,6 @@ private:
                                 size_t* actual) TA_REQ(get_lock());
     zx_status_t UserSignalSelfLocked(uint32_t clear_mask, uint32_t set_mask) TA_REQ(get_lock());
 
-    fbl::Canary<fbl::magic("FIFO")> canary_;
     const uint32_t elem_count_;
     const uint32_t elem_size_;
     const uint32_t mask_;

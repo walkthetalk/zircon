@@ -5,6 +5,7 @@
 #include <ddktl/pdev.h>
 
 #include <ddk/debug.h>
+#include <lib/mmio/mmio.h>
 
 namespace ddk {
 
@@ -15,7 +16,6 @@ void PDev::ShowInfo() {
         zxlogf(INFO, "mmio count          = %d\n", info.mmio_count);
         zxlogf(INFO, "irq count           = %d\n", info.irq_count);
         zxlogf(INFO, "gpio count          = %d\n", info.gpio_count);
-        zxlogf(INFO, "i2c channel count   = %d\n", info.i2c_channel_count);
         zxlogf(INFO, "clk count           = %d\n", info.clk_count);
         zxlogf(INFO, "bti count           = %d\n", info.bti_count);
     }
@@ -32,16 +32,6 @@ zx_status_t PDev::MapMmio(uint32_t index, std::optional<MmioBuffer>* mmio) {
                               ZX_CACHE_POLICY_UNCACHED_DEVICE, mmio);
 }
 
-I2cChannel PDev::GetI2c(uint32_t index) {
-    i2c_protocol_t i2c;
-    size_t actual;
-    zx_status_t res = GetProtocol(ZX_PROTOCOL_I2C, index, &i2c, sizeof(i2c), &actual);
-    if (res != ZX_OK || actual != sizeof(i2c)) {
-        return {};
-    }
-    return I2cChannel(&i2c);
-}
-
 GpioProtocolClient PDev::GetGpio(uint32_t index) {
     gpio_protocol_t gpio;
     size_t actual;
@@ -52,14 +42,24 @@ GpioProtocolClient PDev::GetGpio(uint32_t index) {
     return GpioProtocolClient(&gpio);
 }
 
-ClkProtocolClient PDev::GetClk(uint32_t index) {
-    clk_protocol_t clk;
+PowerProtocolClient PDev::GetPower(uint32_t index) {
+    power_protocol_t power;
     size_t actual;
-    zx_status_t res = GetProtocol(ZX_PROTOCOL_CLK, index, &clk, sizeof(clk), &actual);
+    zx_status_t res = GetProtocol(ZX_PROTOCOL_POWER, index, &power, sizeof(power), &actual);
+    if (res != ZX_OK || actual != sizeof(power)) {
+        return {};
+    }
+    return PowerProtocolClient(&power);
+}
+
+ClockProtocolClient PDev::GetClk(uint32_t index) {
+    clock_protocol_t clk;
+    size_t actual;
+    zx_status_t res = GetProtocol(ZX_PROTOCOL_CLOCK, index, &clk, sizeof(clk), &actual);
     if (res != ZX_OK || actual != sizeof(clk)) {
         return {};
     }
-    return ClkProtocolClient(&clk);
+    return ClockProtocolClient(&clk);
 }
 
 } // namespace ddk

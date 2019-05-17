@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef SYSROOT_ZIRCON_DEVICE_IOCTL_H_
+#define SYSROOT_ZIRCON_DEVICE_IOCTL_H_
 
 // clang-format off
 
@@ -63,7 +64,7 @@
 #define IOCTL_FAMILY_ETHERTAP       0x27
 #define IOCTL_FAMILY_USB_PERIPHERAL 0x28
 #define IOCTL_FAMILY_USB_VIRT_BUS   0x29
-#define IOCTL_FAMILY_CPUPERF        0x2A
+#define IOCTL_FAMILY_PERFMON        0x2A
 #define IOCTL_FAMILY_POWER          0x30
 #define IOCTL_FAMILY_THERMAL        0x31
 #define IOCTL_FAMILY_CAMERA         0x32
@@ -92,3 +93,5 @@
 #define IOCTL_KIND(n) (((n) >> 20) & 0xF)
 #define IOCTL_FAMILY(n) (((n) >> 8) & 0xFF)
 #define IOCTL_NUMBER(n) ((n) & 0xFF)
+
+#endif  // SYSROOT_ZIRCON_DEVICE_IOCTL_H_

@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef ZIRCON_SYSCALLS_OBJECT_H_
-#define ZIRCON_SYSCALLS_OBJECT_H_
+#ifndef SYSROOT_ZIRCON_SYSCALLS_OBJECT_H_
+#define SYSROOT_ZIRCON_SYSCALLS_OBJECT_H_
 
 #include <zircon/types.h>
 
@@ -36,10 +36,19 @@ typedef uint32_t zx_object_info_topic_t;
 #define ZX_INFO_PROCESS_HANDLE_STATS    ((zx_object_info_topic_t) 21u) // zx_info_process_handle_stats_t[1]
 #define ZX_INFO_SOCKET                  ((zx_object_info_topic_t) 22u) // zx_info_socket_t[1]
 #define ZX_INFO_VMO                     ((zx_object_info_topic_t) 23u) // zx_info_vmo_t[1]
+#define ZX_INFO_JOB                     ((zx_object_info_topic_t) 24u) // zx_info_job_t[1]
 
 typedef uint32_t zx_obj_props_t;
-#define ZX_OBJ_PROP_NONE                ((zx_obj_props_t)0u)
-#define ZX_OBJ_PROP_WAITABLE            ((zx_obj_props_t)1u)
+#define ZX_OBJ_PROP_NONE                ((zx_obj_props_t) 0u)
+#define ZX_OBJ_PROP_WAITABLE            ((zx_obj_props_t) 1u)
+
+// Return codes set when a task is killed.
+#define ZX_TASK_RETCODE_SYSCALL_KILL    ((int64_t) -1024)   // via zx_task_kill().
+#define ZX_TASK_RETCODE_OOM_KILL        ((int64_t) -1025)   // by the OMM killer.
+#define ZX_TASK_RETCODE_POLICY_KILL     ((int64_t) -1026)   // by the Job policy.
+#define ZX_TASK_RETCODE_VDSO_KILL       ((int64_t) -1027)   // by the VDSO.
+#define ZX_TASK_RETCODE_EXCEPTION_KILL  ((int64_t) -1028)   // Exception not handled.
+
 
 typedef struct zx_info_handle_basic {
     // The unique id assigned by kernel to the object referenced by the
@@ -73,12 +82,12 @@ typedef struct zx_info_handle_count {
 
 typedef struct zx_info_process_handle_stats {
     // The number of outstanding handles to kernel objects of each type.
-    uint32_t handle_count[64];
+    uint32_t handle_count[ZX_OBJ_TYPE_UPPER_BOUND];
 } zx_info_process_handle_stats_t;
 
 typedef struct zx_info_process {
     // The process's return code; only valid if |exited| is true.
-    // Guaranteed to be non-zero if the process was killed by |zx_task_kill|.
+    // If the process was killed, it will be one of the ZX_TASK_RETCODE values.
     int64_t return_code;
 
     // True if the process has ever left the initial creation state,
@@ -91,6 +100,22 @@ typedef struct zx_info_process {
     // True if a debugger is attached to the process.
     bool debugger_attached;
 } zx_info_process_t;
+
+typedef struct zx_info_job {
+    // The job's return code; only valid if |exited| is true.
+    // If the process was killed, it will be one of the ZX_TASK_RETCODE values.
+    int64_t return_code;
+
+    // If true, the job has exited and |return_code| is valid.
+    bool exited;
+
+    // True if the ZX_PROP_JOB_KILL_ON_OOM was set.
+    bool kill_on_oom;
+
+    // True if a debugger is attached to the job.
+    bool debugger_attached;
+} zx_info_job_t;
+
 
 typedef uint32_t zx_thread_state_t;
 
@@ -256,7 +281,10 @@ typedef struct zx_info_maps {
 // if (ZX_INFO_VMO_TYPE(f) == ZX_INFO_VMO_TYPE_PAGED)
 #define ZX_INFO_VMO_TYPE(flags)             ((flags) & (1u<<0))
 
-// The VMO is a clone, and is a copy-on-write clone.
+// The VMO is resizable.
+#define ZX_INFO_VMO_RESIZABLE               (1u<<1)
+
+// The VMO is a child, and is a copy-on-write clone.
 #define ZX_INFO_VMO_IS_COW_CLONE            (1u<<2)
 
 // When reading a list of VMOs pointed to by a process, indicates that the
@@ -267,6 +295,14 @@ typedef struct zx_info_maps {
 // process maps the VMO into a VMAR, but doesn't necessarily have a handle to
 // the VMO.
 #define ZX_INFO_VMO_VIA_MAPPING             (1u<<4)
+
+// The VMO is a pager owned VMO created by zx_pager_create_vmo or is
+// a clone of a VMO with this flag set. Will only be set on VMOs with
+// the ZX_INFO_VMO_TYPE_PAGED flag set.
+#define ZX_INFO_VMO_PAGER_BACKED            (1u<<5)
+
+// The VMO is contiguous
+#define ZX_INFO_VMO_CONTIGUOUS              (1u<<6)
 
 // Describes a VMO. For mapping information, see |zx_info_maps_t|.
 typedef struct zx_info_vmo {
@@ -309,11 +345,6 @@ typedef struct zx_info_vmo {
     // If |flags & ZX_INFO_VMO_VIA_HANDLE|, the handle rights.
     // Undefined otherwise.
     zx_rights_t handle_rights;
-
-    // VMO creation options. This is a bitmask of
-    // kResizable    = (1u << 0);
-    // kContiguous   = (1u << 1);
-    uint32_t create_options;
 
     // VMO mapping cache policy. One of ZX_CACHE_POLICY_*
     uint32_t cache_policy;
@@ -429,6 +460,9 @@ typedef struct zx_info_resource {
 // Terminate this job if the system is low on memory.
 #define ZX_PROP_JOB_KILL_ON_OOM             15u
 
+// Exception close behavior.
+#define ZX_PROP_EXCEPTION_STATE             16u
+
 // Basic thread states, in zx_info_thread_t.state.
 #define ZX_THREAD_STATE_NEW                 ((zx_thread_state_t) 0x0000u)
 #define ZX_THREAD_STATE_RUNNING             ((zx_thread_state_t) 0x0001u)
@@ -455,6 +489,10 @@ typedef struct zx_info_resource {
 // Useful if, for example, you want to check for BLOCKED on anything.
 #define ZX_THREAD_STATE_BASIC(n) ((n) & 0xff)
 
+// How a thread should behave when the current exception is closed.
+#define ZX_EXCEPTION_STATE_TRY_NEXT         0u
+#define ZX_EXCEPTION_STATE_HANDLED          1u
+
 __END_CDECLS
 
-#endif // ZIRCON_SYSCALLS_OBJECT_H_
+#endif // SYSROOT_ZIRCON_SYSCALLS_OBJECT_H_

@@ -85,6 +85,7 @@ public:
     // calls will fail.
     void Close();
 
+    void Dump() const;
 protected:
     // Synchronously gets a page from the backing source.
     virtual bool GetPage(uint64_t offset,
@@ -154,7 +155,7 @@ public:
 
 private:
     // PageRequests passed to GetPage may or may not be initialized. offset_ must be checked
-    // and the object must be initalized if necessary.
+    // and the object must be initialized if necessary.
     void Init(fbl::RefPtr<PageSource> src, uint64_t offset);
 
     const bool allow_batching_;

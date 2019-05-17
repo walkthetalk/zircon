@@ -43,7 +43,8 @@ zx_status_t CreateDevice(void* ctx, const fuchsia_hardware_nand_RamNandInfo* inf
     RamNandCtl* device = reinterpret_cast<RamNandCtl*>(ctx);
     const char* name = nullptr;
     zx_status_t status = device->CreateDevice(info, &name);
-    return fuchsia_hardware_nand_RamNandCtlCreateDevice_reply(txn, status, name, strlen(name));
+    return fuchsia_hardware_nand_RamNandCtlCreateDevice_reply(txn, status, name,
+                                                              name ? strlen(name) : 0);
 }
 
 fuchsia_hardware_nand_RamNandCtl_ops_t fidl_ops = {.CreateDevice = CreateDevice};
@@ -74,7 +75,7 @@ zx_status_t RamNandCtl::CreateDevice(const fuchsia_hardware_nand_RamNandInfo* in
 
 }  // namespace
 
-zx_status_t ram_nand_driver_bind(void* ctx, zx_device_t* parent) {
+zx_status_t RamNandDriverBind(void* ctx, zx_device_t* parent) {
     fbl::AllocChecker checker;
     fbl::unique_ptr<RamNandCtl> device(new (&checker) RamNandCtl(parent));
     if (!checker.check()) {

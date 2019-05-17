@@ -15,7 +15,6 @@
 #include <bits.h>
 #include <debug.h>
 #include <err.h>
-#include <fbl/atomic.h>
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <inttypes.h>
@@ -37,17 +36,11 @@
 #define TRACE_CONTEXT_SWITCH 0
 
 /* ktraces just local to this file */
-#define LOCAL_KTRACE 0
+#define LOCAL_KTRACE_ENABLE 0
 
-#if LOCAL_KTRACE
-#define LOCAL_KTRACE0(probe) ktrace_probe0(probe)
-#define LOCAL_KTRACE2(probe, x, y) ktrace_probe2(probe, x, y)
-#define LOCAL_KTRACE64(probe, x) ktrace_probe64(probe, x)
-#else
-#define LOCAL_KTRACE0(probe)
-#define LOCAL_KTRACE2(probe, x, y)
-#define LOCAL_KTRACE64(probe, x)
-#endif
+#define LOCAL_KTRACE(string, args...)                                \
+    ktrace_probe(LocalTrace<LOCAL_KTRACE_ENABLE>, TraceContext::Cpu, \
+                 KTRACE_STRING_REF(string), ##args)
 
 static_assert(((long)KERNEL_BASE >> MMU_KERNEL_SIZE_SHIFT) == -1, "");
 static_assert(((long)KERNEL_ASPACE_BASE >> MMU_KERNEL_SIZE_SHIFT) == -1, "");
@@ -83,7 +76,7 @@ public:
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(AsidAllocator);
 
-    fbl::Mutex lock_;
+    DECLARE_MUTEX(AsidAllocator) lock_;
     uint16_t last_ TA_GUARDED(lock_) = MMU_ARM64_FIRST_USER_ASID - 1;
 
     bitmap::RawBitmapGeneric<bitmap::FixedStorage<MMU_ARM64_MAX_USER_ASID + 1>> bitmap_ TA_GUARDED(lock_);
@@ -98,7 +91,7 @@ zx_status_t AsidAllocator::Alloc(uint16_t* asid) {
     // [MMU_ARM64_FIRST_USER_ASID, MMU_ARM64_MAX_USER_ASID]
     // start the search from the last found id + 1 and wrap when hitting the end of the range
     {
-        fbl::AutoLock al(&lock_);
+        Guard<Mutex> al{&lock_};
 
         size_t val;
         bool notfound = bitmap_.Get(last_ + 1, MMU_ARM64_MAX_USER_ASID + 1, &val);
@@ -128,7 +121,7 @@ zx_status_t AsidAllocator::Alloc(uint16_t* asid) {
 zx_status_t AsidAllocator::Free(uint16_t asid) {
     LTRACEF("free asid %#x\n", asid);
 
-    fbl::AutoLock al(&lock_);
+    Guard<Mutex> al{&lock_};
 
     bitmap_.ClearOne(asid);
 
@@ -293,7 +286,7 @@ static void s2_pte_attr_to_mmu_flags(pte_t pte, uint* mmu_flags) {
 }
 
 zx_status_t ArmArchVmAspace::Query(vaddr_t vaddr, paddr_t* paddr, uint* mmu_flags) {
-    fbl::AutoLock a(&lock_);
+    Guard<Mutex> al{&lock_};
     return QueryLocked(vaddr, paddr, mmu_flags);
 }
 
@@ -398,10 +391,10 @@ zx_status_t ArmArchVmAspace::AllocPageTable(paddr_t* paddrp, uint page_size_shif
         return status;
     }
 
-    page->state = VM_PAGE_STATE_MMU;
+    page->set_state(VM_PAGE_STATE_MMU);
     pt_pages_++;
 
-    LOCAL_KTRACE0("page table alloc");
+    LOCAL_KTRACE("page table alloc");
 
     LTRACEF("allocated 0x%lx\n", *paddrp);
     return 0;
@@ -415,7 +408,7 @@ void ArmArchVmAspace::FreePageTable(void* vaddr, paddr_t paddr, uint page_size_s
 
     vm_page_t* page;
 
-    LOCAL_KTRACE0("page table free");
+    LOCAL_KTRACE("page table free");
 
     page = paddr_to_vm_page(paddr);
     if (!page) {
@@ -760,7 +753,7 @@ ssize_t ArmArchVmAspace::MapPages(vaddr_t vaddr, paddr_t paddr, size_t size,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    LOCAL_KTRACE64("mmu map", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
+    LOCAL_KTRACE("mmu map", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
     ssize_t ret = MapPageTable(vaddr, vaddr_rel, paddr, size, attrs,
                                top_index_shift, page_size_shift, tt_virt_);
     __dsb(ARM_MB_SY);
@@ -783,7 +776,7 @@ ssize_t ArmArchVmAspace::UnmapPages(vaddr_t vaddr, size_t size,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    LOCAL_KTRACE64("mmu unmap", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
+    LOCAL_KTRACE("mmu unmap", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
 
     ssize_t ret = UnmapPageTable(vaddr, vaddr_rel, size, top_index_shift,
                                  page_size_shift, tt_virt_);
@@ -807,7 +800,7 @@ zx_status_t ArmArchVmAspace::ProtectPages(vaddr_t vaddr, size_t size, pte_t attr
         return ZX_ERR_INVALID_ARGS;
     }
 
-    LOCAL_KTRACE64("mmu protect", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
+    LOCAL_KTRACE("mmu protect", (vaddr & ~PAGE_MASK) | ((size >> PAGE_SIZE_SHIFT) & PAGE_MASK));
 
     zx_status_t ret = ProtectPageTable(vaddr, vaddr_rel, size, attrs,
                                        top_index_shift, page_size_shift,
@@ -874,7 +867,7 @@ zx_status_t ArmArchVmAspace::MapContiguous(vaddr_t vaddr, paddr_t paddr, size_t 
 
     ssize_t ret;
     {
-        fbl::AutoLock a(&lock_);
+        Guard<Mutex> a{&lock_};
         pte_t attrs;
         vaddr_t vaddr_base;
         uint top_size_shift, top_index_shift, page_size_shift;
@@ -923,7 +916,7 @@ zx_status_t ArmArchVmAspace::Map(vaddr_t vaddr, paddr_t* phys, size_t count, uin
 
     size_t total_mapped = 0;
     {
-        fbl::AutoLock a(&lock_);
+        Guard<Mutex> a{&lock_};
         pte_t attrs;
         vaddr_t vaddr_base;
         uint top_size_shift, top_index_shift, page_size_shift;
@@ -980,7 +973,7 @@ zx_status_t ArmArchVmAspace::Unmap(vaddr_t vaddr, size_t count, size_t* unmapped
     if (!IS_PAGE_ALIGNED(vaddr))
         return ZX_ERR_INVALID_ARGS;
 
-    fbl::AutoLock a(&lock_);
+    Guard<Mutex> a{&lock_};
 
     ssize_t ret;
     {
@@ -1014,7 +1007,7 @@ zx_status_t ArmArchVmAspace::Protect(vaddr_t vaddr, size_t count, uint mmu_flags
     if (!(mmu_flags & ARCH_MMU_FLAG_PERM_READ))
         return ZX_ERR_INVALID_ARGS;
 
-    fbl::AutoLock a(&lock_);
+    Guard<Mutex> a{&lock_};
 
     int ret;
     {
@@ -1037,7 +1030,7 @@ zx_status_t ArmArchVmAspace::Init(vaddr_t base, size_t size, uint flags) {
     LTRACEF("aspace %p, base %#" PRIxPTR ", size 0x%zx, flags 0x%x\n",
             this, base, size, flags);
 
-    fbl::AutoLock a(&lock_);
+    Guard<Mutex> a{&lock_};
 
     // Validate that the base + size is sane and doesn't wrap.
     DEBUG_ASSERT(size > PAGE_SIZE);
@@ -1072,7 +1065,7 @@ zx_status_t ArmArchVmAspace::Init(vaddr_t base, size_t size, uint flags) {
         if (status != ZX_OK) {
             return status;
         }
-        page->state = VM_PAGE_STATE_MMU;
+        page->set_state(VM_PAGE_STATE_MMU);
 
         volatile pte_t* va = static_cast<volatile pte_t*>(paddr_to_physmap(pa));
 
@@ -1094,7 +1087,7 @@ zx_status_t ArmArchVmAspace::Destroy() {
     canary_.Assert();
     LTRACEF("aspace %p\n", this);
 
-    fbl::AutoLock a(&lock_);
+    Guard<Mutex> a{&lock_};
 
     DEBUG_ASSERT((flags_ & ARCH_ASPACE_FLAG_KERNEL) == 0);
 

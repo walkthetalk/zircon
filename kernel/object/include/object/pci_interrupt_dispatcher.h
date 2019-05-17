@@ -8,6 +8,7 @@
 #if WITH_KERNEL_PCIE
 
 #include <fbl/canary.h>
+#include <object/handle.h>
 #include <object/interrupt_dispatcher.h>
 #include <object/pci_device_dispatcher.h>
 #include <sys/types.h>
@@ -20,7 +21,7 @@ public:
                               uint32_t irq_id,
                               bool maskable,
                               zx_rights_t* out_rights,
-                              fbl::RefPtr<Dispatcher>* out_interrupt);
+                              KernelHandle<InterruptDispatcher>* out_interrupt);
 
     ~PciInterruptDispatcher() final;
 
@@ -33,11 +34,8 @@ private:
     static pcie_irq_handler_retval_t IrqThunk(const PcieDevice& dev,
                                               uint irq_id,
                                               void* ctx);
-    PciInterruptDispatcher(const fbl::RefPtr<PcieDevice>& device, uint32_t vector, bool maskable)
-        : device_(device), vector_(vector), maskable_(maskable) { }
+    PciInterruptDispatcher(const fbl::RefPtr<PcieDevice>& device, uint32_t vector, bool maskable);
     zx_status_t RegisterInterruptHandler();
-
-    fbl::Canary<fbl::magic("INPD")> canary_;
 
     fbl::RefPtr<PcieDevice> device_;
     const uint32_t vector_;

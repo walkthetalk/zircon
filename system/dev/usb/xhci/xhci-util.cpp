@@ -8,6 +8,8 @@
 
 #include "xhci-util.h"
 
+namespace usb_xhci {
+
 static void xhci_sync_command_callback(void* data, uint32_t cc, xhci_trb_t* command_trb,
                                          xhci_trb_t* event_trb) {
     xhci_sync_command_t* command = (xhci_sync_command_t*)data;
@@ -34,11 +36,14 @@ zx_status_t xhci_send_command(xhci_t* xhci, uint32_t cmd, uint64_t ptr, uint32_t
     int cc;
 
     xhci_sync_command_init(&command);
-    xhci_post_command(xhci, cmd, ptr, control_bits, &command.context);
+    zx_status_t status = xhci_post_command(xhci, cmd, ptr, control_bits, &command.context);
+    if (status != ZX_OK) {
+        return status;
+    }
 
     // Wait for one second (arbitrarily chosen timeout)
     // TODO(voydanoff) consider making the timeout a parameter to this function
-    zx_status_t status = sync_completion_wait(&command.completion, ZX_SEC(1));
+    status = sync_completion_wait(&command.completion, ZX_SEC(1));
     if (status == ZX_OK) {
         cc = (command.status & XHCI_MASK(EVT_TRB_CC_START, EVT_TRB_CC_BITS)) >> EVT_TRB_CC_START;
          if (cc == TRB_CC_SUCCESS) {
@@ -106,3 +111,5 @@ uint32_t* xhci_get_next_ext_cap(void* mmio, uint32_t* prev_cap, uint32_t* match_
     }
     return nullptr;
 }
+
+} // namespace usb_xhci

@@ -20,6 +20,8 @@
 #include <zircon/device/display-controller.h>
 #include <zircon/listnode.h>
 
+#include <map>
+
 #include "controller.h"
 #include "fence.h"
 #include "fuchsia/hardware/display/c/fidl.h"
@@ -38,7 +40,7 @@ typedef struct layer_node : public fbl::SinglyLinkedListable<layer_node*> {
 // Almost-POD used by Client to manage layer state. Public state is used by Controller.
 class Layer : public IdMappable<fbl::unique_ptr<Layer>> {
 public:
-    fbl::RefPtr<Image> current_image() const { return displayed_image_; };
+    fbl::RefPtr<Image> current_image() const { return displayed_image_; }
     uint32_t z_order() const { return current_layer_.z_index; }
     bool is_skipped() const { return is_skipped_; }
 
@@ -144,6 +146,8 @@ public:
 private:
     void HandleImportVmoImage(const fuchsia_hardware_display_ControllerImportVmoImageRequest* req,
                               fidl::Builder* resp_builder, const fidl_type_t** resp_table);
+    void HandleImportImage(const fuchsia_hardware_display_ControllerImportImageRequest* req,
+                           fidl::Builder* resp_builder, const fidl_type_t** resp_table);
     void HandleReleaseImage(const fuchsia_hardware_display_ControllerReleaseImageRequest* req,
                             fidl::Builder* resp_builder, const fidl_type_t** resp_table);
     void HandleImportEvent(const fuchsia_hardware_display_ControllerImportEventRequest* req,
@@ -196,6 +200,19 @@ private:
     void HandleAllocateVmo(const fuchsia_hardware_display_ControllerAllocateVmoRequest* req,
                            fidl::Builder* resp_builder, zx_handle_t* handle_out,
                            bool* has_handle_out, const fidl_type_t** resp_table);
+    void HandleGetSingleBufferFramebuffer(
+        const fuchsia_hardware_display_ControllerGetSingleBufferFramebufferRequest* req,
+        fidl::Builder* resp_builder, zx_handle_t* handle_out, bool* has_handle_out,
+        const fidl_type_t** resp_table);
+    void HandleImportBufferCollection(
+        const fuchsia_hardware_display_ControllerImportBufferCollectionRequest* req,
+        fidl::Builder* resp_builder, const fidl_type_t** resp_table);
+    void HandleSetBufferCollectionConstraints(
+        const fuchsia_hardware_display_ControllerSetBufferCollectionConstraintsRequest* req,
+        fidl::Builder* resp_builder, const fidl_type_t** resp_table);
+    void HandleReleaseBufferCollection(
+        const fuchsia_hardware_display_ControllerReleaseBufferCollectionRequest* req,
+        fidl::Builder* resp_builder, const fidl_type_t** resp_table);
 
     // Cleans up layer state associated with an image. If image == nullptr, then
     // cleans up all image state. Return true if a current layer was modified.
@@ -216,6 +233,17 @@ private:
     // A counter for the number of times the client has successfully applied
     // a configuration. This does not account for changes due to waiting images.
     uint32_t client_apply_count_ = 0;
+
+    zx::channel sysmem_allocator_;
+
+    struct Collections {
+        // Sent to the hardware driver.
+        zx::channel driver;
+        // If the VC is using this, |kernel| is the collection used for setting
+        // it as kernel framebuffer.
+        zx::channel kernel;
+    };
+    std::map<uint64_t, Collections> collection_map_;
 
     Fence::Map fences_ __TA_GUARDED(fence_mtx_);
     // Mutex held when creating or destroying fences.
@@ -240,16 +268,14 @@ private:
 
 // ClientProxy manages interactions between its Client instance and the ddk and the
 // controller. Methods on this class are thread safe.
-using ClientParent = ddk::Device<ClientProxy, ddk::Ioctlable, ddk::Closable>;
+using ClientParent = ddk::Device<ClientProxy, ddk::Closable>;
 class ClientProxy : public ClientParent {
 public:
     ClientProxy(Controller* controller, bool is_vc);
     ~ClientProxy();
-    zx_status_t Init();
+    zx_status_t Init(zx::channel server_channel);
 
     zx_status_t DdkClose(uint32_t flags);
-    zx_status_t DdkIoctl(uint32_t op, const void* in_buf, size_t in_len,
-                         void* out_buf, size_t out_len, size_t* actual);
     void DdkRelease();
 
     // Requires holding controller_->mtx() lock
@@ -274,8 +300,7 @@ private:
     Client handler_;
     bool enable_vsync_ = false;
 
-    zx::channel server_handle_;
-    zx::channel client_handle_;
+    zx::channel server_channel_;
 };
 
 } // namespace display

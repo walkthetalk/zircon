@@ -14,9 +14,14 @@ namespace flat {
 #define CHECK_PRIMITIVE_TYPE(N, S)                                     \
     {                                                                  \
         auto the_type_name = Name(library_ptr, N);                     \
-        auto the_type = typespace.Lookup(                              \
-            the_type_name, types::Nullability::kNonnullable,           \
-            Typespace::LookupMode::kNoForwardReferences);              \
+        const Type* the_type;                                          \
+        ASSERT_TRUE(typespace.Create(                                  \
+            the_type_name,                                             \
+            nullptr /* maybe_arg_type */,                              \
+            std::optional<types::HandleSubtype>(),                     \
+            nullptr /* maybe_size */,                                  \
+            types::Nullability::kNonnullable,                          \
+            &the_type));                                               \
         ASSERT_NE(the_type, nullptr, N);                               \
         auto the_type_p = static_cast<const PrimitiveType*>(the_type); \
         ASSERT_EQ(the_type_p->subtype, S, N);                          \
@@ -27,7 +32,8 @@ namespace flat {
 bool root_types_with_no_library_in_lookup() {
     BEGIN_TEST;
 
-    Typespace typespace = Typespace::RootTypes();
+    Typespace typespace = Typespace::RootTypes(nullptr);
+
     Library* library_ptr = nullptr;
 
     CHECK_PRIMITIVE_TYPE("bool", types::PrimitiveSubtype::kBool);
@@ -50,7 +56,7 @@ bool root_types_with_no_library_in_lookup() {
 bool root_types_with_some_library_in_lookup() {
     BEGIN_TEST;
 
-    Typespace typespace = Typespace::RootTypes();
+    Typespace typespace = Typespace::RootTypes(nullptr);
 
     TestLibrary library("library fidl.test;");
     ASSERT_TRUE(library.Compile());
@@ -71,10 +77,10 @@ bool root_types_with_some_library_in_lookup() {
     END_TEST;
 }
 
-BEGIN_TEST_CASE(types_tests);
-RUN_TEST(root_types_with_no_library_in_lookup);
-RUN_TEST(root_types_with_some_library_in_lookup);
-END_TEST_CASE(types_tests);
+BEGIN_TEST_CASE(types_tests)
+RUN_TEST(root_types_with_no_library_in_lookup)
+RUN_TEST(root_types_with_some_library_in_lookup)
+END_TEST_CASE(types_tests)
 
 } // namespace flat
 } // namespace fidl

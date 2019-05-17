@@ -18,7 +18,7 @@ using UsbBusType = ddk::Device<UsbBus, ddk::Unbindable>;
 
 class UsbBus : public UsbBusType,
                public ddk::UsbBusProtocol<UsbBus, ddk::base_protocol>,
-               public ddk::UsbBusInterface<UsbBus> {
+               public ddk::UsbBusInterfaceProtocol<UsbBus> {
 public:
     UsbBus(zx_device_t* parent)
         : UsbBusType(parent), hci_(parent) {}
@@ -31,10 +31,10 @@ public:
 
     // USB Bus protocol implementation.
     zx_status_t UsbBusConfigureHub(zx_device_t* hub_device, usb_speed_t speed,
-                                   const usb_hub_descriptor_t* desc);
+                                   const usb_hub_descriptor_t* desc, bool multi_tt);
     zx_status_t UsbBusDeviceAdded(zx_device_t* hub_device, uint32_t port, usb_speed_t speed);
     zx_status_t UsbBusDeviceRemoved(zx_device_t* hub_device, uint32_t port);
-    zx_status_t UsbBusSetHubInterface(zx_device_t* usb_device, const usb_hub_interface_t* hub);
+    zx_status_t UsbBusSetHubInterface(zx_device_t* usb_device, const usb_hub_interface_protocol_t* hub);
 
     // USB Bus interface implementation.
     zx_status_t UsbBusInterfaceAddDevice(uint32_t device_id, uint32_t hub_id, usb_speed_t speed);

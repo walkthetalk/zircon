@@ -28,10 +28,11 @@
 #include <fbl/string_buffer.h>
 #include <fbl/string_piece.h>
 #include <fs/metrics.h>
+#include <fuchsia/device/c/fidl.h>
 #include <fuchsia/io/c/fidl.h>
+#include <lib/fdio/unsafe.h>
 #include <lib/fdio/vfs.h>
 #include <lib/sync/completion.h>
-#include <zircon/device/device.h>
 #include <zircon/device/vfs.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
@@ -167,7 +168,7 @@ zx_status_t Blob::InitCompressed(CompressionAlgorithm algorithm) {
     vmoid_t compressed_vmoid;
     status = blobfs_->AttachVmo(compressed_mapper.vmo(), &compressed_vmoid);
     if (status != ZX_OK) {
-        FS_TRACE_ERROR("Failed to attach commpressed VMO to blkdev: %d\n", status);
+        FS_TRACE_ERROR("Failed to attach compressed VMO to blkdev: %d\n", status);
         return status;
     }
 
@@ -235,7 +236,7 @@ zx_status_t Blob::InitCompressed(CompressionAlgorithm algorithm) {
         return ZX_ERR_IO_DATA_INTEGRITY;
     }
 
-    blobfs_->LocalMetrics().UdpateMerkleDecompress(compressed_blocks * kBlobfsBlockSize,
+    blobfs_->LocalMetrics().UpdateMerkleDecompress(compressed_blocks * kBlobfsBlockSize,
                                                    inode_.blob_size, read_time, ticker.End());
     return ZX_OK;
 }
@@ -305,7 +306,7 @@ zx_status_t Blob::SpaceAllocate(uint64_t size_data) {
         return ZX_ERR_BAD_STATE;
     }
 
-    auto write_info = fbl::make_unique<WritebackInfo>();
+    auto write_info = std::make_unique<WritebackInfo>();
 
     // Initialize the inode with known fields.
     memset(inode_.merkle_root_hash, 0, Digest::kLength);
@@ -663,11 +664,14 @@ zx_status_t Blob::GetReadableEvent(zx_handle_t* out) {
             readable_event_.signal(0u, ZX_USER_SIGNAL_0);
         }
     }
-    status = zx_handle_duplicate(readable_event_.get(), ZX_RIGHTS_BASIC, out);
+    zx::event out_event;
+    status = readable_event_.duplicate(ZX_RIGHTS_BASIC, &out_event);
     if (status != ZX_OK) {
         return status;
     }
-    return sizeof(zx_handle_t);
+
+    *out = out_event.release();
+    return ZX_OK;
 }
 
 zx_status_t Blob::CloneVmo(zx_rights_t rights, zx_handle_t* out_vmo, size_t* out_size) {
@@ -687,8 +691,9 @@ zx_status_t Blob::CloneVmo(zx_rights_t rights, zx_handle_t* out_vmo, size_t* out
     // was requested.
     const size_t merkle_bytes = MerkleTreeBlocks(inode_) * kBlobfsBlockSize;
     zx::vmo clone;
-    if ((status = mapping_.vmo().clone(ZX_VMO_CLONE_COPY_ON_WRITE, merkle_bytes, inode_.blob_size,
-                                       &clone)) != ZX_OK) {
+    if ((status = mapping_.vmo().create_child(ZX_VMO_CHILD_COPY_ON_WRITE,
+                                              merkle_bytes, inode_.blob_size,
+                                              &clone)) != ZX_OK) {
         return status;
     }
 
@@ -823,12 +828,7 @@ zx_status_t Blob::ValidateFlags(uint32_t flags) {
 
 zx_status_t Blob::GetNodeInfo(uint32_t flags, fuchsia_io_NodeInfo* info) {
     info->tag = fuchsia_io_NodeInfoTag_file;
-    zx_status_t r = GetReadableEvent(&info->file.event);
-    if (r < 0) {
-        return r;
-    }
-
-    return ZX_OK;
+    return GetReadableEvent(&info->file.event);
 }
 
 zx_status_t Blob::Read(void* data, size_t len, size_t off, size_t* out_actual) {
@@ -898,11 +898,24 @@ zx_status_t Blob::QueryFilesystem(fuchsia_io_FilesystemInfo* info) {
 }
 
 zx_status_t Blob::GetDevicePath(size_t buffer_len, char* out_name, size_t* out_len) {
-    ssize_t len = ioctl_device_get_topo_path(blobfs_->Fd(), out_name, buffer_len);
-    if (len < 0) {
-        return static_cast<zx_status_t>(len);
+    auto device = blobfs_->BlockDevice();
+    if (buffer_len == 0) {
+        return ZX_ERR_BUFFER_TOO_SMALL;
     }
-    *out_len = len;
+    zx_status_t call_status;
+    zx_status_t status = fuchsia_device_ControllerGetTopologicalPath(device->get(), &call_status,
+                                                                     out_name, buffer_len - 1,
+                                                                     out_len);
+    if (status == ZX_OK) {
+        status = call_status;
+    }
+    if (status != ZX_OK) {
+        return status;
+    }
+    // Ensure null-terminated
+    out_name[*out_len] = 0;
+    // Account for the null byte in the length, since callers expect it.
+    (*out_len)++;
     return ZX_OK;
 }
 #endif
@@ -945,8 +958,11 @@ void Blob::Sync(SyncCallback closure) {
     }
 }
 
+bool Blob::IsDirectory() const {
+    return false;
+}
+
 void Blob::CompleteSync() {
-    fsync(blobfs_->Fd());
     atomic_store(&syncing_, false);
 }
 

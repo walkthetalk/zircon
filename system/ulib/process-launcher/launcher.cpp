@@ -23,8 +23,12 @@ fbl::String GetString(fidl_string_t string) {
     return fbl::String(string.data, string.size);
 }
 
+fbl::String GetString(fidl_vector_t bytes) {
+    return fbl::String(static_cast<char*>(bytes.data), bytes.count);
+}
+
 void PushStrings(fidl_vector_t* input, fbl::Vector<fbl::String>* target) {
-    fidl_string_t* data = static_cast<fidl_string_t*>(input->data);
+    fidl_vector_t* data = static_cast<fidl_vector_t*>(input->data);
     for (size_t i = 0; i < input->count; ++i) {
         target->push_back(GetString(data[i]));
     }
@@ -88,26 +92,28 @@ zx_status_t LauncherImpl::ReadAndDispatchMessage(fidl::MessageBuffer* buffer) {
         return status;
     if (!message.has_header())
         return ZX_ERR_INVALID_ARGS;
-    switch (message.ordinal()) {
-    case fuchsia_process_LauncherLaunchOrdinal:
-    case fuchsia_process_LauncherLaunchGenOrdinal:
+    // This is an if statement because, depending on the state of the ordinal
+    // migration, GenOrdinal and Ordinal may be the same value.  See FIDL-372
+    uint32_t ordinal = message.ordinal();
+    if (ordinal == fuchsia_process_LauncherLaunchOrdinal ||
+        ordinal == fuchsia_process_LauncherLaunchGenOrdinal) {
         return Launch(buffer, std::move(message));
-    case fuchsia_process_LauncherCreateWithoutStartingOrdinal:
-    case fuchsia_process_LauncherCreateWithoutStartingGenOrdinal:
+    } else if (ordinal == fuchsia_process_LauncherCreateWithoutStartingOrdinal ||
+               ordinal == fuchsia_process_LauncherCreateWithoutStartingGenOrdinal) {
         return CreateWithoutStarting(buffer, std::move(message));
-    case fuchsia_process_LauncherAddArgsOrdinal:
-    case fuchsia_process_LauncherAddArgsGenOrdinal:
+    } else if (ordinal == fuchsia_process_LauncherAddArgsOrdinal ||
+               ordinal == fuchsia_process_LauncherAddArgsGenOrdinal) {
         return AddArgs(std::move(message));
-    case fuchsia_process_LauncherAddEnvironsOrdinal:
-    case fuchsia_process_LauncherAddEnvironsGenOrdinal:
+    } else if (ordinal == fuchsia_process_LauncherAddEnvironsOrdinal ||
+               ordinal == fuchsia_process_LauncherAddEnvironsGenOrdinal) {
         return AddEnvirons(std::move(message));
-    case fuchsia_process_LauncherAddNamesOrdinal:
-    case fuchsia_process_LauncherAddNamesGenOrdinal:
+    } else if (ordinal == fuchsia_process_LauncherAddNamesOrdinal ||
+               ordinal == fuchsia_process_LauncherAddNamesGenOrdinal) {
         return AddNames(std::move(message));
-    case fuchsia_process_LauncherAddHandlesOrdinal:
-    case fuchsia_process_LauncherAddHandlesGenOrdinal:
+    } else if (ordinal == fuchsia_process_LauncherAddHandlesOrdinal ||
+               ordinal == fuchsia_process_LauncherAddHandlesGenOrdinal) {
         return AddHandles(std::move(message));
-    default:
+    } else {
         fprintf(stderr, "launcher: error: Unknown message ordinal: %d\n", message.ordinal());
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -128,19 +134,13 @@ zx_status_t LauncherImpl::Launch(fidl::MessageBuffer* buffer, fidl::Message mess
     PrepareLaunchpad(message, &lp);
 
     fidl::Builder builder = buffer->CreateBuilder();
-    fidl_message_header_t* header = builder.New<fidl_message_header_t>();
-    header->txid = txid;
-    header->ordinal = ordinal;
-    fuchsia_process_LaunchResult* result = builder.New<fuchsia_process_LaunchResult>();
+    auto* response = builder.New<fuchsia_process_LauncherLaunchResponse>();
+    response->hdr.txid = txid;
+    response->hdr.ordinal = ordinal;
+    response->status = launchpad_go(lp, &response->process, &error_msg);
 
-    status = launchpad_go(lp, &result->process, &error_msg);
-
-    result->status = status;
-    if (status != ZX_OK && error_msg) {
-        uint32_t len = static_cast<uint32_t>(strlen(error_msg));
-        result->error_message.size = len;
-        result->error_message.data = builder.NewArray<char>(len);
-        strncpy(result->error_message.data, error_msg, len);
+    if (response->status != ZX_OK && error_msg) {
+        fprintf(stderr, "launcher: error: Launch: %s\n", error_msg);
     }
 
     message.set_bytes(builder.Finalize());
@@ -169,30 +169,25 @@ zx_status_t LauncherImpl::CreateWithoutStarting(fidl::MessageBuffer* buffer, fid
     PrepareLaunchpad(message, &lp);
 
     fidl::Builder builder = buffer->CreateBuilder();
-    fidl_message_header_t* header = builder.New<fidl_message_header_t>();
-    header->txid = txid;
-    header->ordinal = ordinal;
-    fuchsia_process_CreateWithoutStartingResult* result = builder.New<fuchsia_process_CreateWithoutStartingResult>();
+    auto* response = builder.New<fuchsia_process_LauncherCreateWithoutStartingResponse>();
+    response->hdr.txid = txid;
+    response->hdr.ordinal = ordinal;
 
-    launchpad_start_data_t data;
-    status = launchpad_ready_set(lp, &data, &error_msg);
+    launchpad_start_data_t data = {};
+    response->status = launchpad_ready_set(lp, &data, &error_msg);
 
-    result->status = status;
-    if (status == ZX_OK) {
-        result->data = builder.New<fuchsia_process_ProcessStartData>();
-        result->data->process = data.process;
-        result->data->root_vmar = data.root_vmar;
-        result->data->thread = data.thread;
-        result->data->entry = data.entry;
-        result->data->sp = data.sp;
-        result->data->bootstrap = data.bootstrap;
-        result->data->vdso_base = data.vdso_base;
-        result->data->base = data.base;
+    if (response->status == ZX_OK) {
+        response->data = builder.New<fuchsia_process_ProcessStartData>();
+        response->data->process = data.process;
+        response->data->root_vmar = data.root_vmar;
+        response->data->thread = data.thread;
+        response->data->entry = data.entry;
+        response->data->stack = data.stack;
+        response->data->bootstrap = data.bootstrap;
+        response->data->vdso_base = data.vdso_base;
+        response->data->base = data.base;
     } else if (error_msg) {
-        uint32_t len = static_cast<uint32_t>(strlen(error_msg));
-        result->error_message.size = len;
-        result->error_message.data = builder.NewArray<char>(len);
-        strncpy(result->error_message.data, error_msg, len);
+        fprintf(stderr, "launcher: error: CreateWithoutStarting: %s\n", error_msg);
     }
 
     message.set_bytes(builder.Finalize());

@@ -73,6 +73,7 @@ static const uint8_t zxcrypt_magic[16] = {
 };
 
 disk_format_t detect_disk_format(int fd);
+disk_format_t detect_disk_format_log_unknown(int fd);
 
 typedef struct mount_options {
     bool readonly;
@@ -96,20 +97,19 @@ typedef struct mkfs_options {
 
 extern const mkfs_options_t default_mkfs_options;
 
-#define NUM_MKFS_OPTIONS 2
-
 typedef struct fsck_options {
     bool verbose;
     // At MOST one of the following '*_modify' flags may be true.
     bool never_modify;  // Fsck still looks for problems, but it does not try to resolve them.
     bool always_modify; // Fsck never asks to resolve problems; it assumes it should fix them.
-    bool force;         // Force fsck to check the filesystem integrity, even if it is marked as "clean".
+    bool force;         // Force fsck to check the filesystem integrity, even if it is "clean".
+    bool apply_journal; // Apply journal prior to running the consistency checker.
 } fsck_options_t;
-
-#define NUM_FSCK_OPTIONS 3
 
 extern const fsck_options_t default_fsck_options;
 
+// Callback that will launch the requested program.  |argv[argc]| is guaranteed
+// to be accessible and set to nullptr.
 typedef zx_status_t (*LaunchCallback)(int argc, const char** argv,
                                       zx_handle_t* hnd, uint32_t* ids, size_t len);
 

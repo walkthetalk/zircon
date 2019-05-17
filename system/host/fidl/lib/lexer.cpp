@@ -7,6 +7,8 @@
 #include <assert.h>
 #include <map>
 
+#include <zircon/compiler.h>
+
 namespace fidl {
 
 namespace {
@@ -84,7 +86,7 @@ bool IsIdentifierBody(char c) {
 
 // IsIdentifierValid disallows identifiers (escaped, and unescaped) from
 // starting or ending with underscore.
-bool IsIdentifierValid(StringView source_data) {
+bool IsIdentifierValid(std::string_view source_data) {
     return source_data[0] != '_' && source_data[source_data.size() - 1] != '_';
 }
 
@@ -126,7 +128,7 @@ bool IsNumericLiteralBody(char c) {
 } // namespace
 
 constexpr char Lexer::Peek() const {
-    return *current_;
+    return current_ < end_of_file_ ? *current_ : 0;
 }
 
 void Lexer::Skip() {
@@ -135,14 +137,14 @@ void Lexer::Skip() {
 }
 
 char Lexer::Consume() {
-    auto current = *current_;
+    auto current = Peek();
     ++current_;
     ++token_size_;
     return current;
 }
 
-StringView Lexer::Reset(Token::Kind kind) {
-    auto data = StringView(token_start_, token_size_);
+std::string_view Lexer::Reset(Token::Kind kind) {
+    auto data = std::string_view(token_start_, token_size_);
     if (kind != Token::Kind::kComment) {
         previous_end_ = token_start_ + token_size_;
     }
@@ -153,7 +155,7 @@ StringView Lexer::Reset(Token::Kind kind) {
 
 Token Lexer::Finish(Token::Kind kind) {
     assert(kind != Token::Kind::kIdentifier);
-    StringView previous(previous_end_, token_start_ - previous_end_);
+    std::string_view previous(previous_end_, token_start_ - previous_end_);
     SourceLocation previous_location(previous, source_file_);
     return Token(previous_location,
                  SourceLocation(Reset(kind), source_file_), kind, Token::Subkind::kNone);
@@ -172,15 +174,15 @@ Token Lexer::LexNumericLiteral() {
 Token Lexer::LexIdentifier() {
     while (IsIdentifierBody(Peek()))
         Consume();
-    StringView previous(previous_end_, token_start_ - previous_end_);
+    std::string_view previous(previous_end_, token_start_ - previous_end_);
     SourceLocation previous_end(previous, source_file_);
-    StringView identifier_data = Reset(Token::Kind::kIdentifier);
+    std::string_view identifier_data = Reset(Token::Kind::kIdentifier);
     if (!IsIdentifierValid(identifier_data)) {
-        SourceLocation location(StringView(token_start_, token_size_), source_file_);
+        SourceLocation location(std::string_view(token_start_, token_size_), source_file_);
         std::string msg("invalid identifier '");
         msg.append(identifier_data);
         msg.append("'");
-        error_reporter_->ReportError(location, msg);
+        error_reporter_->ReportError(&location, msg);
     }
     auto subkind = Token::Subkind::kNone;
     auto lookup = keyword_table_.find(identifier_data);
@@ -203,7 +205,7 @@ Token Lexer::LexStringLiteral() {
             // This escaping logic is incorrect for the input: "\\"
             if (last != '\\')
                 return Finish(Token::Kind::kStringLiteral);
-        // Fall through.
+        __FALLTHROUGH;
         default:
             last = next;
         }
@@ -278,6 +280,7 @@ Token Lexer::Lex() {
         case '\r':
         case '\t':
             assert(false && "Should have been handled by SkipWhitespace!");
+            break;
 
         case '-':
             // Maybe the start of an arrow.
@@ -285,7 +288,7 @@ Token Lexer::Lex() {
                 Consume();
                 return Finish(Token::Kind::kArrow);
             }
-        // Fallthrough
+        __FALLTHROUGH;
         case '0':
         case '1':
         case '2':
@@ -361,11 +364,11 @@ Token Lexer::Lex() {
             case '/':
                 return LexCommentOrDocComment();
             default: {
-                SourceLocation location(StringView(token_start_, token_size_), source_file_);
+                SourceLocation location(std::string_view(token_start_, token_size_), source_file_);
                 std::string msg("invalid character '");
                 msg.append(location.data());
                 msg.append("'");
-                error_reporter_->ReportError(location, msg);
+                error_reporter_->ReportError(&location, msg);
                 continue;
             }
             } // switch
@@ -403,11 +406,11 @@ Token Lexer::Lex() {
             return Finish(Token::Kind::kAmpersand);
 
         default: {
-            SourceLocation location(StringView(token_start_, token_size_), source_file_);
+            SourceLocation location(std::string_view(token_start_, token_size_), source_file_);
             std::string msg("invalid character '");
             msg.append(location.data());
             msg.append("'");
-            error_reporter_->ReportError(location, msg);
+            error_reporter_->ReportError(&location, msg);
             continue;
         }
         } // switch

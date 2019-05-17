@@ -7,6 +7,7 @@
 #include <ddk/binding.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <ddk/protocol/test.h>
 #include <ddktl/device.h>
 #include <fbl/array.h>
 #include <fbl/auto_lock.h>
@@ -17,7 +18,7 @@
 #include <lib/zx/vmo.h>
 #include <zircon/assert.h>
 #include <zircon/process.h>
-#include <ddk/protocol/test.h>
+#include <zircon/status.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
 
@@ -38,7 +39,6 @@ public:
     void DdkRelease();
     zx_status_t DdkGetProtocol(uint32_t proto_id, void* out);
     zx_status_t DdkOpen(zx_device_t** dev_out, uint32_t flags);
-    zx_status_t DdkOpenAt(zx_device_t** dev_out, const char* path, uint32_t flags);
     zx_status_t DdkClose(uint32_t flags);
     void DdkUnbind();
     zx_status_t DdkRead(void* buf, size_t count, zx_off_t off, size_t* actual);
@@ -93,16 +93,20 @@ struct ProcessActionsContext {
 
     bool has_hook_status = false;
     // OUT: What should be returned by the hook
-    zx_status_t hook_status = ZX_ERR_INTERNAL;;
+    zx_status_t hook_status = ZX_ERR_INTERNAL;
     // IN: A buffer that can be written to by actions (nullptr if none)
     void* associated_buf = nullptr;
     size_t associated_buf_count = 0;
     // OUT: Number of bytes written by actions
     size_t associated_buf_actual = 0;
-    // IN: MockDevice to use for associating threads with
+    // IN/OUT: MockDevice to use for associating threads with.  NULL'd out if
+    // remove was called.
     MockDevice* mock_device = nullptr;
-    // IN: Device to use for invoking add_device/remove_device
+    // IN/OUT: Device to use for invoking add_device/remove_device.  NULL'd out
+    // if remove was called.
     zx_device_t* device = nullptr;
+    // IN: Whether or not this context is running in a separate thread
+    bool is_thread = false;
 };
 
 // Execute the actions returned by a hook
@@ -114,13 +118,30 @@ MockDevice::MockDevice(zx_device_t* device, zx::channel controller)
 }
 
 int MockDevice::ThreadFunc(void* raw_arg) {
-    auto arg = fbl::unique_ptr(static_cast<ThreadFuncArg*>(raw_arg));
-    // TODO(teisenbe): Implement MockDeviceThread here
+    auto arg = fbl::unique_ptr<ThreadFuncArg>(static_cast<ThreadFuncArg*>(raw_arg));
+
+    while (true) {
+        fbl::Array<const fuchsia_device_mock_Action> actions;
+        zx_status_t status = WaitForPerformActions(arg->channel, &actions);
+        if (status != ZX_OK) {
+            ZX_ASSERT_MSG(status == ZX_ERR_STOP, "MockDevice thread exiting: %s\n",
+                          zx_status_get_string(status));
+            break;
+        }
+        ProcessActionsContext ctx(arg->channel, false, arg->dev, arg->dev->zxdev());
+        ctx.is_thread = true;
+        status = ProcessActions(std::move(actions), &ctx);
+        ZX_ASSERT(status == ZX_OK);
+        if (ctx.device == nullptr) {
+            // If the device was removed, bail out since we're releasing.
+            break;
+        }
+    }
     return 0;
 }
 
 void MockDevice::CreateThread(zx::channel channel) {
-    auto arg = fbl::make_unique<ThreadFuncArg>();
+    auto arg = std::make_unique<ThreadFuncArg>();
     arg->channel = std::move(channel);
     arg->dev = this;
 
@@ -169,13 +190,20 @@ void MockDevice::DdkRelease() {
     zx_status_t status = ReleaseHook(controller_, ConstructHookInvocation());
     ZX_ASSERT(status == ZX_OK);
 
-    {
-        fbl::AutoLock guard(&lock_);
-        for (auto& t : threads_) {
+    // Launch a thread to do the actual joining and delete, since this could get
+    // called from a thread.
+    thrd_t thrd;
+    int ret = thrd_create(&thrd, [](void* arg) {
+        auto me = static_cast<MockDevice*>(arg);
+        fbl::AutoLock guard(&me->lock_);
+        for (auto& t : me->threads_) {
             thrd_join(t, nullptr);
         }
-    }
-    delete this;
+        delete me;
+        return 0;
+    }, this);
+    ZX_ASSERT(ret == thrd_success);
+    thrd_detach(thrd);
 }
 
 zx_status_t MockDevice::DdkGetProtocol(uint32_t proto_id, void* out) {
@@ -192,17 +220,6 @@ zx_status_t MockDevice::DdkGetProtocol(uint32_t proto_id, void* out) {
 zx_status_t MockDevice::DdkOpen(zx_device_t** dev_out, uint32_t flags) {
     fbl::Array<const fuchsia_device_mock_Action> actions;
     zx_status_t status = OpenHook(controller_, ConstructHookInvocation(), flags, &actions);
-    ZX_ASSERT(status == ZX_OK);
-    ProcessActionsContext ctx(controller_, true, this, zxdev());
-    status = ProcessActions(std::move(actions), &ctx);
-    ZX_ASSERT(status == ZX_OK);
-    return ctx.hook_status;
-}
-
-zx_status_t MockDevice::DdkOpenAt(zx_device_t** dev_out, const char* path, uint32_t flags) {
-    fbl::Array<const fuchsia_device_mock_Action> actions;
-    zx_status_t status = OpenAtHook(controller_, ConstructHookInvocation(), fbl::StringPiece(path),
-                                    flags, &actions);
     ZX_ASSERT(status == ZX_OK);
     ProcessActionsContext ctx(controller_, true, this, zxdev());
     status = ProcessActions(std::move(actions), &ctx);
@@ -324,7 +341,7 @@ zx_status_t MockDevice::DdkRxrpc(zx_handle_t channel) {
 
 zx_status_t MockDevice::Create(zx_device_t* parent, zx::channel controller,
                                fbl::unique_ptr<MockDevice>* out) {
-    auto dev = fbl::make_unique<MockDevice>(parent, std::move(controller));
+    auto dev = std::make_unique<MockDevice>(parent, std::move(controller));
     *out = std::move(dev);
     return ZX_OK;
 }
@@ -370,8 +387,17 @@ zx_status_t ProcessActions(fbl::Array<const fuchsia_device_mock_Action> actions,
         }
         case fuchsia_device_mock_ActionTag_remove_device: {
             device_remove(ctx->device);
-            zx_status_t status = SendRemoveDeviceDone(*ctx->channel,
-                                                      action.remove_device.action_id);
+            // Null out the device pointers, since the release hook might get
+            // activated.
+            ctx->device = nullptr;
+            ctx->mock_device = nullptr;
+            zx_status_t status;
+            if (ctx->is_thread) {
+                status = SendRemoveDeviceDoneFromThread(*ctx->channel,
+                                                        action.remove_device.action_id);
+            } else {
+                status = SendRemoveDeviceDone(*ctx->channel, action.remove_device.action_id);
+            }
             ZX_ASSERT(status == ZX_OK);
             break;
         }
@@ -392,14 +418,23 @@ zx_status_t ProcessActions(fbl::Array<const fuchsia_device_mock_Action> actions,
             }
             memcpy(name, action.add_device.name.data, action.add_device.name.size);
             name[action.add_device.name.size] = 0;
-            status = dev->DdkAdd(name, DEVICE_ADD_NON_BINDABLE);
-            if (status != ZX_OK) {
+
+            status = dev->DdkAdd(name, DEVICE_ADD_NON_BINDABLE,
+                                 static_cast<zx_device_prop_t*>(action.add_device.properties.data),
+                                 static_cast<uint32_t>(action.add_device.properties.count));
+            if (status == ZX_OK) {
+                // Devmgr now owns this
+                __UNUSED auto ptr = dev.release();
+            }
+            if (action.add_device.expect_status != status) {
                 return status;
             }
-            // Devmgr now owns this
-            __UNUSED auto ptr = dev.release();
 
-            status = SendAddDeviceDone(*ctx->channel, action.add_device.action_id);
+            if (ctx->is_thread) {
+                status = SendAddDeviceDoneFromThread(*ctx->channel, action.add_device.action_id);
+            } else {
+                status = SendAddDeviceDone(*ctx->channel, action.add_device.action_id);
+            }
             ZX_ASSERT(status == ZX_OK);
             break;
         }

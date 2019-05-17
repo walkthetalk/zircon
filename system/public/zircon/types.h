@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef ZIRCON_TYPES_H_
-#define ZIRCON_TYPES_H_
+#ifndef SYSROOT_ZIRCON_TYPES_H_
+#define SYSROOT_ZIRCON_TYPES_H_
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,6 +12,7 @@
 #include <zircon/errors.h>
 #include <zircon/limits.h>
 #include <zircon/rights.h>
+#include <zircon/time.h>
 
 #ifndef __cplusplus
 #ifndef _KERNEL
@@ -33,25 +34,11 @@ __BEGIN_CDECLS
 
 typedef uint32_t zx_handle_t;
 
-#define ZX_HANDLE_INVALID         ((zx_handle_t)0)
+#define ZX_HANDLE_INVALID           ((zx_handle_t)0)
+#define ZX_HANDLE_FIXED_BITS_MASK   ((zx_handle_t)0x3)
 
 // See errors.h for the values zx_status_t can take.
 typedef int32_t zx_status_t;
-
-// absolute time in nanoseconds (generally with respect to the monotonic clock)
-typedef int64_t zx_time_t;
-// a duration in nanoseconds
-typedef int64_t zx_duration_t;
-// a duration in hardware ticks
-typedef uint64_t zx_ticks_t;
-#define ZX_TIME_INFINITE INT64_MAX
-#define ZX_TIME_INFINITE_PAST INT64_MIN
-#define ZX_NSEC(n) ((zx_duration_t)(1LL * (n)))
-#define ZX_USEC(n) ((zx_duration_t)(1000LL * (n)))
-#define ZX_MSEC(n) ((zx_duration_t)(1000000LL * (n)))
-#define ZX_SEC(n)  ((zx_duration_t)(1000000000LL * (n)))
-#define ZX_MIN(n)  (ZX_SEC(n) * 60LL)
-#define ZX_HOUR(n) (ZX_MIN(n) * 60LL)
 
 // clock ids
 typedef uint32_t zx_clock_t;
@@ -149,8 +136,9 @@ typedef uint32_t zx_signals_t;
 #define ZX_TASK_TERMINATED          __ZX_OBJECT_SIGNALED
 
 // Job
-#define ZX_JOB_NO_PROCESSES         __ZX_OBJECT_SIGNALED
+#define ZX_JOB_TERMINATED           __ZX_OBJECT_SIGNALED
 #define ZX_JOB_NO_JOBS              __ZX_OBJECT_SIGNAL_4
+#define ZX_JOB_NO_PROCESSES         __ZX_OBJECT_SIGNAL_5
 
 // Process
 #define ZX_PROCESS_TERMINATED       __ZX_OBJECT_SIGNALED
@@ -177,20 +165,8 @@ typedef uint32_t zx_signals_t;
 typedef uint64_t zx_koid_t;
 #define ZX_KOID_INVALID ((uint64_t) 0)
 #define ZX_KOID_KERNEL  ((uint64_t) 1)
-
-// Transaction ID and argument types for zx_channel_call.
-typedef uint32_t zx_txid_t;
-
-typedef struct zx_channel_call_args {
-    const void* wr_bytes;
-    const zx_handle_t* wr_handles;
-    void *rd_bytes;
-    zx_handle_t* rd_handles;
-    uint32_t wr_num_bytes;
-    uint32_t wr_num_handles;
-    uint32_t rd_num_bytes;
-    uint32_t rd_num_handles;
-} zx_channel_call_args_t;
+// The first non-reserved koid. The first 1024 are reserved.
+#define ZX_KOID_FIRST   ((uint64_t) 1024)
 
 // Maximum number of wait items allowed for zx_object_wait_many()
 // TODO(ZX-1349) Re-lower this.
@@ -204,7 +180,8 @@ typedef struct zx_wait_item {
 } zx_wait_item_t;
 
 // VM Object creation options
-#define ZX_VMO_NON_RESIZABLE             ((uint32_t)1u)
+#define ZX_VMO_NON_RESIZABLE             ((uint32_t)1u << 0)
+#define ZX_VMO_RESIZABLE                 ((uint32_t)1u << 1)
 
 // VM Object opcodes
 #define ZX_VMO_OP_COMMIT                 ((uint32_t)1u)
@@ -219,7 +196,14 @@ typedef struct zx_wait_item {
 
 // VM Object clone flags
 #define ZX_VMO_CLONE_COPY_ON_WRITE        ((uint32_t)1u << 0)
+#define ZX_VMO_CHILD_COPY_ON_WRITE        ((uint32_t)1u << 0)
 #define ZX_VMO_CLONE_NON_RESIZEABLE       ((uint32_t)1u << 1)
+#define ZX_VMO_CHILD_NON_RESIZEABLE       ((uint32_t)1u << 1)
+#define ZX_VMO_CHILD_RESIZABLE            ((uint32_t)1u << 2)
+// TODO(stevensd): COW2 is bidirectional. Once things are ready to
+// move away from unidirectional COW, remove this alternate flag
+// and change the semantics of ZX_VMO_CHILD_COPY_ON_WRITE
+#define ZX_VMO_CHILD_COPY_ON_WRITE2       ((uint32_t)1u << 3)
 
 typedef uint32_t zx_vm_option_t;
 // Mapping flags to vmar routines
@@ -236,6 +220,30 @@ typedef uint32_t zx_vm_option_t;
 #define ZX_VM_MAP_RANGE             ((zx_vm_option_t)(1u << 10))
 #define ZX_VM_REQUIRE_NON_RESIZABLE ((zx_vm_option_t)(1u << 11))
 
+#define ZX_VM_ALIGN_BASE            24
+#define ZX_VM_ALIGN_1KB             ((zx_vm_option_t)(10u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_2KB             ((zx_vm_option_t)(11u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_4KB             ((zx_vm_option_t)(12u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_8KB             ((zx_vm_option_t)(13u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_16KB            ((zx_vm_option_t)(14u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_32KB            ((zx_vm_option_t)(15u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_64KB            ((zx_vm_option_t)(16u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_128KB           ((zx_vm_option_t)(17u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_256KB           ((zx_vm_option_t)(18u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_512KB           ((zx_vm_option_t)(19u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_1MB             ((zx_vm_option_t)(20u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_2MB             ((zx_vm_option_t)(21u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_4MB             ((zx_vm_option_t)(22u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_8MB             ((zx_vm_option_t)(23u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_16MB            ((zx_vm_option_t)(24u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_32MB            ((zx_vm_option_t)(25u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_64MB            ((zx_vm_option_t)(26u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_128MB           ((zx_vm_option_t)(27u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_256MB           ((zx_vm_option_t)(28u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_512MB           ((zx_vm_option_t)(29u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_1GB             ((zx_vm_option_t)(30u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_2GB             ((zx_vm_option_t)(31u << ZX_VM_ALIGN_BASE))
+#define ZX_VM_ALIGN_4GB             ((zx_vm_option_t)(32u << ZX_VM_ALIGN_BASE))
 
 // virtual address
 typedef uintptr_t zx_vaddr_t;
@@ -352,14 +360,49 @@ typedef uint32_t zx_obj_type_t;
 #define ZX_OBJ_TYPE_PMT             ((zx_obj_type_t)26u)
 #define ZX_OBJ_TYPE_SUSPEND_TOKEN   ((zx_obj_type_t)27u)
 #define ZX_OBJ_TYPE_PAGER           ((zx_obj_type_t)28u)
-#define ZX_OBJ_TYPE_LAST            ((zx_obj_type_t)29u)
+#define ZX_OBJ_TYPE_EXCEPTION       ((zx_obj_type_t)29u)
 
+// System ABI commits to having no more than 64 object types.
+//
+// See zx_info_process_handle_stats_t for an example of a binary interface that
+// depends on having an upper bound for the number of object types.
+#define ZX_OBJ_TYPE_UPPER_BOUND     ((zx_obj_type_t)64u)
+
+// Used in channel_read_etc.
 typedef struct zx_handle_info {
     zx_handle_t handle;
     zx_obj_type_t type;
     zx_rights_t rights;
     uint32_t unused;
 } zx_handle_info_t;
+
+typedef uint32_t zx_handle_op_t;
+
+#define ZX_HANDLE_OP_MOVE           ((zx_handle_op_t)0u)
+#define ZX_HANDLE_OP_DUPLICATE      ((zx_handle_op_t)1u)
+
+// Used in channel_write_etc.
+typedef struct zx_handle_disposition {
+    zx_handle_op_t operation;
+    zx_handle_t handle;
+    zx_obj_type_t type;
+    zx_rights_t rights;
+    zx_status_t result;
+} zx_handle_disposition_t;
+
+// Transaction ID and argument types for zx_channel_call.
+typedef uint32_t zx_txid_t;
+
+typedef struct zx_channel_call_args {
+    const void* wr_bytes;
+    const zx_handle_t* wr_handles;
+    void *rd_bytes;
+    zx_handle_t* rd_handles;
+    uint32_t wr_num_bytes;
+    uint32_t wr_num_handles;
+    uint32_t rd_num_bytes;
+    uint32_t rd_num_handles;
+} zx_channel_call_args_t;
 
 // The ZX_VM_FLAG_* constants are to be deprecated in favor of the ZX_VM_*
 // versions.
@@ -395,4 +438,4 @@ typedef atomic_int zx_futex_t;
 
 __END_CDECLS
 
-#endif // ZIRCON_TYPES_H_
+#endif // SYSROOT_ZIRCON_TYPES_H_

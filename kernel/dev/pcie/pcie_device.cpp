@@ -15,9 +15,9 @@
 #include <err.h>
 #include <fbl/algorithm.h>
 #include <fbl/auto_lock.h>
-#include <fbl/limits.h>
 #include <inttypes.h>
 #include <kernel/spinlock.h>
+#include <ktl/limits.h>
 #include <lk/init.h>
 #include <platform.h>
 #include <string.h>
@@ -34,7 +34,7 @@ using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
 
-namespace {  // anon namespace.  Externals do not need to know about PcieDeviceImpl
+namespace {  // namespace.  Externals do not need to know about PcieDeviceImpl
 class PcieDeviceImpl : public PcieDevice {
 public:
     static fbl::RefPtr<PcieDevice> Create(PcieUpstreamNode& upstream, uint dev_id, uint func_id);
@@ -548,10 +548,10 @@ zx_status_t PcieDevice::AllocateBarLocked(pcie_bar_info_t& info) {
              * the 4GB mark.  If we encounter such a thing, clear out the
              * allocation and attempt to re-allocate. */
             uint64_t inclusive_end = info.bus_addr + info.size - 1;
-            if (inclusive_end <= fbl::numeric_limits<uint32_t>::max()) {
+            if (inclusive_end <= ktl::numeric_limits<uint32_t>::max()) {
                 alloc = &upstream->mmio_lo_regions();
             } else
-            if (info.bus_addr > fbl::numeric_limits<uint32_t>::max()) {
+            if (info.bus_addr > ktl::numeric_limits<uint32_t>::max()) {
                 alloc = &upstream->mmio_hi_regions();
             }
         } else {

@@ -30,7 +30,6 @@
 namespace mt_usb {
 using namespace board_mt8167; // Hardware registers.
 
-
 MtUsb::Endpoint* MtUsb::EndpointFromAddress(uint8_t addr) {
     size_t ep_num = addr & USB_ENDPOINT_NUM_MASK;
     if (ep_num == 0 || ep_num > NUM_EPS) {
@@ -72,12 +71,12 @@ zx_status_t MtUsb::Create(void* ctx, zx_device_t* parent) {
 zx_status_t MtUsb::Init() {
     for (uint8_t i = 0; i < countof(out_eps_); i++) {
         auto& ep = out_eps_[i];
-        ep.ep_num = i;
+        ep.ep_num = static_cast<uint8_t>(i + 1);
         ep.direction = EP_OUT;
     }
     for (uint8_t i = 0; i < countof(in_eps_); i++) {
         auto& ep = in_eps_[i];
-        ep.ep_num = i;
+        ep.ep_num = static_cast<uint8_t>(i + 1);
         ep.direction = EP_IN;
     }
 
@@ -475,8 +474,11 @@ void MtUsb::HandleEndpointRxLocked(Endpoint* ep) {
 }
 
 void MtUsb::EpQueueNextLocked(Endpoint* ep) {
-    if (ep->current_req == nullptr && !ep->queued_reqs.is_empty()) {
-        auto req = ep->queued_reqs.pop();
+    std::optional<Request> req;
+
+    if (ep->current_req == nullptr &&
+        (req = ep->queued_reqs.pop()).has_value()) {
+        ep->current_req = req->take();
         ep->cur_offset = 0;
 
         if (ep->direction == EP_IN) {
@@ -611,8 +613,8 @@ int MtUsb::IrqThread() {
         .set_usbcom(1)
         .WriteTo(mmio);
 
-   // Configure all endpoints other than endpoint zero to use 512 byte double-buffered FIFOs.
-    constexpr uint32_t fifo_size = 512 >> 3;   // FIFO size is measured in 8 byte units.
+   // Configure all endpoints other than endpoint zero to use 1024 byte double-buffered FIFOs.
+    constexpr uint32_t fifo_size = 1024 >> 3;   // FIFO size is measured in 8 byte units.
     uint32_t fifo_addr = (64 >> 3);             // First 64 bytes used for endpoint zero.
     for (uint8_t i = 1; i <= NUM_EPS; i++) {
         INDEX::Get().FromValue(0).set_selected_endpoint(i).WriteTo(mmio);
@@ -625,8 +627,8 @@ int MtUsb::IrqThread() {
         RXFIFOADD::Get().FromValue(0).set_rxfifoadd(static_cast<uint16_t>(fifo_addr)).WriteTo(mmio);
         fifo_addr += 2*fifo_size; // double-buffered
 
-        TXFIFOSZ::Get().FromValue(0).set_txdpb(1).set_txsz(FIFO_SIZE_512).WriteTo(mmio);
-        RXFIFOSZ::Get().FromValue(0).set_rxdpb(1).set_rxsz(FIFO_SIZE_512).WriteTo(mmio);
+        TXFIFOSZ::Get().FromValue(0).set_txdpb(1).set_txsz(FIFO_SIZE_1024).WriteTo(mmio);
+        RXFIFOSZ::Get().FromValue(0).set_rxdpb(1).set_rxsz(FIFO_SIZE_1024).WriteTo(mmio);
     }
 
     while (true) {
@@ -713,7 +715,26 @@ void MtUsb::DdkUnbind() {
 void MtUsb::DdkRelease() {
     delete this;
 }
-
+zx_status_t MtUsb::UsbDciCancelAll(uint8_t ep) {
+    Endpoint* endpoint = EndpointFromAddress(ep);
+    if (!endpoint) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    RequestQueue queue;
+    {
+        fbl::AutoLock l(&endpoint->lock);
+        queue = std::move(endpoint->queued_reqs);
+        if (endpoint->current_req) {
+            Request pending_request(endpoint->current_req, sizeof(usb_request_t));
+            queue.push(std::move(pending_request));
+            endpoint->current_req = nullptr;
+        }
+    }
+    for (auto req = queue.pop(); req; req = queue.pop()) {
+        req->Complete(ZX_ERR_IO_NOT_PRESENT, 0);
+    }
+    return ZX_OK;
+}
 void MtUsb::UsbDciRequestQueue(usb_request_t* req, const usb_request_complete_t* cb) {
     auto* ep = EndpointFromAddress(req->header.ep_address);
     if (ep == nullptr) {
@@ -724,6 +745,7 @@ void MtUsb::UsbDciRequestQueue(usb_request_t* req, const usb_request_complete_t*
     fbl::AutoLock lock(&ep->lock);
 
     if (!ep->enabled) {
+        lock.release();
         usb_request_complete(req, ZX_ERR_BAD_STATE, 0, cb);
         return;
     }
@@ -732,7 +754,7 @@ void MtUsb::UsbDciRequestQueue(usb_request_t* req, const usb_request_complete_t*
     EpQueueNextLocked(ep);
 }
 
-zx_status_t MtUsb::UsbDciSetInterface(const usb_dci_interface_t* interface) {
+zx_status_t MtUsb::UsbDciSetInterface(const usb_dci_interface_protocol_t* interface) {
     // TODO - handle interface == nullptr for tear down path?
 
     if (dci_intf_.has_value()) {
@@ -740,7 +762,7 @@ zx_status_t MtUsb::UsbDciSetInterface(const usb_dci_interface_t* interface) {
         return ZX_ERR_BAD_STATE;
     }
 
-    dci_intf_ = ddk::UsbDciInterfaceClient(interface);
+    dci_intf_ = ddk::UsbDciInterfaceProtocolClient(interface);
 
     // Now that the usb-peripheral driver has bound, we can start things up.
     int rc = thrd_create_with_name(&irq_thread_,

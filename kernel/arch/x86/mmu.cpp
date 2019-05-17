@@ -17,6 +17,7 @@
 #include <arch/x86/mmu.h>
 #include <arch/x86/mmu_mem_types.h>
 #include <kernel/mp.h>
+#include <lib/counters.h>
 #include <new>
 #include <vm/arch_vm_aspace.h>
 #include <vm/physmap.h>
@@ -25,6 +26,16 @@
 #include <zircon/types.h>
 
 #define LOCAL_TRACE 0
+
+// Count of the number of batches of TLB invalidations initiated on each CPU
+KCOUNTER(tlb_invalidations_sent, "mmu.tlb_invalidation_batches_sent")
+// Count of the number of batches of TLB invalidation requests received on each CPU
+// Includes tlb_invalidations_full_global_received and tlb_invalidations_full_nonglobal_received
+KCOUNTER(tlb_invalidations_received, "mmu.tlb_invalidation_batches_received")
+// Count of the number of TLB invalidation requests for all entries on each CPU
+KCOUNTER(tlb_invalidations_full_global_received, "mmu.tlb_invalidation_full_global_received")
+// Count of the number of TLB invalidation requests for all non-global entries on each CPU
+KCOUNTER(tlb_invalidations_full_nonglobal_received, "mmu.tlb_invalidation_full_nonglobal_received")
 
 /* Default address width including virtual/physical address.
  * newer versions fetched below */
@@ -47,6 +58,13 @@ volatile pt_entry_t linear_map_pdp[(64ULL * GB) / (2 * MB)] __ALIGNED(PAGE_SIZE)
 
 /* which of the above variables is the top level page table */
 #define KERNEL_PT pml4
+
+// Width of the PCID identifier
+#define X86_PCID_BITS (12)
+// When this bit is set in the source operand of a MOV CR3, TLB entries and paging structure
+// caches for the active PCID may be preserved. If the bit is clear, entries will be cleared.
+// See Intel Volume 3A, 4.10.4.1
+#define X86_PCID_CR3_SAVE_ENTRIES (63)
 
 // Static relocated base to prepare for KASLR. Used at early boot and by gdb
 // script to know the target relocated address.
@@ -146,6 +164,8 @@ static void TlbInvalidatePage_task(void* raw_context) {
     DEBUG_ASSERT(arch_ints_disabled());
     TlbInvalidatePage_context* context = (TlbInvalidatePage_context*)raw_context;
 
+    kcounter_add(tlb_invalidations_received, 1);
+
     ulong cr3 = x86_get_cr3();
     if (context->target_cr3 != cr3 && !context->pending->contains_global) {
         /* This invalidation doesn't apply to this CPU, ignore it */
@@ -154,8 +174,10 @@ static void TlbInvalidatePage_task(void* raw_context) {
 
     if (context->pending->full_shootdown) {
         if (context->pending->contains_global) {
+            kcounter_add(tlb_invalidations_full_global_received, 1);
             x86_tlb_global_invalidate();
         } else {
+            kcounter_add(tlb_invalidations_full_nonglobal_received, 1);
             x86_tlb_nonglobal_invalidate();
         }
         return;
@@ -186,6 +208,8 @@ static void x86_tlb_invalidate_page(const X86PageTableBase* pt, PendingTlbInvali
         return;
     }
 
+    kcounter_add(tlb_invalidations_sent, 1);
+
     ulong cr3 = pt ? pt->phys() : x86_get_cr3();
     struct TlbInvalidatePage_context task_context = {
         .target_cr3 = cr3, .pending = pending,
@@ -207,6 +231,17 @@ static void x86_tlb_invalidate_page(const X86PageTableBase* pt, PendingTlbInvali
 
     mp_sync_exec(target, target_mask, TlbInvalidatePage_task, &task_context);
     pending->clear();
+}
+
+bool x86_enable_pcid() {
+    DEBUG_ASSERT(arch_ints_disabled());
+    if (!g_x86_feature_pcid_good) {
+        return false;
+    }
+
+    ulong cr4 = x86_get_cr4();
+    x86_set_cr4(cr4 | X86_CR4_PCIDE);
+    return true;
 }
 
 bool X86PageTableMmu::check_paddr(paddr_t paddr) {
@@ -473,9 +508,9 @@ void x86_mmu_early_init() {
 
     // Unmap the lower identity mapping.
     pml4[0] = 0;
-    PendingTlbInvalidation tlb;
-    tlb.enqueue(0, PML4_L, /* global */ false, /* terminal */ false);
-    x86_tlb_invalidate_page(nullptr, &tlb);
+    // As we are still in early init code we cannot use the general page invalidation mechanisms,
+    // specifically ones that might use mp_sync_exec or kcounters, so just drop the entire tlb.
+    x86_tlb_global_invalidate();
 
     /* get the address width from the CPU */
     uint8_t vaddr_width = x86_linear_address_width();
@@ -516,7 +551,7 @@ zx_status_t X86PageTableBase::Init(void* ctx) TA_NO_THREAD_SAFETY_ANALYSIS {
     }
     virt_ = reinterpret_cast<pt_entry_t*>(paddr_to_physmap(pa));
     phys_ = pa;
-    p->state = VM_PAGE_STATE_MMU;
+    p->set_state(VM_PAGE_STATE_MMU);
 
     // TODO(abdulla): Remove when PMM returns pre-zeroed pages.
     arch_zero_page(virt_);
@@ -594,7 +629,7 @@ zx_status_t X86ArchVmAspace::Init(vaddr_t base, size_t size, uint mmu_flags) {
 
         LTRACEF("user aspace: pt phys %#" PRIxPTR ", virt %p\n", pt_->phys(), pt_->virt());
     }
-    fbl::atomic_init(&active_cpus_, 0);
+    ktl::atomic_init(&active_cpus_, 0);
 
     return ZX_OK;
 }

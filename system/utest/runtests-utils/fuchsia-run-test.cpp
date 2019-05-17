@@ -12,7 +12,6 @@
 #include <unistd.h>
 
 #include <fbl/auto_call.h>
-#include <fbl/string.h>
 #include <fbl/string_buffer.h>
 #include <fbl/unique_fd.h>
 #include <fbl/unique_ptr.h>
@@ -144,12 +143,22 @@ bool TestFileComponentInfoTest() {
     END_TEST;
 }
 
+static ScopedTestFile NewPublishFile(const fbl::String& test_name) {
+    const char* root_dir = getenv("TEST_ROOT_DIR");
+    if (root_dir == nullptr) {
+        root_dir = "";
+    }
+    const fbl::String path =
+        fbl::String::Concat({root_dir, "/bin/publish-data-helper"});
+    return ScopedTestFile(test_name.c_str(), path.c_str());
+}
+
 bool RunTestDontPublishData() {
     BEGIN_TEST;
 
     ScopedTestDir test_dir;
     fbl::String test_name = JoinPath(test_dir.path(), "publish-data-helper");
-    ScopedTestFile file(test_name.c_str(), "/boot/bin/publish-data-helper");
+    auto file = NewPublishFile(test_name);
 
     const char* argv[] = {test_name.c_str(), nullptr};
     std::unique_ptr<Result> result = PlatformRunTest(argv, nullptr, nullptr);
@@ -166,14 +175,14 @@ bool RunTestsPublishData() {
 
     ScopedTestDir test_dir;
     fbl::String test_name = JoinPath(test_dir.path(), "publish-data-helper");
-    ScopedTestFile file(test_name.c_str(), "/boot/bin/publish-data-helper");
+    auto file = NewPublishFile(test_name);
     int num_failed = 0;
     fbl::Vector<std::unique_ptr<Result>> results;
     const signed char verbosity = 77;
     const fbl::String output_dir = JoinPath(test_dir.path(), "output");
     const char output_file_base_name[] = "output.txt";
     ASSERT_EQ(0, MkDirAll(output_dir));
-    EXPECT_TRUE(RunTests(PlatformRunTest, {test_name}, {},
+    EXPECT_TRUE(RunTests(PlatformRunTest, {test_name}, {}, 1,
                          output_dir.c_str(), output_file_base_name, verbosity,
                          &num_failed, &results));
     EXPECT_EQ(0, num_failed);
@@ -188,7 +197,7 @@ bool RunAllTestsPublishData() {
 
     ScopedTestDir test_dir;
     fbl::String test_name = JoinPath(test_dir.path(), "publish-data-helper");
-    ScopedTestFile file(test_name.c_str(), "/boot/bin/publish-data-helper");
+    auto file = NewPublishFile(test_name);
 
     const fbl::String output_dir =
         JoinPath(test_dir.path(), "run-all-tests-output-1");
@@ -242,15 +251,56 @@ bool RunAllTestsPublishData() {
     END_TEST;
 }
 
+bool RunTestRootDir() {
+    BEGIN_TEST;
+
+    ScopedTestDir test_dir;
+    fbl::String test_name = JoinPath(test_dir.path(), "succeed.sh");
+    const char* argv[] = {test_name.c_str(), nullptr};
+
+    // This test should have gotten TEST_ROOT_DIR. Confirm that we can find our
+    // artifact in the "testdata/" directory under TEST_ROOT_DIR.
+    const char* root_dir = getenv("TEST_ROOT_DIR");
+    if (!root_dir) {
+      root_dir = "";
+    }
+
+    // Run a test and confirm TEST_ROOT_DIR gets passed along.
+    {
+        const char script_contents[] =
+            "read line < $TEST_ROOT_DIR/testdata/runtests-utils/test-data\n"
+            "echo \"$line\"\n";
+        ScopedScriptFile script(argv[0], script_contents);
+        fbl::String output_filename = JoinPath(test_dir.path(), "test.out");
+        std::unique_ptr<Result> result =
+            PlatformRunTest(argv, nullptr, output_filename.c_str());
+
+        FILE* output_file = fopen(output_filename.c_str(), "r");
+        ASSERT_TRUE(output_file);
+        char* line = nullptr;
+        size_t n = 0;
+        ASSERT_LE(0, getline(&line, &n, output_file));
+        EXPECT_STR_EQ("Hello world!\n", line);
+        fclose(output_file);
+        free(line);
+        EXPECT_STR_EQ(argv[0], result->name.c_str());
+        EXPECT_EQ(SUCCESS, result->launch_status);
+        EXPECT_EQ(0, result->return_code);
+    }
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(FuchsiaComponentInfo)
 RUN_TEST_SMALL(TestFileComponentInfoTest)
 END_TEST_CASE(FuchsiaComponentInfo)
 
-BEGIN_TEST_CASE(PublishDataTests)
+BEGIN_TEST_CASE(PlatformRunTests)
 RUN_TEST(RunTestDontPublishData)
 RUN_TEST_MEDIUM(RunTestsPublishData)
 RUN_TEST_MEDIUM(RunAllTestsPublishData)
-END_TEST_CASE(PublishDataTests)
+RUN_TEST_MEDIUM(RunTestRootDir)
+END_TEST_CASE(PlatformRunTests)
 
 } // namespace
 } // namespace runtests

@@ -24,6 +24,63 @@ static bool initial_state() {
     END_TEST;
 }
 
+// Verify that AddBasicPolicy prevents "widening" of a deny all policy.
+static bool add_basic_policy_no_widening() {
+    BEGIN_TEST;
+
+    JobPolicy p;
+
+    // Start with deny all.
+    zx_policy_basic_t policy{ZX_POL_NEW_ANY, ZX_POL_ACTION_DENY};
+    ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, &policy, 1), "");
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_EVENT), "");
+
+    // Attempt to allow event creation.
+    policy = {ZX_POL_NEW_EVENT, ZX_POL_ACTION_ALLOW};
+    // Fails because mode is ZX_JOB_POL_ABSOLUTE.
+    ASSERT_EQ(ZX_ERR_ALREADY_EXISTS, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, &policy, 1), "");
+    // Does not fail because mode is ZX_JOB_POL_RELATIVE.
+    ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_RELATIVE, &policy, 1), "");
+
+    // However, action is still deny.
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_EVENT), "");
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_VMO), "");
+
+    END_TEST;
+}
+
+// Verify that AddBasicPolicy prevents "widening" of policy using NEW_ANY.
+static bool add_basic_policy_no_widening_with_any() {
+    BEGIN_TEST;
+
+    JobPolicy p;
+
+    // Start with deny event creation.
+    zx_policy_basic_t policy{ZX_POL_NEW_EVENT, ZX_POL_ACTION_DENY};
+    ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, &policy, 1), "");
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_EVENT), "");
+
+    // Attempt to allow event creation.
+    policy = {ZX_POL_NEW_EVENT, ZX_POL_ACTION_ALLOW};
+    // Fails because mode is ZX_JOB_POL_ABSOLUTE.
+    ASSERT_EQ(ZX_ERR_ALREADY_EXISTS, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, &policy, 1), "");
+    // Does not fail because mode is ZX_JOB_POL_RELATIVE.
+    ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_RELATIVE, &policy, 1), "");
+
+    // However, action is still deny.
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_EVENT), "");
+
+    // Attempt to allow any.
+    policy = {ZX_POL_NEW_ANY, ZX_POL_ACTION_ALLOW};
+    ASSERT_EQ(ZX_ERR_ALREADY_EXISTS, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, &policy, 1), "");
+    ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_RELATIVE, &policy, 1), "");
+
+    // Still deny.
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_EVENT), "");
+
+    END_TEST;
+}
+
 static bool add_basic_policy_absolute() {
     BEGIN_TEST;
 
@@ -63,12 +120,10 @@ static bool add_basic_policy_unmodified_on_error() {
     BEGIN_TEST;
 
     JobPolicy p;
-    zx_policy_basic_t policy[2]{{ZX_POL_NEW_VMO,
-                                 ZX_POL_ACTION_ALLOW | ZX_POL_ACTION_EXCEPTION},
-                                {ZX_POL_NEW_CHANNEL,
-                                 ZX_POL_ACTION_KILL}};
+    zx_policy_basic_t policy[2]{{ZX_POL_NEW_VMO, ZX_POL_ACTION_ALLOW_EXCEPTION},
+                                {ZX_POL_NEW_CHANNEL, ZX_POL_ACTION_KILL}};
     ASSERT_EQ(ZX_OK, p.AddBasicPolicy(ZX_JOB_POL_ABSOLUTE, policy, fbl::count_of(policy)), "");
-    ASSERT_EQ(ZX_POL_ACTION_ALLOW | ZX_POL_ACTION_EXCEPTION,
+    ASSERT_EQ(ZX_POL_ACTION_ALLOW_EXCEPTION,
               p.QueryBasicPolicy(ZX_POL_NEW_VMO), "");
     ASSERT_EQ(ZX_POL_ACTION_KILL, p.QueryBasicPolicy(ZX_POL_NEW_CHANNEL), "");
 
@@ -100,6 +155,7 @@ static bool add_basic_policy_deny_any() {
     ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_FIFO), "");
     ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_TIMER), "");
     ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_PROCESS), "");
+    ASSERT_EQ(ZX_POL_ACTION_DENY, p.QueryBasicPolicy(ZX_POL_NEW_PROFILE), "");
 
     END_TEST;
 }
@@ -115,13 +171,31 @@ static bool set_get_timer_slack() {
     END_TEST;
 }
 
+static bool increment_counters() {
+    BEGIN_TEST;
+
+    // There's no programmatic interface to read kcounters so there's nothing to assert (aside from
+    // not crashing).
+    JobPolicy p;
+    for (uint32_t action = 0; action < ZX_POL_ACTION_MAX; ++action) {
+        for (uint32_t condition = 0; condition < ZX_POL_MAX; ++condition) {
+            p.IncrementCounter(action, condition);
+        }
+    }
+
+    END_TEST;
+}
+
 } // namespace
 
 UNITTEST_START_TESTCASE(job_policy_tests)
 UNITTEST("initial_state", initial_state)
+UNITTEST("add_basic_policy_no_widening", add_basic_policy_no_widening)
+UNITTEST("add_basic_policy_no_widening_with_any", add_basic_policy_no_widening_with_any)
 UNITTEST("add_basic_policy_absolute", add_basic_policy_absolute)
 UNITTEST("add_basic_policy_relative", add_basic_policy_relative)
 UNITTEST("add_basic_policy_unmodified_on_error", add_basic_policy_unmodified_on_error)
 UNITTEST("add_basic_policy_deny_any", add_basic_policy_deny_any)
 UNITTEST("set_get_timer_slack", set_get_timer_slack)
+UNITTEST("increment_counters", increment_counters)
 UNITTEST_END_TESTCASE(job_policy_tests, "job_policy", "JobPolicy tests");
