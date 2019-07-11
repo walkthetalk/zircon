@@ -6,9 +6,20 @@ library("smbios") {
   kernel = true
   static = true
   sources = [
-    "smbios.cpp",
+    "smbios.cc",
   ]
   deps = [
     "$zx/system/ulib/fbl",
+  ]
+}
+
+test("smbios-test") {
+  sources = [
+    "smbios-test.cc",
+  ]
+  deps = [
+    ":smbios",
+    "$zx/system/ulib/fdio",
+    "$zx/system/ulib/zxtest",
   ]
 }

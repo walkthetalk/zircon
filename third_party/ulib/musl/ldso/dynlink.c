@@ -6,18 +6,20 @@
 #include "zircon_impl.h"
 #include "threads_impl.h"
 #include "stdio_impl.h"
+
 #include <ctype.h>
 #include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <ldmsg/ldmsg.h>
+#include <lib/processargs/processargs.h>
+#include <lib/zircon-internal/default_stack_size.h>
 #include <limits.h>
 #include <link.h>
-#include <zircon/dlfcn.h>
-#include <zircon/process.h>
-#include <zircon/status.h>
-#include <zircon/syscalls/log.h>
 #include <pthread.h>
+#include <runtime/thread.h>
 #include <setjmp.h>
 #include <stdalign.h>
 #include <stdarg.h>
@@ -31,12 +33,10 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
-
-#include <inttypes.h>
-
-#include <ldmsg/ldmsg.h>
-#include <lib/processargs/processargs.h>
-#include <runtime/thread.h>
+#include <zircon/dlfcn.h>
+#include <zircon/process.h>
+#include <zircon/status.h>
+#include <zircon/syscalls/log.h>
 
 
 static void early_init(void);
@@ -135,7 +135,8 @@ static struct r_debug debug;
 static struct tls_module* tls_tail;
 static size_t tls_cnt, tls_offset = 16, tls_align = MIN_TLS_ALIGN;
 static size_t static_tls_cnt;
-static pthread_mutex_t init_fini_lock = {._m_type = PTHREAD_MUTEX_RECURSIVE};
+static pthread_mutex_t init_fini_lock = {
+    ._m_attr = PTHREAD_MUTEX_MAKE_ATTR(PTHREAD_MUTEX_RECURSIVE, PTHREAD_PRIO_NONE) };
 
 static bool log_libs = false;
 static atomic_uintptr_t unlogged_tail;
@@ -476,6 +477,7 @@ __NO_SAFESTACK NO_ASAN static void do_relocs(struct dso* dso, size_t* rel,
                 continue;
             }
         } else {
+            name = "(local)";
             sym = 0;
             def.sym = 0;
             def.dso = dso;
@@ -553,7 +555,7 @@ __NO_SAFESTACK NO_ASAN static void do_relocs(struct dso* dso, size_t* rel,
                 size_t* new = dl_alloc(2 * sizeof(size_t));
                 if (!new) {
                     error("Error relocating %s: cannot allocate TLSDESC for %s", dso->l_map.l_name,
-                          sym ? name : "(local)");
+                          name);
                     longjmp(*rtld_fail, 1);
                 }
                 new[0] = def.dso->tls_id;
@@ -990,7 +992,7 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
         this_min = ph->p_vaddr & -PAGE_SIZE;
         this_max = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1) & -PAGE_SIZE;
         size_t off_start = ph->p_offset & -PAGE_SIZE;
-        zx_vm_option_t zx_options = ZX_VM_SPECIFIC;
+        zx_vm_option_t zx_options = ZX_VM_SPECIFIC | ZX_VM_ALLOW_FAULTS;
         zx_options |= (ph->p_flags & PF_R) ? ZX_VM_PERM_READ : 0;
         zx_options |= (ph->p_flags & PF_W) ? ZX_VM_PERM_WRITE : 0;
         zx_options |= (ph->p_flags & PF_X) ? ZX_VM_PERM_EXECUTE : 0;
@@ -1016,7 +1018,8 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
                 }
             } else {
                 // Get a writable (lazy) copy of the portion of the file VMO.
-                status = _zx_vmo_create_child(vmo, ZX_VMO_CHILD_COPY_ON_WRITE,
+                status = _zx_vmo_create_child(vmo,
+                                              ZX_VMO_CHILD_COPY_ON_WRITE | ZX_VMO_CHILD_RESIZABLE,
                                               off_start, data_size, &map_vmo);
                 if (status == ZX_OK && map_size > data_size) {
                     // Extend the writable VMO to cover the .bss pages too.
@@ -1645,7 +1648,6 @@ __attribute__((__visibility__("hidden"))) void* __tls_get_new(size_t* v) {
 
 __NO_SAFESTACK struct pthread* __init_main_thread(zx_handle_t thread_self) {
     pthread_attr_t attr = DEFAULT_PTHREAD_ATTR;
-    attr._a_stacksize = libc.stack_size;
 
     char thread_self_name[ZX_MAX_NAME_LEN];
     if (_zx_object_get_property(thread_self, ZX_PROP_NAME, thread_self_name,
@@ -1949,7 +1951,7 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo,
     app.l_map.l_name = (char*)"";
 
     // Check for a PT_GNU_STACK header requesting a main thread stack size.
-    libc.stack_size = DEFAULT_PTHREAD_ATTR._a_stacksize;
+    libc.stack_size = ZIRCON_DEFAULT_STACK_SIZE;
     for (size_t i = 0; i < app.phnum; i++) {
         if (app.phdr[i].p_type == PT_GNU_STACK) {
             size_t size = app.phdr[i].p_memsz;
@@ -2394,7 +2396,7 @@ __attribute__((__visibility__("hidden"))) void __dl_vseterr(const char*, va_list
 
 #define LOADER_SVC_MSG_MAX 1024
 
-__NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
+__NO_SAFESTACK static zx_status_t loader_svc_rpc(uint64_t ordinal,
                                                  const void* data, size_t len,
                                                  zx_handle_t request_handle,
                                                  zx_handle_t* result) {

@@ -122,14 +122,22 @@ namespace ddk {
 class IoBuffer {
 public:
     IoBuffer() {}
-
-    ~IoBuffer() {
-        io_buffer_release(&io_buffer_);
+    IoBuffer(IoBuffer&& other) {
+        io_buffer_ = other.io_buffer_;
+        other.io_buffer_ = {};
     }
-
-    inline void release() {
+    IoBuffer& operator=(IoBuffer&& other) {
+        if(&other == this) {
+            return *this;
+        }
         io_buffer_release(&io_buffer_);
+        io_buffer_ = other.io_buffer_;
+        other.io_buffer_ = {};
+        return *this;
     }
+    ~IoBuffer() { io_buffer_release(&io_buffer_); }
+
+    inline void release() { io_buffer_release(&io_buffer_); }
 
     inline zx_status_t Init(zx_handle_t bti, size_t size, uint32_t flags) {
         return io_buffer_init(&io_buffer_, bti, size, flags);
