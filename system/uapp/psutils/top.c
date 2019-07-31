@@ -57,7 +57,7 @@ static zx_koid_t last_process_scanned;
 
 // Return text representation of thread state.
 static const char* state_string(const zx_info_thread_t* info) {
-    if (info->wait_exception_port_type != ZX_EXCEPTION_PORT_TYPE_NONE) {
+    if (info->wait_exception_channel_type != ZX_EXCEPTION_CHANNEL_TYPE_NONE) {
         return "excp";
     } else {
         switch (ZX_THREAD_STATE_BASIC(info->state)) {
@@ -307,11 +307,14 @@ int main(int argc, char** argv) {
     }
 
     bool is_term = false;
-    if (!strncmp(getenv("TERM"), "screen", 6)) {
-        is_term = true;
-    }
-    if (!strncmp(getenv("TERM"), "xterm", 5)) {
-        is_term = true;
+    const char *term = getenv("TERM");
+    if (term != NULL) {
+        if (!strncmp(term, "screen", 6)) {
+            is_term = true;
+        }
+        if (!strncmp(term, "xterm", 5)) {
+            is_term = true;
+        }
     }
 
     // set stdin to non blocking

@@ -6,23 +6,23 @@
 
 #include <ddk/metadata/buttons.h>
 #include <ddk/protocol/gpio.h>
-
 #include <ddktl/device.h>
 #include <ddktl/protocol/hidbus.h>
-
 #include <fbl/array.h>
 #include <fbl/mutex.h>
-
 #include <hid/buttons.h>
-
 #include <lib/zx/interrupt.h>
 #include <lib/zx/port.h>
-
 #include <zircon/thread_annotations.h>
 
 #include <optional>
 
 namespace buttons {
+
+// zx_port_packet::key.
+constexpr uint64_t kPortKeyShutDown = 0x01;
+// Start of up to kNumberOfRequiredGpios port types used for interrupts.
+constexpr uint64_t kPortKeyInterruptStart = 0x10;
 
 class HidButtonsDevice;
 using DeviceType = ddk::Device<HidButtonsDevice, ddk::Unbindable>;
@@ -30,10 +30,15 @@ using DeviceType = ddk::Device<HidButtonsDevice, ddk::Unbindable>;
 class HidButtonsDevice : public DeviceType,
                          public ddk::HidbusProtocol<HidButtonsDevice, ddk::base_protocol> {
 public:
+    struct Gpio {
+        gpio_protocol_t gpio;
+        zx::interrupt irq;
+        buttons_gpio_config_t config;
+    };
+
     explicit HidButtonsDevice(zx_device_t* device)
         : DeviceType(device) {}
-
-    zx_status_t Bind();
+    virtual ~HidButtonsDevice() = default;
 
     // Methods required by the ddk mixins.
     zx_status_t HidbusStart(const hidbus_ifc_protocol_t* ifc) TA_EXCL(client_lock_);
@@ -51,25 +56,27 @@ public:
     void DdkUnbind();
     void DdkRelease();
 
+    zx_status_t Bind(fbl::Array<Gpio> gpios,
+                     fbl::Array<buttons_button_config_t> buttons);
+
+protected:
+    // Protected for unit testing.
+    void ShutDown() TA_EXCL(client_lock_);
+
+    zx::port port_;
+
 private:
-    struct Gpio {
-        gpio_protocol_t gpio;
-        zx::interrupt irq;
-        buttons_gpio_config_t config;
-    };
 
     int Thread();
-    void ShutDown() TA_EXCL(client_lock_);
     void ReconfigurePolarity(uint32_t idx, uint64_t int_port);
     zx_status_t ConfigureInterrupt(uint32_t idx, uint64_t int_port);
     bool MatrixScan(uint32_t row, uint32_t col, zx_duration_t delay);
 
     thrd_t thread_;
-    zx::port port_;
     fbl::Mutex client_lock_;
     ddk::HidbusIfcProtocolClient client_ TA_GUARDED(client_lock_);
     fbl::Array<buttons_button_config_t> buttons_;
     fbl::Array<Gpio> gpios_;
     std::optional<uint8_t> fdr_gpio_;
 };
-}
+} // namespace buttons

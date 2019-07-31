@@ -232,7 +232,7 @@ struct AllocationTable {
     // Returns an over estimation of size required to allocate all slices in a fvm_volume of
     // |fvm_disk_size| with a given |slice_size|. The returned value is always rounded to the next
     // block boundary.
-    constexpr uint64_t Length(size_t fvm_disk_size, size_t slice_size) {
+    static constexpr uint64_t Length(size_t fvm_disk_size, size_t slice_size) {
         return fbl::round_up(sizeof(SliceEntry) * (fvm_disk_size / slice_size), kBlockSize);
     }
 };
@@ -330,6 +330,34 @@ public:
     // Note: pslice is 1-indexed.
     size_t GetSliceStart(size_t pslice) const {
         return 2 * metadata_allocated_size_ + (pslice - 1) * slice_size_;
+    }
+
+    // Returns the maximum number of slices that can be addressed from the maximum possible size
+    // of the metatadata.
+    size_t GetMaxAllocatableSlices() const {
+        return (metadata_allocated_size() - kAllocTableOffset) / sizeof(SliceEntry);
+    }
+
+    // Returns the maximum number of slices that the allocated metadata can address for a given
+    // |disk_size|.
+    size_t GetMaxAddressableSlices(uint64_t disk_size) const {
+        size_t slice_count =
+            std::min(GetMaxAllocatableSlices(), UsableSlicesCount(disk_size, slice_size_));
+        // Because the allocation table is 1-indexed and pslices are 0 indexed on disk,
+        // if the number of slices fit perfectly in the metadata, the allocated buffer won't be big
+        // enough to address them all. This only happens when the rounded up block value happens to
+        // match the disk size.
+        // TODO(gevalentino): Fix underlying cause and remove workaround.
+        if ((AllocationTable::kOffset + slice_count * sizeof(SliceEntry)) ==
+            metadata_allocated_size()) {
+            slice_count--;
+        }
+        return slice_count;
+    }
+
+    // Returns the maximum partition size the current metadata can grow to.
+    size_t GetMaxPartitionSize() const {
+        return GetSliceStart(1) + GetMaxAllocatableSlices() * slice_size_;
     }
 
 private:
